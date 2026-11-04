@@ -3571,6 +3571,7 @@ dependencies = [
  "vega-plugin",
  "vega-registry",
  "vega-shim",
+ "vega-transcript",
 ]
 
 [[package]]
