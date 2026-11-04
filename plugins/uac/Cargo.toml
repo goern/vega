@@ -26,6 +26,7 @@ vega-build = { path = "../../crates/vega-build" }
 
 [target.'cfg(unix)'.dependencies]
 vega-shim = { path = "../../crates/vega-shim" }
+vega-transcript = { path = "../../crates/vega-transcript" }
 vega-gate = { path = "../gate" }
 
 [[test]]
