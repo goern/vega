@@ -8,3 +8,4 @@ spike/during.out
 
 # Local mise overrides (secrets)
 mise.local.toml
+.envrc
