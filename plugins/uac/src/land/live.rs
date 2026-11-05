@@ -1,6 +1,7 @@
 //! Integrations keep their existing owners: gate, bd, mux and Worktrunk.
 use super::*;
 use vega_herdr::{agent_name, herdr, lanes, me, state as st};
+use vega_transcript::{locate, Kind};
 
 pub(super) struct Live;
 fn pane_absent_in(inventory: &Value, pane: &str) -> Result<bool> {
@@ -150,8 +151,40 @@ fn parse_worktree(list: &str, branch: &str) -> Result<Option<PathBuf>> {
     }
     Ok(found.pop())
 }
-fn session(a: &Value) -> &str {
-    a["agent_session"]["value"].as_str().unwrap_or("")
+/// herdr names a session only through its agent hook, which a host may not
+/// have (`herdr integration status`). Then the session is the one Claude log
+/// of a pane vega spawned there. Empty when unknown, so nothing matches.
+fn session(a: &Value) -> String {
+    let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    session_in(a, &st::spawn_records(), &home)
+}
+/// A second log in the cwd (a reused pane, a `/clear`) is ambiguous, and a log
+/// other than the recorded session is another agent: both fail closed.
+fn session_in(a: &Value, spawns: &[st::SpawnRecord], home: &Path) -> String {
+    let reported = a["agent_session"]["value"].as_str().unwrap_or("");
+    if !reported.is_empty() {
+        return reported.into();
+    }
+    let cwd = a["cwd"].as_str().unwrap_or("");
+    let spawned = spawns.iter().find(|r| {
+        a["pane_id"] == r.pane.as_str()
+            && agent_name(a) == r.name
+            && a["agent"] == r.kind.as_str()
+            && r.cwd == cwd
+    });
+    let Some(r) = spawned.filter(|r| r.kind == Kind::Claude.as_str()) else {
+        return String::new();
+    };
+    let log = locate(Kind::Claude, None, cwd, home).ok();
+    let id = log
+        .as_deref()
+        .and_then(Path::file_stem)
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if r.session.as_deref().is_some_and(|s| s != id) {
+        return String::new();
+    }
+    id.into()
 }
 pub(super) fn identity_matches(s: &Sentinel, a: &Value) -> bool {
     a["pane_id"] == s.pane
@@ -345,7 +378,7 @@ impl Services for Live {
             let s = Sentinel {
                 pane: a["pane_id"].as_str().unwrap_or("").into(),
                 name: agent_name(&a).into(),
-                session: session(&a).into(),
+                session: session(&a),
                 actor: lanes::actor(wt.as_ref().unwrap()).unwrap_or_default(),
                 worktree: wt.clone().unwrap(),
                 brief: st::brief_of(None, a["pane_id"].as_str().unwrap_or("")).unwrap_or(0),
@@ -761,6 +794,56 @@ mod tests {
         let mut reused = a;
         reused["agent_session"]["value"] = "new-session".into();
         assert!(!identity_matches(&s, &reused));
+    }
+    #[test]
+    fn session_falls_back_to_the_spawned_panes_only_log() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = "/repo/.claude/worktrees/feature";
+        let logs = home
+            .path()
+            .join(".claude/projects/-repo--claude-worktrees-feature");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("s1.jsonl"), "").unwrap();
+        let a = json!({"pane_id": "w1:p2", "name": "feature", "agent": "claude", "cwd": cwd});
+        let spawn = st::SpawnRecord {
+            pane: "w1:p2".into(),
+            name: "feature".into(),
+            kind: "claude".into(),
+            cwd: cwd.into(),
+            parent: None,
+            mode: "headed".into(),
+            task: None,
+            session: None,
+            extra: vec![],
+        };
+        let of =
+            |a: &Value, r: &st::SpawnRecord| session_in(a, std::slice::from_ref(r), home.path());
+        assert_eq!(of(&a, &spawn), "s1");
+        // Any agent in the worktree is not enough: no spawn record, no session.
+        assert_eq!(session_in(&a, &[], home.path()), "");
+        for (field, value) in [
+            ("pane_id", "w1:p3"),
+            ("name", "another"),
+            ("agent", "codex"),
+            ("cwd", "/elsewhere"),
+        ] {
+            let mut other = a.clone();
+            other[field] = value.into();
+            assert_eq!(of(&other, &spawn), "", "{field}");
+        }
+        let recorded = |id: &str| st::SpawnRecord {
+            session: Some(id.into()),
+            ..spawn.clone()
+        };
+        assert_eq!(of(&a, &recorded("s1")), "s1");
+        assert_eq!(of(&a, &recorded("s0")), "");
+        // herdr's word stands whenever it has one.
+        let mut reported = a.clone();
+        reported["agent_session"]["value"] = "herdr-session".into();
+        assert_eq!(session_in(&reported, &[], home.path()), "herdr-session");
+        // A second session in the cwd: which one finished is unknown.
+        fs::write(logs.join("s2.jsonl"), "").unwrap();
+        assert_eq!(of(&a, &spawn), "");
     }
     #[test]
     fn pane_absence_requires_a_complete_inventory() {

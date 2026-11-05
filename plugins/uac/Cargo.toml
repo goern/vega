@@ -13,6 +13,7 @@ vega-bd-sync = { path = "../../crates/vega-bd-sync" }
 vega-ci-watch = { path = "../../crates/vega-ci-watch" }
 vega-herdr = { path = "../../crates/vega-herdr" }
 vega-shim = { path = "../../crates/vega-shim" }
+vega-transcript = { path = "../../crates/vega-transcript" }
 vega-registry = { path = "../../crates/vega-registry" }
 vega-plugin = { path = "../../crates/vega-plugin" }
 
