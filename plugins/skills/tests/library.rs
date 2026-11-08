@@ -199,7 +199,9 @@ fn tool_dir(tool: &str) -> Option<PathBuf> {
 
 fn tool_dir_in(tool: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     env::split_paths(path)
-        .find(|d| d.join(tool).is_file())
+        // Skip the agent-only vega shims: they need the rest of PATH to find
+        // the real tool, and the tests hand it a trimmed PATH (vega-fvcq).
+        .find(|d| !d.to_string_lossy().contains("/vega/shims") && d.join(tool).is_file())
         .map(|d| d.canonicalize().unwrap_or(d))
 }
 

@@ -806,6 +806,7 @@ mod tests {
         fs::write(logs.join("s1.jsonl"), "").unwrap();
         let a = json!({"pane_id": "w1:p2", "name": "feature", "agent": "claude", "cwd": cwd});
         let spawn = st::SpawnRecord {
+            backend: "herdr".into(),
             pane: "w1:p2".into(),
             name: "feature".into(),
             kind: "claude".into(),
@@ -815,6 +816,8 @@ mod tests {
             task: None,
             session: None,
             extra: vec![],
+            tier: None,
+            model: None,
         };
         let of =
             |a: &Value, r: &st::SpawnRecord| session_in(a, std::slice::from_ref(r), home.path());
