@@ -318,8 +318,9 @@ pub fn spawn(
     Ok(pane)
 }
 
-/// The toolbox launcher that `scripts/install-hc-toolbox-shell.sh` installs, when this host
-/// has one. The host's glibc can be older than the vega shims need (vega-alc), so agents
+/// The toolbox launcher a host provisions at `~/.local/bin/hc-toolbox-shell` (see
+/// docs/design/hc-migration.md, "Toolbox launch of local hc spawns"), when this host has
+/// one. The host's glibc can be older than the vega shims need (vega-alc), so agents
 /// must start inside the toolbox.
 fn toolbox_launcher() -> Option<String> {
     use std::os::unix::fs::PermissionsExt;
@@ -330,7 +331,8 @@ fn toolbox_launcher() -> Option<String> {
 }
 
 /// `toolbox run` passes only a fixed env allowlist (the launcher re-injects `HC_*`), so the
-/// spawn env goes in through `env` inside the toolbox. Empty values are masks, not settings.
+/// spawn env goes in through `env` inside the toolbox. An empty value stays `K=`, so it still
+/// overrides a value the toolbox would inherit.
 fn toolbox_argv(
     launcher: &str,
     env: &serde_json::Map<String, Value>,
@@ -338,7 +340,7 @@ fn toolbox_argv(
 ) -> Vec<String> {
     let mut out = vec![launcher.to_string(), "env".to_string()];
     for (k, v) in env {
-        if let Some(v) = v.as_str().filter(|v| !v.is_empty()) {
+        if let Some(v) = v.as_str() {
             out.push(format!("{k}={v}"));
         }
     }
@@ -490,6 +492,7 @@ mod tests {
                 "/h/.local/bin/hc-toolbox-shell",
                 "env",
                 "A=b c",
+                "HERDR_PANE_ID=",
                 "claude",
                 "--x"
             ]
