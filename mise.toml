@@ -38,6 +38,7 @@ run = [
   "sh scripts/install-vscode-ext.test.sh",
   "sh scripts/check-stamp.test.sh",
   "sh scripts/install-cli.test.sh",
+  "sh scripts/install-hc-toolbox-shell.test.sh",
   "python3 scripts/target-cache.test.py",
   "python3 scripts/target-profile.test.py",
   # Cargo commands have exited. The sweep also takes Cargo's nonblocking lock.
@@ -65,6 +66,10 @@ run = [
   # Skips with a hint where `code` is not on PATH (e.g. WSL).
   "sh scripts/install-vscode-ext.sh",
 ]
+
+[tasks.install-hc-toolbox-shell]
+description = "Install the hc toolbox launcher (~/.local/bin/hc-toolbox-shell) and point herdr-core's shell at it; skips without toolbox"
+run = "sh scripts/install-hc-toolbox-shell.sh"
 
 [tasks.install-dcg]
 description = "Install checksum-pinned dcg 0.16.0 without modifying agent hooks; rollback if doctor fails"
