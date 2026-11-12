@@ -195,6 +195,7 @@ pub fn spawn(
     }
     agent_args.extend(selection.args.clone());
     args.extend(agent_args);
+    let launcher = machine().is_none().then(toolbox_launcher).flatten();
     if let Some(p) = prompt {
         args.push(if no_parent && own.is_none() {
             p.into()
@@ -202,6 +203,10 @@ pub fn spawn(
             backend::body(p, handoff(no_parent, mode).0, machine().is_some())?
         });
     }
+    let args = match &launcher {
+        Some(l) => toolbox_argv(l, &launch_env, args),
+        None => args,
+    };
     let v = vega_herdr::hc::rpc(
         "terminal.run",
         serde_json::json!({
@@ -311,6 +316,34 @@ pub fn spawn(
         eprintln!("{w}");
     }
     Ok(pane)
+}
+
+/// The toolbox launcher that `scripts/install-hc-toolbox-shell.sh` installs, when this host
+/// has one. The host's glibc can be older than the vega shims need (vega-alc), so agents
+/// must start inside the toolbox.
+fn toolbox_launcher() -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(&env::var("HOME").ok()?).join(".local/bin/hc-toolbox-shell");
+    let meta = std::fs::metadata(&path).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .then(|| path.to_string_lossy().into_owned())
+}
+
+/// `toolbox run` passes only a fixed env allowlist (the launcher re-injects `HC_*`), so the
+/// spawn env goes in through `env` inside the toolbox. Empty values are masks, not settings.
+fn toolbox_argv(
+    launcher: &str,
+    env: &serde_json::Map<String, Value>,
+    agent: Vec<String>,
+) -> Vec<String> {
+    let mut out = vec![launcher.to_string(), "env".to_string()];
+    for (k, v) in env {
+        if let Some(v) = v.as_str().filter(|v| !v.is_empty()) {
+            out.push(format!("{k}={v}"));
+        }
+    }
+    out.extend(agent);
+    out
 }
 
 /// `machine.exec` wraps the program's output: base64 `stdout`, its exit `code`.
@@ -435,4 +468,31 @@ pub fn resume(pane: &str) -> Result<(), Failure> {
     drop_kept_brief(pane);
     println!("prompt: sent");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbox_argv_prefixes_launcher_and_carries_env() {
+        let mut env = serde_json::Map::new();
+        env.insert("A".into(), "b c".into());
+        env.insert("HERDR_PANE_ID".into(), "".into());
+        let argv = toolbox_argv(
+            "/h/.local/bin/hc-toolbox-shell",
+            &env,
+            vec!["claude".into(), "--x".into()],
+        );
+        assert_eq!(
+            argv,
+            [
+                "/h/.local/bin/hc-toolbox-shell",
+                "env",
+                "A=b c",
+                "claude",
+                "--x"
+            ]
+        );
+    }
 }

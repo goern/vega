@@ -142,7 +142,7 @@ mod tests {
         let c = parse(include_str!("../../../.vega/gate.toml")).unwrap();
         assert_eq!(c.timeout_secs, 1200);
         assert_eq!(c.tier, "budget");
-        assert_eq!(c.reviewers[1], "pi:zai/glm-5.3");
+        assert_eq!(c.reviewers[1], "pi:xai/grok-4.6");
         assert_eq!(c.reviews.len(), 1);
         assert_eq!(
             c.reviews[0].rubric.as_deref(),
