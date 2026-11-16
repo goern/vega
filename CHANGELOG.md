@@ -5,6 +5,14 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
+## 218 · 2026-11-16
+
+- feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
+  the gate's `timeout`, closes its beads `abandoned` with the reason and mails the author once, without
+  waiting for the author's next push (new `vega gate sweep` runs the same pass by hand). A bd failure
+  (Dolt server down) no longer drops the review's state with its beads still `running`: the state stays
+  until every bead is closed and the sweep retries.
+
 ## 217 · 2026-11-16
 
 - feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces

@@ -184,7 +184,9 @@ pub fn shared_script(dir: &str, name: &str, body: &str) -> PathBuf {
 /// `<log>` is `dir`, passed as `FAKE_LOG`.
 /// bd list answers `<log>/bd-list.json` (else `[]`); bd create numbers ids;
 /// vega pins `m-<lane>` and spawns fresh panes starting at w9:p5; a
-/// `<log>/spawn-fail-<kind>` file makes that kind's spawn fail; fake harness binaries
+/// `<log>/spawn-fail-<kind>` file makes that kind's spawn fail;
+/// `<log>/bd-down` (or `bd-down-<id>`) fails bd update/close like a dead
+/// Dolt server; `<log>/bd-open` makes bd show answer an open bead; fake harness binaries
 /// sit in a shared dir (`VEGA_GATE_HARNESS_PATH`); herdr's `pane get` answers
 /// `<log>/herdr-get.json`.
 pub fn fakes(dir: &Path) -> Vec<(String, PathBuf)> {
@@ -204,6 +206,12 @@ if [ -f $L/fail-supersede ] && [ "$1" = update ] && [ "$4" = verdict=superseded 
   echo "injected storage failure" >&2
   exit 1
 fi
+if [ "$1" = update ] || [ "$1" = close ]; then
+  if [ -f $L/bd-down ] || [ -f "$L/bd-down-$2" ]; then
+    echo "dial tcp 127.0.0.1:3307: connect: connection refused" >&2
+    exit 1
+  fi
+fi
 case "$1" in
   list) if [ -f "$L/bd-key-$3.json" ]; then cat "$L/bd-key-$3.json"; else cat $L/bd-list.json 2>/dev/null || echo '[]'; fi ;;
   create) n=$(( $(cat $L/bd-n 2>/dev/null || echo 0) + 1 )); echo $n > $L/bd-n
@@ -216,7 +224,7 @@ case "$1" in
       echo "slow" >&2; exit 1
     fi
     echo "gate-$n" ;;
-  show) echo '[{"status":"closed"}]' ;;
+  show) if [ -f $L/bd-open ]; then echo '[{"status":"in_progress"}]'; else echo '[{"status":"closed"}]'; fi ;;
 esac
 "#,
     );

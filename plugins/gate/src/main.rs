@@ -1,6 +1,6 @@
 //! `vega gate`: an LLM review before an agent's push. The git shim calls the
 //! same library on `git push`; this binary is the agent's and the reviewer's
-//! view: home, `check`, `start`, `verdict`, `log`, `gc`. Design:
+//! view: home, `check`, `start`, `verdict`, `log`, `sweep`, `gc`. Design:
 //! docs/design/gate.md.
 
 use std::env;
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         ["verdict", v @ ("pass" | "fail"), rest @ ..] => verdict_cmd(*v == "pass", rest),
         ["log"] => log(None),
         ["log", "--since", d] => log(Some(d)),
+        ["sweep"] => sweep(),
         ["gc"] => gc(),
         _ => Err(Failure::new(
             "usage",
@@ -131,8 +132,14 @@ fn home() -> Result<(), Failure> {
     if c.found.is_some() {
         segments_view(&c)?;
     }
-    for pane in start::reap_dead(&c.dir, &c.dir) {
-        println!("abandoned: reviewer {pane} exited without a verdict");
+    for s in start::reap_dead(&c.dir) {
+        match &s.error {
+            None => println!("abandoned: {}", s.reason),
+            Some(e) => println!(
+                "ending: {} (beads not finished: {e}; retried by vegad and the next vega gate)",
+                s.reason
+            ),
+        }
     }
     let running = state::all();
     println!(
@@ -310,11 +317,21 @@ fn log(since: Option<&str>) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Removes reviews whose beads are closed or that are older than a day, and
-/// clone dirs no review owns that are older than a day.
+/// Ends every review on this host whose reviewer exited or timed out (vegad
+/// runs the same pass on its own thread).
+fn sweep() -> Result<(), Failure> {
+    let swept = vega_gate::sweep::run(vega_shim::unix_now(), |_| true);
+    for s in &swept {
+        println!("{}", s.line());
+    }
+    println!("sweep: {} review(s) ended or retried", swept.len());
+    Ok(())
+}
+
+/// Removes reviews whose beads are closed (or whose repo is gone), and clone
+/// dirs no review owns that are older than a day.
 fn gc() -> Result<(), Failure> {
     const DAY: i64 = 86400;
-    let now = vega_shim::unix_now();
     let mut removed = 0;
     let mut owned: Vec<PathBuf> = Vec::new();
     for r in state::all() {
@@ -337,7 +354,9 @@ fn gc() -> Result<(), Failure> {
                 })
             })
         };
-        if now - r.started_at > DAY || !r.repo.exists() || closed() {
+        // Age alone never drops a review: its state is the only handle on
+        // beads still `running`. The sweep ends it; gc removes it once closed.
+        if !r.repo.exists() || closed() {
             start::cleanup(&r, start::pane_alive(&r));
             removed += 1;
         } else {

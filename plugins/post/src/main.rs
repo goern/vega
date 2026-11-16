@@ -27,6 +27,7 @@ mod catalog_broker_test;
 mod ci;
 mod cmd;
 mod delivery;
+mod gatesweep;
 mod gather;
 mod gitsync;
 mod hc_agents;
@@ -2593,6 +2594,8 @@ impl Jobs {
             hc_agents::spawn(etx);
             // Git sync (gitsync.rs): fetch, fast-forward clean main checkouts.
             gitsync::spawn();
+            // Gate sweep (gatesweep.rs): end exited or timed-out gate reviews.
+            gatesweep::spawn();
             // The lanista catalog (catalog.rs): fetch on the builder, copy elsewhere.
             catalog::spawn();
             // PagerDuty: one configured host, independent of the mail relay.

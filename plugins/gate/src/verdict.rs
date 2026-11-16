@@ -164,29 +164,7 @@ pub fn give(pass: bool, findings: &[Finding], r: &Review) -> Result<Vec<String>,
     // Keep direct hc delivery until hc offers an atomic idle-or-done guard
     // (vega-0h4c.17); direct hc send proves synchronous delivery.
     // Select transport by the saved backend.
-    let mailed = !r.author_pane.is_empty()
-        && match r.backend {
-            Backend::Hc => vega_herdr::hc_on(
-                None,
-                &["send", &r.author_pane, &text],
-                Some(Duration::from_secs(15)),
-            )
-            .is_ok(),
-            Backend::Herdr => run(
-                &tool("vega"),
-                &[
-                    "post",
-                    "send",
-                    "--from-tool",
-                    "vega-gate",
-                    &r.author_pane,
-                    &text,
-                ],
-                None,
-                Some(Duration::from_secs(15)),
-            )
-            .is_ok_and(|o| o.ok),
-        };
+    let mailed = mail_author(r, &text);
     start::cleanup_detached(r);
     // A replacing start may now close this finished pane immediately: all
     // verdict side effects, including author mail, are complete.
@@ -205,6 +183,35 @@ pub fn give(pass: bool, findings: &[Finding], r: &Review) -> Result<Vec<String>,
         ),
         "cleanup: this pane closes in 5 s; clone and state removed".into(),
     ])
+}
+
+/// Sends `text` to the review's author as the gate tool, over the transport
+/// of the saved backend. Keep direct hc delivery until hc offers an atomic
+/// idle-or-done guard (vega-0h4c.17); direct hc send proves synchronous delivery.
+pub fn mail_author(r: &Review, text: &str) -> bool {
+    !r.author_pane.is_empty()
+        && match r.backend {
+            Backend::Hc => vega_herdr::hc_on(
+                None,
+                &["send", &r.author_pane, text],
+                Some(Duration::from_secs(15)),
+            )
+            .is_ok(),
+            Backend::Herdr => run(
+                &tool("vega"),
+                &[
+                    "post",
+                    "send",
+                    "--from-tool",
+                    "vega-gate",
+                    &r.author_pane,
+                    text,
+                ],
+                None,
+                Some(Duration::from_secs(15)),
+            )
+            .is_ok_and(|o| o.ok),
+        }
 }
 
 /// The one verdict mail: the verdict, every finding inline (the reviewer's
@@ -261,6 +268,8 @@ mod tests {
             tab: "gate-fixes".into(),
             started_at: 0,
             timeout_secs: 60,
+            ended: String::new(),
+            mailed: false,
         }
     }
 

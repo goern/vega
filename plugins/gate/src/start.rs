@@ -310,6 +310,17 @@ pub fn pane_alive(r: &Review) -> bool {
 /// Removes a review's clone, rubric export and state file now; closes its
 /// pane when asked. Only paths under the gate's cache dir are removed.
 pub fn cleanup(r: &Review, close_pane: bool) {
+    release_pane(r, close_pane);
+    for p in [&r.clone, &r.work] {
+        if p.starts_with(cache_dir()) && p != &cache_dir() {
+            let _ = fs::remove_dir_all(p);
+        }
+    }
+    state::remove(&r.pane);
+}
+
+/// Kills the reviewer when asked; an hc terminal record is removed either way.
+pub fn release_pane(r: &Review, close_pane: bool) {
     if r.backend == Backend::Hc {
         if close_pane {
             let _ = vega_herdr::hc_on(None, &["kill", &r.pane], Some(Duration::from_secs(5)));
@@ -330,12 +341,6 @@ pub fn cleanup(r: &Review, close_pane: bool) {
             Some(Duration::from_secs(5)),
         );
     }
-    for p in [&r.clone, &r.work] {
-        if p.starts_with(cache_dir()) && p != &cache_dir() {
-            let _ = fs::remove_dir_all(p);
-        }
-    }
-    state::remove(&r.pane);
 }
 
 /// The verdict's cleanup: after 5 s remove the clone, rubric export and state
@@ -377,39 +382,10 @@ pub fn cleanup_detached(r: &Review) {
         .spawn();
 }
 
-/// A fresh reviewer is not judged dead before its pane has had this long to
-/// show up in the terminal's list.
-pub const REAP_GRACE_SECS: i64 = 15;
-
-/// Ends the reviews of `repo` whose reviewer pane is gone (exited) with no
-/// verdict written: their running beads become `abandoned` and the state,
-/// clone and pane are cleaned, so the next `vega gate start` starts a fresh
-/// review instead of waiting for the timeout. The state lock decides against
-/// a verdict in flight. Returns the abandoned panes.
-pub fn reap_dead(dir: &Path, repo: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    for r in state::all() {
-        if r.repo != repo || now() - r.started_at <= REAP_GRACE_SECS || pane_alive(&r) {
-            continue;
-        }
-        let Ok(Some(guard)) = state::lock_current(&r) else {
-            continue;
-        };
-        for b in &r.beads {
-            let _ = record::finish(
-                dir,
-                b,
-                "abandoned",
-                &format!("abandoned: reviewer {} exited without a verdict", r.pane),
-                None,
-            );
-        }
-        state::remove(&r.pane);
-        drop(guard);
-        cleanup(&r, false);
-        out.push(r.pane.clone());
-    }
-    out
+/// Ends the reviews of `repo` whose reviewer exited or ran past its timeout
+/// without a verdict ([`crate::sweep`]).
+pub fn reap_dead(repo: &Path) -> Vec<crate::sweep::Swept> {
+    crate::sweep::run(now(), |r| r.repo == repo)
 }
 
 /// What a plan needs: a pass for every segment, else a running review.
@@ -522,7 +498,9 @@ pub fn start_from(
             });
             continue;
         }
-        let _ = record::finish(
+        // A failed write keeps the state: the sweep retries it, and the bead
+        // must not stay `running` with nothing left to finish it.
+        record::finish(
             dir,
             &b.id,
             "abandoned",
@@ -532,7 +510,7 @@ pub fn start_from(
                 format!("abandoned: reviewer gone or silent past {timeout} s")
             },
             None,
-        );
+        )?;
         if let Some(r) = st {
             skip_reviewers.push((r.kind.clone(), r.model.clone()));
             cleanup(r, alive);
@@ -1188,6 +1166,8 @@ fn spawn_review(
         tab: tab.clone(),
         started_at: now(),
         timeout_secs: cfg.timeout_secs,
+        ended: String::new(),
+        mailed: false,
     };
     r.save()?;
     if text.contains("brief: pasted, not confirmed") {

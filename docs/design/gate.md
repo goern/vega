@@ -325,11 +325,32 @@ timeout, since their state is not visible here.
 | Reviewer idle without ever taking its prompt (no prompt in its session log), or at a dialog | `vega gate` and the running line say `stuck` or `blocked` with `vega mux show <pane>` for TUI or `hc read <terminal>` for hc; the timeout still applies |
 | Push again or `vega gate start`, new head, review running | lock the old review, mark its beads `superseded`, revoke its state, close the old pane and start a fresh reviewer bound to the new head/generation. Include unchanged running segments; never re-point a reviewer by mail. A stale verdict cannot apply to the new generation |
 | `bd create` fails or times out after writing the bead | the bead is adopted by external ref and review id; a start that still fails abandons the beads it created; a leftover local `running` bead without state is abandoned after 300 s (section 6) |
-| Reviewer dies (pane gone) or silent past `timeout` | on the next push: bead `abandoned`, cleanup, start a new review with the next candidate. A second abandon for the same key fails open (infrastructure, spike input 7) |
-| Reviewer exited (hc terminal not `live`, herdr pane gone) with no verdict, e.g. the agent rejected its argv at start | `vega gate` (home) and `vega gate start` end the review at once, once it is 15 s old: beads `abandoned` (reason `reviewer <pane> exited without a verdict`), state, clone and pane cleaned, so the next start spawns afresh instead of reporting a running review. The state lock decides against a verdict in flight |
+| Reviewer dies (pane gone), exits, or is silent past `timeout`, with no verdict | ended actively, without a push (section 7, Sweep): reviewer killed if still running, beads `abandoned` (reason `reviewer <pane> exited without a verdict` or `reviewer <pane> silent past the <n> s timeout`), the author mailed once, clone and state cleaned. The next start picks the next candidate; a second abandon for the same key fails open (infrastructure, spike input 7) |
+| bd fails while ending a review (its Dolt server down) | the state stays, holding the beads not yet finished and the end reason; the next sweep retries, without a second mail. A state file is removed only after every bead is finished, so no bead stays `running` with nothing left to finish it. `vega gate start` stops with the bd error instead of dropping it |
 | A push's own commit has `Assisted-by` without a model, or none names the pane's kind with one | refused at once: exit 1 with the commits to reword; no bead, no reviewer (section 4, step 1) |
 | Target ref missing locally | uses `<remote>/HEAD`; none either: fail open |
 | Reviewer pushes | refused (section 1) |
+
+### Sweep: who ends a review without a verdict
+
+`vega gate sweep` (library `vega_gate::sweep`) checks every review state on the host: past the 15 s grace,
+a reviewer that is gone (hc terminal not `live`, herdr pane gone) or older than its `timeout_secs` (counted
+from its start) is ended. Under the state lock: record the reason in the state, kill the reviewer if it
+still runs (hc `kill` + `rm`, herdr `pane close`), mail the author once (`hc send` / `vega post send
+--from-tool vega-gate`, as the verdict), then finish each bead `abandoned`. Only when all are finished are
+the state, clone and rubric export removed; otherwise the state keeps the unfinished beads for the next pass.
+A verdict in flight wins the lock; a verdict after the end is refused (the state no longer matches).
+
+**Owner: a vegad thread** (`plugins/post/src/gatesweep.rs`, every 60 s, on every vegad, broker or not).
+Before, only `vega gate start` and `vega gate` home ended reviews, so a hung reviewer whose author never
+pushed again ran for hours (wechsler, 2026-11-16: an agy reviewer 4 h at a login screen, its beads
+`running`). vegad is the one process always running per host that already owns the host's gate
+housekeeping (`vega gate gc` on the janitor tick) and the review states are host-local, so no other host
+can do it. Not on the relay loop or the janitor tick: one pass may spend several bd calls (5 s each) and
+hc kills, which would break the loop's 5 s step budget (vegad.md, loop budget health); its own thread
+leaves the loop untouched, like gitsync. 60 s keeps a review's end within a minute of its timeout at
+the cost of one directory read per minute when nothing runs. `vega gate` (home) runs the same pass for
+its repo; `vega gate gc` no longer drops a review by age, only once its beads are closed or its repo is gone.
 
 ## 8. `vega gate` plugin
 
@@ -395,7 +416,8 @@ Each step a bead under vega-lhc.146, after this design lands.
   check writes a marker file, and non-push calls do no IO at all.
 - A review's timeout counts from its start (state file / bead `started_at`), not from the reviewer's last
   activity.
-- vegad runs `vega gate gc` on its five-minute janitor tick. It is best-effort: one failure is logged and
+- vegad runs `vega gate gc` on its five-minute janitor tick, and the sweep (section 7) every minute on its
+  own thread. It is best-effort: one failure is logged and
   the daemon continues; a successful later tick resets that one-time failure log.
 - A sentinel branch that merged main into itself is walked like a push (runs plus the merge's combined
   diff), so its keys differ from the UAC's `merge-base(P1, P2)..P2` segment; that branch is reviewed again

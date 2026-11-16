@@ -13,6 +13,7 @@ pub mod record;
 pub mod segments;
 pub mod start;
 pub mod state;
+pub mod sweep;
 mod terminal;
 pub mod verdict;
 
