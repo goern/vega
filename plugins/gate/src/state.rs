@@ -31,6 +31,11 @@ pub struct Review {
     pub tab: String,
     pub started_at: i64,
     pub timeout_secs: i64,
+    /// Why the sweep ended this review without a verdict; empty while it
+    /// runs. A review stays recorded until every bead is finished.
+    pub ended: String,
+    /// The author was mailed about the end (once, never again).
+    pub mailed: bool,
 }
 
 pub fn file(pane: &str) -> PathBuf {
@@ -61,6 +66,8 @@ impl Review {
             "tab": self.tab,
             "started_at": self.started_at,
             "timeout_secs": self.timeout_secs,
+            "ended": self.ended,
+            "mailed": self.mailed,
         })
     }
 
@@ -102,6 +109,8 @@ impl Review {
                 .get("timeout_secs")
                 .and_then(Value::as_i64)
                 .unwrap_or(1200),
+            ended: s("ended").unwrap_or_default(),
+            mailed: v.get("mailed").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
@@ -171,7 +180,11 @@ pub fn all() -> Vec<Review> {
 pub fn waiting_authors(now: i64) -> std::collections::HashSet<String> {
     all()
         .into_iter()
-        .filter(|r| !r.author_pane.is_empty() && now < r.started_at.saturating_add(r.timeout_secs))
+        .filter(|r| {
+            !r.author_pane.is_empty()
+                && r.ended.is_empty()
+                && now < r.started_at.saturating_add(r.timeout_secs)
+        })
         .map(|r| r.author_pane)
         .collect()
 }
@@ -205,11 +218,19 @@ mod tests {
             tab: "gate-b".into(),
             started_at: 5,
             timeout_secs: 60,
+            ended: String::new(),
+            mailed: false,
         };
         assert_eq!(Review::from_json(&r.to_json()), Some(r.clone()));
         let mut legacy = r.to_json();
         legacy.as_object_mut().unwrap().remove("backend");
+        legacy.as_object_mut().unwrap().remove("ended");
+        legacy.as_object_mut().unwrap().remove("mailed");
         assert_eq!(Review::from_json(&legacy), Some(r.clone()));
+        let mut ending = r.clone();
+        ending.ended = "reviewer w1:p2 exited without a verdict".into();
+        ending.mailed = true;
+        assert_eq!(Review::from_json(&ending.to_json()), Some(ending));
         let mut hc = r;
         hc.backend = vega_herdr::pane::Backend::Hc;
         hc.pane = "t7".into();

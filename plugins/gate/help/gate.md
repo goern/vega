@@ -19,7 +19,10 @@ Commands:
                             the reviewer's verdict; only the pane `start` spawned
                             may give it; sends the verdict, closes the terminal
   log [--since <7d>]        every gate bead: passes, fails, skips, no-reviewer
-  gc                        remove clones of finished or day-old reviews
+  sweep                     end reviews whose reviewer exited or ran past its
+                            timeout: kill it, beads abandoned, author mailed
+                            once (vegad runs this every minute)
+  gc                        remove finished reviews and day-old orphan clones
 
 Target: the branch's upstream, else origin/HEAD, else origin/main.
 Config: .vega/gate.toml at the target; no file, no gate. Beads repos only.

@@ -824,6 +824,9 @@ path), `git status` 3.3–10 s, one `report-metadata` per pane and workspace 0.8
 - **`git status` off the loop** (`probes.rs`): one thread reads each checkout a refresh asked
   about, new ones first, then each every 30 s; the refresh takes the last value (no `$git` until the
   first read). A checkout no refresh named for 2 min is dropped.
+- **Gate sweep thread** (`plugins/post/src/gatesweep.rs`): every 60 s ends gate reviews whose
+  reviewer exited or ran past its timeout (kill, beads `abandoned`, one author mail; gate.md section 7,
+  Sweep). Its bd calls and hc kills never run on the loop; a review kept by a bd error is logged once.
 - **Agents below vegad**: `vega mux spawn` renices the pane shell to 10 before the agent starts
   (local spawns); the agent and its tools inherit it, vegad stays at 0. Not `taskpolicy -b`: it
   confines builds to the efficiency cores.

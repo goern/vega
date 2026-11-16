@@ -5,7 +5,7 @@ read from the push target. The `git` shim checks a recorded pass for each segmen
 commits, each merged branch) and otherwise starts a reviewer agent in the author's backend (herdr or hc) and fails the push until its
 verdict. Records are beads (label `gate`), synced across hosts.
 
-Commands: `vega gate`, `check`, `start`, `verdict`, `log`, `gc`. The library (`vega_gate`) is shared with
+Commands: `vega gate`, `check`, `start`, `verdict`, `log`, `sweep`, `gc`. The library (`vega_gate`) is shared with
 [`shims/git`](../../shims/git/).
 
 Reviewer selection excludes exact author models and prefers other harnesses; a different model on an
