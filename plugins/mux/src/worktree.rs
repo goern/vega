@@ -58,14 +58,118 @@ pub fn hc_worktree(
     branch: &str,
     base: Option<&str>,
 ) -> Result<(String, String), Failure> {
-    if !wt_installed() {
+    let top = git(repo, &["rev-parse", "--show-toplevel"]);
+    let root = top.as_deref().unwrap_or(repo);
+    match backend(
+        wt_installed(),
+        Path::new(root).join(".config/wt.toml").exists(),
+        user_config().exists(),
+    )? {
+        Backend::Wt => wt_switch(repo, branch, base),
+        // No wt and no worktrunk config: nothing to honor but the layout.
+        Backend::Herdr => {
+            let top = top.ok_or_else(|| {
+                Failure::new(
+                    "not_a_repo",
+                    format!("{} is not inside a git repository", collapse_home(repo)),
+                    "pass --cwd <dir of the repo> to branch from",
+                )
+            })?;
+            git_worktree(&top, branch, base)
+        }
+    }
+}
+
+/// `<repo>.<branch>` next to the repo, wt's default layout; `/` in the branch
+/// becomes `-`.
+fn sibling_path(repo_name: &str, top: &Path, branch: &str) -> PathBuf {
+    let dir = format!("{repo_name}.{}", branch.replace(['/', '\\'], "-"));
+    top.parent().unwrap_or(top).join(dir)
+}
+
+/// The checkout path of `branch` in `git worktree list --porcelain` output.
+fn worktree_of(porcelain: &str, branch: &str) -> Option<String> {
+    let want = format!("branch refs/heads/{branch}");
+    porcelain
+        .split("\n\n")
+        .find(|b| b.lines().any(|l| l == want))
+        .and_then(|b| b.lines().find_map(|l| l.strip_prefix("worktree ")))
+        .map(String::from)
+}
+
+/// The main checkout's directory name (`repo`, or `repo` for a bare `repo.git`).
+fn repo_name(top: &str) -> String {
+    let dir_name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    git(
+        top,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .and_then(|c| {
+        let c = PathBuf::from(c);
+        let root = if c.file_name().is_some_and(|n| n == ".git") {
+            c.parent()?.to_path_buf()
+        } else {
+            c
+        };
+        dir_name(&root)
+    })
+    .or_else(|| dir_name(Path::new(top)))
+    .unwrap_or_default()
+    .trim_end_matches(".git")
+    .to_string()
+}
+
+/// Plain `git worktree add`, idempotent: a worktree already holding the
+/// branch is reused, an existing branch is checked out, else it is created
+/// from `base` (default HEAD). No timeout: the checkout can take minutes.
+fn git_worktree(top: &str, branch: &str, base: Option<&str>) -> Result<(String, String), Failure> {
+    if let Some(list) = git(top, &["worktree", "list", "--porcelain"]) {
+        if let Some(path) = worktree_of(&list, branch) {
+            let how = match base {
+                Some(_) => "reused via git; --base ignored, the branch exists",
+                None => "reused via git",
+            };
+            return Ok((path, how.into()));
+        }
+    }
+    let path = sibling_path(&repo_name(top), Path::new(top), branch)
+        .display()
+        .to_string();
+    let exists = branch_exists(top, branch);
+    let mut args = vec!["-C", top, "worktree", "add"];
+    if exists {
+        args.extend(["--", &path, branch]);
+    } else {
+        args.extend(["-b", branch, "--", &path]);
+        if let Some(b) = base {
+            args.push(b);
+        }
+    }
+    let out = Command::new("git")
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| Failure::new("git_failed", e.to_string(), "install git"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" / ");
         return Err(Failure::new(
-            "wt_not_found",
-            "hc worktrees require worktrunk",
-            "install worktrunk, or pass --cwd for an existing checkout",
+            "git_worktree_failed",
+            format!("git worktree add failed: {msg}"),
+            "fix the cause above, or pick another --worktree branch",
         ));
     }
-    wt_switch(repo, branch, base)
+    let how = if exists {
+        "created for the existing branch via git (no wt)".to_string()
+    } else {
+        format!("created from {} via git (no wt)", base.unwrap_or("HEAD"))
+    };
+    Ok((path, how))
 }
 
 /// wt when installed; else herdr, unless a worktrunk config asks for wt.
@@ -368,6 +472,59 @@ mod tests {
     fn wt_failure_maps_hook_approval() {
         let stderr = "▲ vega needs approval to execute 1 command:\n✗ Cannot prompt for approval in non-interactive environment\n";
         assert_eq!(wt_failure(stderr, "/r").code, "approval_required");
+    }
+
+    #[test]
+    fn sibling_path_follows_wt_layout() {
+        assert_eq!(
+            sibling_path("vega", Path::new("/src/vega"), "fix/x"),
+            PathBuf::from("/src/vega.fix-x")
+        );
+    }
+
+    #[test]
+    fn worktree_of_finds_the_branch() {
+        let l = "worktree /src/vega\nHEAD a\nbranch refs/heads/main\n\nworktree /src/vega.x\nHEAD b\nbranch refs/heads/x\n";
+        assert_eq!(worktree_of(l, "x").as_deref(), Some("/src/vega.x"));
+        assert_eq!(worktree_of(l, "xx"), None);
+    }
+
+    #[test]
+    fn git_worktree_creates_honours_base_and_reuses() {
+        let d = std::env::temp_dir().join(format!("vega-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let repo = d.join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-C"])
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        g(&["branch", "base"]);
+        g(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        let top = repo.canonicalize().unwrap().display().to_string();
+        let (p, how) = git_worktree(&top, "feat/y", Some("base")).unwrap();
+        assert!(p.ends_with("/r.feat-y") && Path::new(&p).is_dir(), "{p}");
+        assert!(how.starts_with("created from base"), "{how}");
+        assert_eq!(
+            git(&p, &["rev-parse", "HEAD"]),
+            git(&top, &["rev-parse", "base"])
+        );
+        let (p2, how2) = git_worktree(&top, "feat/y", None).unwrap();
+        assert_eq!(p, p2);
+        assert_eq!(how2, "reused via git");
+        // existing branch without a worktree: checked out, not recreated
+        g(&["branch", "old"]);
+        let (p3, how3) = git_worktree(&top, "old", None).unwrap();
+        assert!(p3.ends_with("/r.old"), "{p3}");
+        assert!(how3.contains("existing branch"), "{how3}");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
