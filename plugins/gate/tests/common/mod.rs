@@ -206,7 +206,16 @@ if [ -f $L/fail-supersede ] && [ "$1" = update ] && [ "$4" = verdict=superseded 
 fi
 case "$1" in
   list) if [ -f "$L/bd-key-$3.json" ]; then cat "$L/bd-key-$3.json"; else cat $L/bd-list.json 2>/dev/null || echo '[]'; fi ;;
-  create) n=$(( $(cat $L/bd-n 2>/dev/null || echo 0) + 1 )); echo $n > $L/bd-n; echo "gate-$n" ;;
+  create) n=$(( $(cat $L/bd-n 2>/dev/null || echo 0) + 1 )); echo $n > $L/bd-n
+    if [ "$(cat $L/create-dies-at 2>/dev/null)" = "$n" ]; then echo "died" >&2; exit 1; fi
+    if [ -f $L/create-fails ]; then
+      # bd wrote the bead, then the gate gave up on it (a timeout).
+      rm -f $L/create-fails
+      while [ "$1" != --metadata ]; do shift; done
+      printf '[{"id":"gate-%s","status":"in_progress","metadata":%s}]\n' "$n" "$2" > $L/bd-list.json
+      echo "slow" >&2; exit 1
+    fi
+    echo "gate-$n" ;;
   show) echo '[{"status":"closed"}]' ;;
 esac
 "#,

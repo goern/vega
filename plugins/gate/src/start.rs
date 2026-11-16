@@ -497,7 +497,10 @@ pub fn start_from(
             |r| r.started_at,
         );
         let timeout = st.map_or(cfg.timeout_secs, |r| r.timeout_secs);
-        let alive = st.is_none_or(pane_alive);
+        let alive = match st {
+            Some(r) => pane_alive(r),
+            None => !orphaned(b, &host(), now()),
+        };
         if alive && now() - started <= timeout {
             running_msg.get_or_insert_with(|| match st {
                 Some(r) => running_line(r),
@@ -514,7 +517,11 @@ pub fn start_from(
             dir,
             &b.id,
             "abandoned",
-            &format!("abandoned: reviewer gone or silent past {timeout} s"),
+            &if st.is_none() && !alive {
+                format!("abandoned: no reviewer started on this host within {SPAWN_GRACE_SECS} s")
+            } else {
+                format!("abandoned: reviewer gone or silent past {timeout} s")
+            },
             None,
         );
         if let Some(r) = st {
@@ -622,6 +629,19 @@ pub fn start_from(
             }
         }
     }
+}
+
+/// A start that spawns a reviewer saves its state within this long after
+/// creating its beads (spawn waits up to 180 s).
+pub const SPAWN_GRACE_SECS: i64 = 300;
+
+/// A running bead recorded on this host without local reviewer state, past
+/// the spawn grace: its start died between `bd create` and the state file
+/// (a bd timeout, a crash), so no reviewer will ever give its verdict.
+/// Beads of other hosts keep their timeout; their state is not visible here.
+pub fn orphaned(b: &Bead, host: &str, now: i64) -> bool {
+    let started: i64 = b.meta_str("started_at").parse().unwrap_or(0);
+    b.is_running() && b.meta_str("reviewer_host") == host && now - started > SPAWN_GRACE_SECS
 }
 
 fn record_abandons(dir: &Path, plan: &Plan, key: &str) -> usize {
@@ -1054,13 +1074,18 @@ fn spawn_review(
         ] {
             m[k] = Value::String(v);
         }
-        beads.push(record::create(
-            dir,
-            &title(branch, &plan.head, &who),
-            &s.key,
-            &m,
-            None,
-        )?);
+        match record::create(dir, &title(branch, &plan.head, &who), &s.key, &m, None) {
+            Ok(id) => beads.push(id),
+            Err(e) => {
+                // No reviewer will own the beads created so far.
+                for b in &beads {
+                    let _ = record::finish(dir, b, "abandoned", &format!("abandoned: {e}"), None);
+                }
+                let _ = fs::remove_dir_all(&clone);
+                let _ = fs::remove_dir_all(&work);
+                return Err(e);
+            }
+        }
     }
 
     let tab = if backend == Backend::Hc {
@@ -1477,6 +1502,37 @@ mod tests {
             mise_ignore(c, Some("/x:/y")),
             "MISE_IGNORED_CONFIG_PATHS=/x:/y:/h/.cache/vega/gate/clones/abc"
         );
+    }
+
+    #[test]
+    fn a_local_running_bead_without_state_is_an_orphan_after_the_grace() {
+        let b = |status: &str, verdict: &str, host: &str, started: i64| Bead {
+            id: "g-1".into(),
+            title: String::new(),
+            status: status.into(),
+            meta: serde_json::json!({
+                "verdict": verdict, "reviewer_host": host, "started_at": started.to_string()
+            }),
+            created_at: String::new(),
+            close_reason: String::new(),
+        };
+        let now = 10_000;
+        let old = now - SPAWN_GRACE_SECS - 1;
+        assert!(orphaned(&b("in_progress", "running", "h1", old), "h1", now));
+        // Inside the grace a concurrent start may still be spawning.
+        assert!(!orphaned(
+            &b("in_progress", "running", "h1", now - 10),
+            "h1",
+            now
+        ));
+        // Another host's review keeps its timeout.
+        assert!(!orphaned(
+            &b("in_progress", "running", "h2", old),
+            "h1",
+            now
+        ));
+        assert!(!orphaned(&b("closed", "running", "h1", old), "h1", now));
+        assert!(!orphaned(&b("in_progress", "pass", "h1", old), "h1", now));
     }
 
     #[test]

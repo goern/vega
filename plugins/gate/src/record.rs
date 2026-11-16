@@ -130,6 +130,11 @@ pub fn status(beads: Vec<Bead>, floor: usize) -> Status {
 
 /// Creates a gate bead; `closed` with a reason closes it at once (skip,
 /// unreviewed, no-reviewer). Returns its id.
+///
+/// A failed `bd create` (for example slower than [`BD_TIMEOUT`]) may still
+/// have written the bead. It is then looked up by its external ref and
+/// review id and adopted, so no `running` bead is left without a reviewer
+/// (gate.md section 6). Only when no such bead is found is the error returned.
 pub fn create(
     dir: &Path,
     title: &str,
@@ -137,13 +142,40 @@ pub fn create(
     meta: &Value,
     closed: Option<&str>,
 ) -> Result<String, String> {
+    let id = match create_once(dir, title, key, meta, closed.is_some()) {
+        Ok(id) => id,
+        Err(e) => adopt(lookup(dir, key).unwrap_or_default(), meta).ok_or(e)?,
+    };
+    if let Some(reason) = closed {
+        close(dir, &id, reason)?;
+    }
+    Ok(id)
+}
+
+/// The open bead a failed create of `meta` left: same review and verdict.
+fn adopt(beads: Vec<Bead>, meta: &Value) -> Option<String> {
+    let want = |k: &str| meta.get(k).and_then(Value::as_str).unwrap_or("");
+    beads
+        .into_iter()
+        .find(|b| {
+            b.status != "closed"
+                && !want("review").is_empty()
+                && b.meta_str("review") == want("review")
+                && b.verdict() == want("verdict")
+        })
+        .map(|b| b.id)
+}
+
+fn create_once(
+    dir: &Path,
+    title: &str,
+    key: &str,
+    meta: &Value,
+    closed: bool,
+) -> Result<String, String> {
     let r = format!("gate:{key}");
     let meta = meta.to_string();
-    let status = if closed.is_some() {
-        "open"
-    } else {
-        "in_progress"
-    };
+    let status = if closed { "open" } else { "in_progress" };
     let id = bd(
         dir,
         &[
@@ -169,9 +201,6 @@ pub fn create(
     .to_string();
     if id.is_empty() {
         return Err("bd create: no id".into());
-    }
-    if let Some(reason) = closed {
-        close(dir, &id, reason)?;
     }
     Ok(id)
 }
@@ -213,6 +242,20 @@ pub fn meta(fields: &[(&str, String)]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_create_adopts_only_its_own_open_bead() {
+        let meta = json!({"review": "r1", "verdict": "running"});
+        let beads = parse_list(
+            r#"[{"id":"g-1","status":"in_progress","metadata":{"review":"r0","verdict":"running"}},
+                {"id":"g-2","status":"closed","metadata":{"review":"r1","verdict":"running"}},
+                {"id":"g-3","status":"in_progress","metadata":{"review":"r1","verdict":"running"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(adopt(beads.clone(), &meta).as_deref(), Some("g-3"));
+        assert_eq!(adopt(beads[..2].to_vec(), &meta), None);
+        assert_eq!(adopt(beads, &json!({"verdict": "running"})), None);
+    }
 
     #[test]
     fn status_prefers_a_pass_then_a_running_review() {
