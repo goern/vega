@@ -13,6 +13,9 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   pane's session log was not found (vega-v20k). Gate reviewers ignore the clone's mise config instead of
   hanging on mise's trust prompt (vega-r36c). `vega uac land` accepts `VEGA_GATE=skip` only with
   `VEGA_GATE_REASON` and shows it in the receipt (vega-sw7k).
+- feature: a `bd create` that times out after writing its gate bead no longer leaves a `running` bead
+  without a reviewer ("review running elsewhere" until the timeout): the gate adopts the bead, and a
+  leftover local one without reviewer state is abandoned after 5 minutes.
 
 ## 216 · 2026-11-16
 

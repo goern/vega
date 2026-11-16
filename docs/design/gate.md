@@ -303,6 +303,15 @@ seconds, pulled every 60 s), so a pass on one host counts on all.
 **Lookup (shim):** `bd list --external-ref gate:<key> --all --json` (0.19 s measured on proteus); a pass is a
 closed bead with `verdict=pass`. Only a pass lets the push through; `fail` beads stay as history.
 
+**No orphaned `running` bead:** a `bd create` that fails, including one slower than 5 s, may
+still have written its bead. The gate then looks it up by `gate:<key>` and adopts the open bead with
+its own review id and verdict; only when none is found does the error stand (and fail open, section 1).
+When a later create of the same start fails, the beads it already created are closed `abandoned`
+before the error is returned. As a backstop, a `running` bead whose `reviewer_host` is this host, with
+no local review state, older than the 300 s spawn grace, is abandoned like a gone reviewer
+(section 7): its start died before the state file, so no verdict can come. Other hosts' beads keep the
+timeout, since their state is not visible here.
+
 ## 7. Failure cases
 
 | Case | Behaviour |
@@ -315,6 +324,7 @@ closed bead with `verdict=pass`. Only a pass lets the push through; `fail` beads
 | Push again, same head and key, review running | exit 1 at once, `review running in tab gate-<branch> since 6 min`; no second reviewer |
 | Reviewer idle without ever taking its prompt (no prompt in its session log), or at a dialog | `vega gate` and the running line say `stuck` or `blocked` with `vega mux show <pane>` for TUI or `hc read <terminal>` for hc; the timeout still applies |
 | Push again or `vega gate start`, new head, review running | lock the old review, mark its beads `superseded`, revoke its state, close the old pane and start a fresh reviewer bound to the new head/generation. Include unchanged running segments; never re-point a reviewer by mail. A stale verdict cannot apply to the new generation |
+| `bd create` fails or times out after writing the bead | the bead is adopted by external ref and review id; a start that still fails abandons the beads it created; a leftover local `running` bead without state is abandoned after 300 s (section 6) |
 | Reviewer dies (pane gone) or silent past `timeout` | on the next push: bead `abandoned`, cleanup, start a new review with the next candidate. A second abandon for the same key fails open (infrastructure, spike input 7) |
 | A push's own commit has `Assisted-by` without a model, or none names the pane's kind with one | refused at once: exit 1 with the commits to reword; no bead, no reviewer (section 4, step 1) |
 | Target ref missing locally | uses `<remote>/HEAD`; none either: fail open |

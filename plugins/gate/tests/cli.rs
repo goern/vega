@@ -758,3 +758,113 @@ fn hc_status_and_sentinel_guidance_follow_terminal_fields() {
     assert!(home.status.success(), "{}", out(&home));
     assert!(out(&home).contains(",gone"), "{}", out(&home));
 }
+
+#[test]
+fn a_bead_written_by_a_timed_out_create_is_adopted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = feature(tmp.path());
+    fs::write(tmp.path().join("create-fails"), "").unwrap();
+    let o = run(&work, tmp.path(), &[("HERDR_PANE_ID", "w1:p1")], &["start"]);
+    let s = out(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("review running in tab gate-feat-login"), "{s}");
+    let bd = log(tmp.path(), "bd");
+    assert!(
+        bd.contains("update gate-1 --set-metadata reviewer_pane=w9:p5"),
+        "{bd}"
+    );
+    assert!(!bd.contains("abandoned"), "{bd}");
+    let st: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(tmp.path().join("state/vega/gate/w9_p5.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(st["beads"][0], "gate-1");
+}
+
+#[test]
+fn a_local_running_bead_without_a_reviewer_is_abandoned_after_the_grace() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for (host_is_ours, abandoned) in [(true, true), (false, false)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = feature(tmp.path());
+        let env = [("HERDR_PANE_ID", "w1:p1")];
+        assert!(run(&work, tmp.path(), &env, &["start"]).status.success());
+        // The first start's bead, as if its start had died before the state file.
+        let bd = log(tmp.path(), "bd");
+        let create = bd.lines().find(|l| l.starts_with("create")).unwrap();
+        let json = create
+            .split_once("--metadata ")
+            .and_then(|(_, r)| r.split_once(" --status"))
+            .unwrap()
+            .0;
+        let mut meta: serde_json::Value = serde_json::from_str(json).unwrap();
+        meta["started_at"] = (now - 400).to_string().into();
+        if !host_is_ours {
+            meta["reviewer_host"] = "elsewhere".into();
+        }
+        fs::remove_file(tmp.path().join("state/vega/gate/w9_p5.json")).unwrap();
+        fs::write(
+            tmp.path().join("bd-list.json"),
+            serde_json::json!([{"id": "gate-1", "status": "in_progress", "metadata": meta}])
+                .to_string(),
+        )
+        .unwrap();
+        let o = run(&work, tmp.path(), &env, &["start"]);
+        let s = out(&o);
+        assert!(o.status.success(), "{s}");
+        let bd = log(tmp.path(), "bd");
+        assert_eq!(
+            bd.contains("no reviewer started on this host"),
+            abandoned,
+            "{bd}"
+        );
+        assert_eq!(
+            s.contains("review running elsewhere (gate-1"),
+            !abandoned,
+            "{s}"
+        );
+        let spawns = log(tmp.path(), "vega")
+            .lines()
+            .filter(|l| l.starts_with("mux spawn"))
+            .count();
+        assert_eq!(spawns, if abandoned { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn a_create_failing_midway_abandons_the_beads_created_before() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = feature(tmp.path());
+    // Two segments: the run a1 and a merged branch.
+    git(&work, &["checkout", "-q", "-b", "side", "origin/main"]);
+    common::commit(&work, "src/b.rs", "fn b() {}\n", "b1");
+    git(&work, &["checkout", "-q", "feat/login"]);
+    git(
+        &work,
+        &["merge", "-q", "--no-ff", "-m", "Merge side", "side"],
+    );
+    fs::write(tmp.path().join("create-dies-at"), "2").unwrap();
+    let o = run(&work, tmp.path(), &[("HERDR_PANE_ID", "w1:p1")], &["start"]);
+    let s = out(&o);
+    assert!(!o.status.success(), "{s}");
+    let bd = log(tmp.path(), "bd");
+    assert!(
+        bd.contains("update gate-1 --set-metadata verdict=abandoned"),
+        "{bd}"
+    );
+    assert!(
+        bd.contains("close gate-1 --reason abandoned: bd create"),
+        "{bd}"
+    );
+    assert!(!log(tmp.path(), "vega").contains("mux spawn"));
+    assert!(
+        !tmp.path().join("state/vega/gate").exists()
+            || fs::read_dir(tmp.path().join("state/vega/gate"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+}
