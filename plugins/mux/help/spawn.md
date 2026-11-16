@@ -31,7 +31,7 @@ do not waive bead policy or the flagship reason requirement.
 Before launch, spawn appends tier/model/reason to the bead notes; failed reads or appends
 abort the spawn. The brief names the bead, even without --prompt. Spawn records retain
 bead, tier, model and reason for show/reopen; hc publishes vega.tier-why and vega.bead labels.
-Local --cwd selects the project; remote spawns use the caller's project pins.
+Local --cwd selects the project (a relative path is taken from the current directory and must exist); remote spawns use the caller's project pins.
 
 Spawns are headed by default: the user answers questions in the pane. Add --headless
 for an unattended child whose in-pane questions must go to its parent. Every spawn
@@ -94,7 +94,9 @@ An explicit --env FORCE_COLOR=... wins, including an empty value. This applies t
 spawn location, including worktrees and remote machines.
 
 With --worktree, worktrunk (`wt switch`) creates the worktree and runs the repo's hooks.
-hc requires wt and starts the agent in a new local app space, or a tab as described above.
+hc without wt and without a worktrunk config (.config/wt.toml, user config) uses plain
+`git worktree add` at ../<repo>.<branch>; with such a config and no wt it fails with wt_not_found.
+hc starts the agent in a new local app space, or a tab as described above.
 The TUI backend starts in the worktree's own herdr workspace, nested under the repo;
 without wt, herdr creates it (only for repos without a worktrunk config). An existing worktree is reused.
 Pass --base the branch that holds the work the task needs: origin/main after a fetch, or

@@ -24,7 +24,7 @@ Help: `--help`.
   Without --bead choose --tier. Notes record tier/model/reason; the brief names the bead.
   Lanista resolves pins; explicit `-m`/`--model` after `--` or `--no-parent` needs no tier without a bead; flagship still needs a reason.
   `vega post done` wakes the parent. Inbox-only targets ask the user.
-- `--worktree <branch> --base <ref>` uses worktrunk and a TUI workspace or local app space;
+- `--worktree <branch> --base <ref>` uses worktrunk (on hc without it: `git worktree add`) and a TUI workspace or local app space;
   without an app, hc uses the worktree cwd.
   hc explicit split/workspace placement is unsupported; use tabs or worktrees.
 - `vega mux close <target>` closes the agent; then `wt remove <branch>`.
