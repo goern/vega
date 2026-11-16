@@ -14,6 +14,8 @@ impl Fixture {
         for (name, text) in [("renice","#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/renice-calls\"\n"),("hc",include_str!("fixtures/hc.py")),("herdr-app",include_str!("fixtures/app.py")),("herdr","#!/bin/sh\necho herdr-called >> \"$HOME/herdr-calls\"\necho '{\"error\":{\"code\":\"agent_not_found\"}}'\nexit 1\n")] {
             fs::write(bin.join(name),text).unwrap();fs::set_permissions(bin.join(name),fs::Permissions::from_mode(0o755)).unwrap();
         }
+        fs::create_dir_all(d.path().join("config/herdr-app")).unwrap();
+        fs::write(d.path().join("config/herdr-app/herdr-app.sock"), "").unwrap();
         Self(d)
     }
     fn root(&self) -> &Path {
@@ -285,7 +287,7 @@ fn hc_backend_override_and_remote_direction_are_checked_before_run() {
     );
     let o = f
         .cmd()
-        .env("VEGA_POST_HOST", "deimos")
+        .env("VEGA_POST_HOST", "puck")
         .args([
             "spawn",
             "remote",
@@ -399,6 +401,141 @@ fn qualified_mail_preserves_the_machine_host_convention() {
         .contains("vega post send --host test t7"));
 }
 
+fn fake_worktree(f: &Fixture) {
+    fs::create_dir(f.root().join("worktree")).unwrap();
+    let wt = f.root().join("bin/wt");
+    fs::write(
+        &wt,
+        r#"#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+root=Path(os.environ['HOME'])
+with open(root/'wt-calls','a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+if sys.argv[1:] == ['--version']: print('fixture wt')
+else: print(json.dumps({'path':str(root/'worktree'),'action':'created','base_branch':'main'}))
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(wt, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn hc_worktree_falls_back_to_tab_without_a_local_app() {
+    for unavailable in ["binary", "socket", "window", "structured"] {
+        let f = Fixture::new();
+        fake_worktree(&f);
+        match unavailable {
+            "binary" => fs::remove_file(f.root().join("bin/herdr-app")).unwrap(),
+            "socket" => fs::remove_file(f.root().join("config/herdr-app/herdr-app.sock")).unwrap(),
+            _ => fs::write(f.root().join("app-unavailable"), unavailable).unwrap(),
+        }
+        let o = f
+            .cmd()
+            .args([
+                "spawn",
+                "worker",
+                "--kind",
+                "codex",
+                "--worktree",
+                "fix-branch",
+                "--prompt",
+                "do the task",
+                "--",
+                "-m",
+                "chosen",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            o.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let text = success(o);
+        assert_eq!(text.matches("no local herdr-app").count(), 1, "{text}");
+        let calls = f.calls();
+        let run = &calls.iter().find(|v| v[0] == "run").unwrap()[1];
+        assert_eq!(run["cwd"], f.root().join("worktree").to_str().unwrap());
+        assert_eq!(run["caller"], "t7");
+        assert_eq!(run["no_parent"], false);
+        assert_eq!(run["labels"]["herdr.space"], "s1");
+        assert_eq!(run["labels"]["vega.harness"], "codex");
+        assert!(run["labels"].get("vega.worktree-placeholder").is_none());
+        let brief = run["argv"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_str()
+            .unwrap();
+        assert!(
+            brief.contains("do the task") && brief.contains("vega post done"),
+            "{brief}"
+        );
+        let shown = f.run(&["show", "worker"]);
+        assert!(shown.contains("t7"), "{shown}");
+        let app = fs::read_to_string(f.root().join("app-calls")).unwrap_or_default();
+        assert_eq!(
+            app,
+            if unavailable == "window" || unavailable == "structured" {
+                "ls\n"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn remote_hc_worktree_uses_target_preparation_and_no_local_app_space() {
+    let f = Fixture::new();
+    // Execute the actual prepare command under a separate target home. Local wt
+    // is deliberately absent: all worktree filesystem operations must run there.
+    let remote = f.root().join("remote-home");
+    fs::create_dir_all(remote.join("bin")).unwrap();
+    fs::create_dir(remote.join("worktree")).unwrap();
+    let wt = remote.join("bin/wt");
+    fs::write(
+        &wt,
+        r#"#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+root=Path(os.environ['HOME'])
+with open(root/'wt-calls','a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+if sys.argv[1:] == ['--version']: print('fixture wt')
+else: print(json.dumps({'path':str(root/'worktree'),'action':'created','base_branch':'main'}))
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wt, fs::Permissions::from_mode(0o755)).unwrap();
+    let text = success(f.cmd()
+        .env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+        .env("TEST_MACHINES", r#"{"machines":[{"name":"remote","host":"remote","id":"id","version":"0.1.18","state":"connected","target":"user@remote","via":false}]}"#)
+        .args(["spawn", "worker", "--kind", "codex", "--machine", "remote", "--cwd", "/remote/repo", "--worktree", "fix-branch", "--base", "main", "--prompt", "remote task", "--", "-m", "chosen"]).output().unwrap());
+    assert!(text.contains("no local herdr-app"), "{text}");
+    let calls = f.calls();
+    let run = &calls.iter().find(|v| v[0] == "run").unwrap()[1];
+    assert_eq!(run["cwd"], remote.join("worktree").to_str().unwrap());
+    assert_eq!(run["on"], "remote");
+    assert_eq!(run["caller"], "t7");
+    assert_eq!(run["no_parent"], false);
+    assert!(run["labels"].get("herdr.space").is_none());
+    assert!(run["argv"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("remote task"));
+    assert!(!f.root().join("app-calls").exists());
+    let wt_calls = fs::read_to_string(remote.join("wt-calls")).unwrap();
+    assert!(
+        wt_calls.contains("fix-branch") && wt_calls.contains("--base") && wt_calls.contains("main"),
+        "{wt_calls}"
+    );
+}
+
 #[test]
 fn hc_worktree_warns_when_the_shown_space_cannot_be_reselected() {
     let f = Fixture::new();
@@ -486,9 +623,19 @@ else: print(json.dumps({'path':str(root/'worktree'),'action':'created','base_bra
     let run = &calls.iter().find(|v| v[0] == "run").unwrap()[1];
     assert_eq!(run["cwd"], tree.to_str().unwrap());
     assert_eq!(run["labels"]["herdr.space"], "s2");
-    assert_eq!(run["labels"]["vega.worktree-placeholder"], "t0");
+    assert!(run["labels"].get("vega.worktree-placeholder").is_none());
     assert_eq!(run["labels"]["vega.harness"], "codex");
     let worker = run["name"].as_str().unwrap();
+    // The space.new shell goes once the agent is in the space: one terminal left.
+    let verbs: Vec<_> = calls.iter().map(|v| v[0].as_str().unwrap()).collect();
+    let at = |verb: &str, t: &str| calls.iter().position(|v| v[0] == verb && v[1] == t);
+    let (killed, removed) = (at("kill", "t0").unwrap(), at("rm", "t0").unwrap());
+    let ran = verbs.iter().position(|v| *v == "run").unwrap();
+    assert!(ran < killed && killed < removed, "{verbs:?}");
+    let left: Value =
+        serde_json::from_str(&fs::read_to_string(f.root().join("terminals.json")).unwrap())
+            .unwrap();
+    assert_eq!(left.as_object().unwrap().len(), 1, "{left}");
     f.run(&["close", worker]);
     let terminals: Value =
         serde_json::from_str(&fs::read_to_string(f.root().join("terminals.json")).unwrap())
@@ -804,5 +951,524 @@ fn spawn_and_reopen_run_the_agent_through_the_toolbox_launcher() {
         );
         // An empty value still overrides what the toolbox would inherit.
         assert!(a[2..agent].iter().any(|v| v == "HERDR_PANE_ID="));
+    }
+}
+
+fn mode_remote(f: &Fixture) -> std::path::PathBuf {
+    let remote = f.root().join("remote-home");
+    fs::create_dir_all(remote.join("bin")).unwrap();
+    for name in ["hc", "herdr"] {
+        fs::copy(
+            f.root().join("bin").join(name),
+            remote.join("bin").join(name),
+        )
+        .unwrap();
+    }
+    fs::write(
+        remote.join("terminals.json"),
+        serde_json::json!({"t8":{
+            "address":"t8", "name":"worker", "state":"live", "parent":"t7",
+            "argv":[], "cwd":"/remote/repo", "created_ms":0,
+            "screen":"exact", "cols":80, "rows":24, "labels":{},
+            "pid": std::process::id(), "status":{"app":"codex","state":"idle"}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    remote
+}
+
+#[test]
+fn remote_mode_uses_target_local_store_for_reads_and_writes() {
+    let f = Fixture::new();
+    let remote = mode_remote(&f);
+    for (args, expected) in [
+        (
+            vec!["mode", "--machine", "remote", "t8", "headed"],
+            "headed",
+        ),
+        (vec!["mode", "hc:remote/t8"], "headed"),
+        (
+            vec!["mode", "--machine", "remote", "worker", "headless"],
+            "headless",
+        ),
+        (vec!["--machine", "remote", "mode", "t8"], "headless"),
+        (vec!["mode", "remote/t8", "headed"], "headed"),
+    ] {
+        let out = success(
+            f.cmd()
+                .env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+        assert!(out.contains(&format!("mode: {expected}")), "{out}");
+        let local = success(
+            f.cmd()
+                .env("HOME", &remote)
+                .env_remove("XDG_STATE_HOME")
+                .env_remove("XDG_CONFIG_HOME")
+                .args(["mode", "t8"])
+                .output()
+                .unwrap(),
+        );
+        assert!(local.contains(&format!("mode: {expected}")), "{local}");
+        let mode =
+            fs::read_to_string(remote.join(".local/state/vega/modes/local_hc-7438")).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&mode).unwrap()["mode"],
+            expected
+        );
+    }
+    assert!(!f.root().join("state/vega/modes").exists());
+    let calls = f.calls();
+    let exec = calls.iter().find(|v| v[0] == "exec").unwrap();
+    assert_eq!(exec[2], "remote");
+    assert!(exec.as_array().unwrap().iter().any(|v| v == "hc:t8"));
+}
+
+#[test]
+fn remote_mode_never_reports_success_for_unconfirmed_execution() {
+    for failure in [
+        "exit",
+        "old",
+        "json",
+        "base64",
+        "mismatch",
+        "timeout",
+        "truncated",
+    ] {
+        let f = Fixture::new();
+        let out = f
+            .cmd()
+            .env("TEST_MODE_FAILURE", failure)
+            .args(["mode", "--machine", "remote", "t8", "headed"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {failure}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("remote_mode_failed"), "{failure}: {text}");
+        assert!(!text.contains("mode: headed"), "{failure}: {text}");
+        assert!(!f.root().join("state/vega/modes").exists());
+    }
+}
+
+#[test]
+fn remote_mode_reports_target_write_failures_and_refuses_conflicting_hosts() {
+    let f = Fixture::new();
+    let remote = mode_remote(&f);
+    fs::create_dir_all(remote.join(".local/state/vega")).unwrap();
+    fs::write(remote.join(".local/state/vega/modes"), "not a directory").unwrap();
+    let out = f
+        .cmd()
+        .env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+        .args(["mode", "--machine", "remote", "t8", "headed"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("remote_mode_failed"));
+    let out = f
+        .cmd()
+        .args(["mode", "--machine", "remote", "other/t8", "headed"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("different hosts"));
+    assert_eq!(f.calls().iter().filter(|v| v[0] == "exec").count(), 1);
+    assert!(!f.root().join("state/vega/modes").exists());
+}
+
+#[test]
+fn remote_mode_supports_tui_panes_without_remote_file_caches() {
+    let f = Fixture::new();
+    let remote = mode_remote(&f);
+    fs::write(
+        remote.join("bin/herdr"),
+        r#"#!/bin/sh
+[ "$*" = 'agent get w1:p2' ] || exit 2
+printf '%s\n' '{"result":{"agent":{"pane_id":"w1:p2","name":"worker","agent":"codex"}}}'
+"#,
+    )
+    .unwrap();
+    for args in [
+        vec!["mode", "--machine", "remote", "w1:p2", "headed"],
+        vec!["mode", "remote:w1:p2"],
+    ] {
+        let out = success(
+            f.cmd()
+                .env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+                .args(args)
+                .output()
+                .unwrap(),
+        );
+        assert!(out.contains("mode: headed"), "{out}");
+    }
+    assert!(remote.join(".local/state/vega/modes/local_w1_p2").exists());
+    assert!(!f.root().join("state/vega/modes").exists());
+}
+
+#[test]
+fn remote_mode_refuses_unavailable_transport_and_disallowed_direction() {
+    for (variable, value, expected) in [
+        ("TEST_PREPARE_FAIL", "1", "remote_mode_failed"),
+        ("VEGA_POST_HOST", "puck", "machine_direction"),
+    ] {
+        let f = Fixture::new();
+        let out = f
+            .cmd()
+            .env(variable, value)
+            .args(["mode", "--machine", "remote", "t8", "headed"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success());
+        assert!(text.contains(expected), "{text}");
+        assert!(!f.root().join("state/vega/modes").exists());
+    }
+}
+
+const REMOTE_MACHINES: &str = r#"{"machines":[{"name":"remote","host":"remote","id":"id","version":"0.1.18","state":"connected","target":"user@remote","via":false}]}"#;
+
+fn remote_spawn_command(f: &Fixture) -> Command {
+    let mut c = f.cmd();
+    c.env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+        .env("TEST_MACHINES", REMOTE_MACHINES)
+        .args([
+            "spawn",
+            "worker",
+            "--kind",
+            "codex",
+            "--machine",
+            "remote",
+            "--cwd",
+            "/remote/repo",
+            "--prompt",
+            "implement remote task",
+        ]);
+    c
+}
+
+#[test]
+fn remote_spawn_records_are_readable_on_the_pane_host() {
+    for headless in [false, true] {
+        let f = Fixture::new();
+        let remote = mode_remote(&f);
+        let mut command = remote_spawn_command(&f);
+        if headless {
+            command.arg("--headless");
+        }
+        success(command.args(["--", "-m", "chosen"]).output().unwrap());
+        let state = remote.join(".local/state/vega");
+        let mode = if headless { "headless" } else { "headed" };
+        for verb in ["mode", "show"] {
+            let text = success(
+                f.cmd()
+                    .env("HOME", &remote)
+                    .env_remove("XDG_STATE_HOME")
+                    .env_remove("XDG_CONFIG_HOME")
+                    .env("VEGA_POST_HOST", "remote")
+                    .args([verb, "t8"])
+                    .output()
+                    .unwrap(),
+            );
+            assert!(text.contains(&format!("mode: {mode}")), "{text}");
+            if verb == "show" {
+                assert!(text.contains("parent: t7 on test"), "{text}");
+                assert!(text.contains("title: implement remote task"), "{text}");
+                assert!(text.contains("cwd: /remote/repo"), "{text}");
+                assert!(text.contains("model: chosen"), "{text}");
+            } else {
+                assert!(!text.contains("no parent recorded"), "{text}");
+            }
+        }
+        let read = |kind: &str| fs::read_to_string(state.join(kind).join("local_hc-7438")).unwrap();
+        let record: Value = serde_json::from_str(&read("spawns")).unwrap();
+        assert_eq!(record["pane"], "t8");
+        assert_eq!(record["cwd"], "/remote/repo");
+        assert_eq!(
+            record["parent"],
+            serde_json::json!({"pane":"t7","host":"test"})
+        );
+        assert!(read("briefs").parse::<u64>().unwrap() > 0);
+        assert!(!state.join("undelivered/local_hc-7438").exists());
+        let calls = f.calls();
+        let exec = calls
+            .iter()
+            .find(|v| {
+                v.as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "record-spawn"))
+            })
+            .unwrap();
+        assert_eq!(exec[4], "15.0");
+    }
+}
+
+#[test]
+fn remote_spawn_removes_stale_parent_title_and_brief_for_no_parent() {
+    let f = Fixture::new();
+    let remote = mode_remote(&f);
+    for kind in ["parents", "tasks", "undelivered"] {
+        let dir = remote.join(".local/state/vega").join(kind);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("local_hc-7438"), "stale").unwrap();
+    }
+    success(
+        f.cmd()
+            .env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux"))
+            .env("TEST_MACHINES", REMOTE_MACHINES)
+            .args([
+                "spawn",
+                "worker",
+                "--kind",
+                "codex",
+                "--machine",
+                "remote",
+                "--cwd",
+                "/remote/repo",
+                "--no-parent",
+                "--headless",
+            ])
+            .output()
+            .unwrap(),
+    );
+    for kind in ["parents", "tasks", "undelivered"] {
+        assert!(!remote
+            .join(".local/state/vega")
+            .join(kind)
+            .join("local_hc-7438")
+            .exists());
+    }
+    let text = success(
+        f.cmd()
+            .env("HOME", &remote)
+            .env_remove("XDG_STATE_HOME")
+            .args(["mode", "t8"])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        text.contains("mode: headless") && text.contains("no parent recorded"),
+        "{text}"
+    );
+}
+
+#[test]
+fn remote_spawn_keeps_undelivered_brief_on_target() {
+    let f = Fixture::new();
+    let remote = mode_remote(&f);
+    let out = remote_spawn_command(&f)
+        .env("TEST_UNDELIVERED", "1")
+        .args(["--", "-m", "chosen"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("brief_not_delivered"));
+    let brief: Value = serde_json::from_slice(
+        &fs::read(remote.join(".local/state/vega/undelivered/local_hc-7438")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(brief["brief"], "implement remote task");
+    assert_eq!(brief["name"], "worker");
+    assert_eq!(brief["no_parent"], false);
+}
+
+#[test]
+fn remote_spawn_reports_unconfirmed_records_without_claiming_success() {
+    for failure in [
+        "unavailable",
+        "exit",
+        "old",
+        "json",
+        "base64",
+        "mismatch",
+        "timeout",
+        "truncated",
+    ] {
+        let f = Fixture::new();
+        mode_remote(&f);
+        let out = remote_spawn_command(&f)
+            .env("TEST_RECORD_FAILURE", failure)
+            .args(["--", "-m", "chosen"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {failure}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("remote_spawn_record_failed") && text.contains("remote/t8 started"),
+            "{failure}: {text}"
+        );
+        assert!(!text.contains("spawned:"), "{failure}: {text}");
+    }
+}
+
+#[test]
+fn remote_spawn_reports_each_target_record_write_failure() {
+    for kind in [
+        "spawns",
+        "modes",
+        "parents",
+        "tasks",
+        "briefs",
+        "undelivered",
+    ] {
+        let f = Fixture::new();
+        let remote = mode_remote(&f);
+        let path = remote.join(".local/state/vega").join(kind);
+        fs::create_dir_all(&path).unwrap();
+        // A directory in place of the record blocks both replacement and removal.
+        fs::create_dir(path.join("local_hc-7438")).unwrap();
+        let out = remote_spawn_command(&f)
+            .args(["--", "-m", "chosen"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {kind}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("remote_spawn_record_failed")
+                && text.contains(&format!("cannot save {kind}")),
+            "{kind}: {text}"
+        );
+        assert!(!text.contains("spawned:"), "{kind}: {text}");
+    }
+}
+
+#[test]
+fn target_spawn_receiver_supports_tui_and_rejects_invalid_requests() {
+    use base64::Engine;
+    let f = Fixture::new();
+    let record = vega_herdr::state::SpawnRecord {
+        backend: "herdr".into(),
+        pane: "w1:p2".into(),
+        name: "worker".into(),
+        kind: "codex".into(),
+        cwd: "/remote/tree".into(),
+        mode: "headed".into(),
+        parent: Some(vega_herdr::state::Parent {
+            pane: "t7".into(),
+            host: "caller".into(),
+        }),
+        task: Some("task title".into()),
+        started_ms: Some(123),
+        ..Default::default()
+    };
+    let request = serde_json::json!({"schema":1,"record":record,"undelivered":"brief"});
+    let encode = |v: &Value| base64::engine::general_purpose::STANDARD.encode(v.to_string());
+    let text = success(
+        f.cmd()
+            .args(["record-spawn", &encode(&request)])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), request);
+    for kind in [
+        "spawns",
+        "modes",
+        "parents",
+        "tasks",
+        "briefs",
+        "undelivered",
+    ] {
+        assert!(f
+            .root()
+            .join("state/vega")
+            .join(kind)
+            .join("local_w1_p2")
+            .exists());
+    }
+    for change in [
+        serde_json::json!({"schema":2}),
+        serde_json::json!({"record":{"pane":"remote:w1:p2"}}),
+        serde_json::json!({"record":{"mode":"bogus"}}),
+        serde_json::json!({"undelivered":false}),
+    ] {
+        let mut invalid = request.clone();
+        if let Some(r) = change.get("record") {
+            for (k, v) in r.as_object().unwrap() {
+                invalid["record"][k] = v.clone();
+            }
+        } else {
+            for (k, v) in change.as_object().unwrap() {
+                invalid[k] = v.clone();
+            }
+        }
+        let out = f
+            .cmd()
+            .args(["record-spawn", &encode(&invalid)])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {invalid}");
+        assert!(serde_json::from_slice::<Value>(&out.stdout)
+            .unwrap()
+            .get("error")
+            .is_some());
+    }
+    let out = f
+        .cmd()
+        .args(["--machine", "remote", "record-spawn", &encode(&request)])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn legacy_remote_tui_spawn_also_confirms_target_records() {
+    for failure in [None, Some("timeout")] {
+        let f = Fixture::new();
+        let remote = mode_remote(&f);
+        let script = r#"#!/usr/bin/python3
+import json, sys
+a=sys.argv[1:]
+if a[:1]==['--machine']: a=a[2:]
+if a[:3]==['agent','get','worker']:
+ print(json.dumps({'error':{'code':'agent_not_found','message':'absent','hint':'spawn'}}));sys.exit(1)
+if a[:2]==['pane','list']: result={'panes':[]}
+elif a[:2]==['tab','create']: result={'tab':{'tab_id':'tab1'},'root_pane':{'pane_id':'w1:p2'}}
+elif a[:2]==['agent','start']: result={}
+elif a[:2]==['agent','get']: result={'agent':{'pane_id':'w1:p2','agent_name':'worker','name':'worker','agent':'codex','agent_status':'idle'}}
+else: raise AssertionError(a)
+print(json.dumps({'result':result}))
+"#;
+        for path in [f.root().join("bin/herdr"), remote.join("bin/herdr")] {
+            fs::write(path, script).unwrap();
+        }
+        let mut c = f.cmd();
+        c.env("TEST_MUX_EXE", env!("CARGO_BIN_EXE_vega-mux")).args([
+            "spawn",
+            "worker",
+            "--backend",
+            "herdr",
+            "--kind",
+            "codex",
+            "--machine",
+            "remote",
+            "--cwd",
+            "/remote/repo",
+            "--at",
+            "tab",
+            "--no-parent",
+        ]);
+        if let Some(failure) = failure {
+            c.env("TEST_RECORD_FAILURE", failure);
+        }
+        let out = c.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        if failure.is_some() {
+            assert!(!out.status.success());
+            assert!(text.contains("remote_spawn_record_failed"), "{text}");
+        } else {
+            assert!(
+                out.status.success(),
+                "{text} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let mode: Value = serde_json::from_slice(
+                &fs::read(remote.join(".local/state/vega/modes/local_w1_p2")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(mode["mode"], "headed");
+            assert!(!remote
+                .join(".local/state/vega/parents/local_w1_p2")
+                .exists());
+        }
     }
 }

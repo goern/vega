@@ -5,13 +5,379 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
-## 162 · 2026-11-12
+## 216 · 2026-11-16
 
 - feature: local `vega mux spawn` and `reopen` on hc start the agent through `~/.local/bin/hc-toolbox-shell`
   when that executable exists, so agents and their tool shells run in the toolbox whose glibc the vega
   binaries need (vega-alc). Hosts without the launcher, and remote `--machine` spawns, are unchanged.
   The spawn environment, including `--env` values, is forwarded as `env K=V` and therefore shows in the
   agent's process argv: keep secrets out of `--env`. Gate reviewers still start on the host.
+
+## 215 · 2026-11-15
+
+- feature: `vega mux spawn --machine <host>` confirms mode, parent, task and
+  spawn records on the target, where review and hooks read them. Unconfirmed
+  writes report an error naming the started terminal; both hosts need matching
+  vega versions.
+
+## 214 · 2026-11-15
+
+- feature: Vega tabs follows agents' live task titles while keeping custom tab
+  names, switches once per wheel notch with paced swipes, and recovers from
+  corrupt saved panel state. Working indicators remain static themed dots.
+- unit: apply `herdr-app.vega-tabs` on herdr-app 0.1.16 to use the updated fork.
+
+## 213 · 2026-11-15
+
+- feature: `vega mux mode --machine <host>` reads and changes the mode on the
+  pane host, so review and question routing see it. Unconfirmed remote changes
+  return an error; both hosts need matching vega versions.
+
+## 212 · 2026-11-15
+
+- feature: live Claude theme delivery stops after an unconfirmed send timeout and
+  caps failed attempts at three per request, preventing repeated slash commands.
+- feature: PagerDuty mail acceptance timeouts retain a maybe-delivered receipt,
+  preventing duplicate reminders on the next relay tick.
+
+## 211 · 2026-11-15
+
+- feature: Services retains registered titles without terminal attribution, labels
+  running/forwarded/stopped rows and distinguishes remote ports from local forwards.
+- feature: `vega service register --port 5320 --also-forward 8367 --title "Classic app"`
+  groups ports under one Forward/Stop. Registered services use the same local ports;
+  occupied ports produce an error. Unregistered listeners retain ephemeral forwards.
+- unit: update the CLI on service hosts and apply `herdr-app.vega-services`.
+
+## 210 · 2026-11-14
+
+- feature: `vega service register --port <port> --title "<title>"` adds host-local
+  descriptions and loopback URLs to Services; `ls` and `rm --port <port>` manage
+  registrations. Entries expire with their listener process; register again after restart.
+- feature: Services hides recognized agent-runtime ports by default; Show agent ports
+  reveals them. Registered services remain visible, and forwarding still uses loopback SSH.
+- unit: update the CLI on service hosts and apply `herdr-app.vega-services` for the panel.
+
+## 209 · 2026-11-14
+
+- feature: Services follows the focused project across machines; only the focused Über-UAC
+  sees all projects. Click an HTTP/HTTPS address to open it; remote private loopback URLs
+  start or reuse a forward first. Puck URLs and non-web addresses copy with a short confirmation.
+  Refresh checks for HTTP/HTTPS; unrecognized TCP services retain copyable TCP addresses.
+- unit: apply `herdr-app.vega-services` to update the existing panel.
+
+## 208 · 2026-11-14
+
+- feature: Services beside Files/Changes lists TCP listeners by project and space across hc
+  machines. Refresh after starting a service; Forward opens an explicit loopback SSH tunnel,
+  Open uses its local HTTP URL, and Stop or panel teardown cleans up that panel’s tunnels.
+  Puck and unknown SSH targets are read only; there is no automatic forwarding.
+- unit: apply `herdr-app.vega-services` with `herdr-app.vega-tabs` before
+  `herdr-app.layouts` (or use the `herdr-app` group). No live apply is part of this change.
+
+## 207 · 2026-11-13
+
+- feature: the gear beside VEGA opens settings for estate model defaults and host tiers,
+  profile windows (Open and Edit tabs), and current theme delivery status. The project
+  window's Models tab now edits only project pins; Reset restores inheritance.
+- unit: apply `herdr-app.vega-window-tabs` alongside `herdr-app.vega-sidebar` (or the
+  `herdr-app` group) to make the existing profile tab editor available in settings.
+
+## 206 · 2026-11-13
+
+- feature: the project window's Decisions tab renders again: answer inputs are created outside render
+  (herdr-app rejected `InputState.new` during render and left a window that could not close).
+
+## 205 · 2026-11-13
+
+- feature: live Claude theme sends retry with bounded backoff and resume after vegad restarts.
+  `vega theme` shows each pane's last sent mode and pending or failed delivery status.
+- feature: pi's native `system` and automatic light/dark pairs stay native; vega no longer tries
+  to copy generated system themes or replace native pair settings.
+
+## 204 · 2026-11-13
+
+- feature: the vega tab bar and pane headers use stock 0.1.15 forks with static working dots.
+- unit: apply `herdr-app.vega-tabs` and `herdr-app.vega-pane` before `herdr-app.layouts`
+  (or apply the `herdr-app` group) to load the forks. `herdr-app.profiles` now skips hosts
+  without a herdr-app home.
+
+## 203 · 2026-11-13
+
+- feature: working agents in the vega sidebar use a static orange status dot, including child and
+  collapsed rail rows, avoiding continuous spinner animation.
+
+## 202 · 2026-11-13
+
+- feature: the vega sidebar reconciles waiting hands only when their state changes. The Needs you
+  popover refreshes when displayed ages or badge freshness change, avoiding unchanged redraws every second.
+
+## 201 · 2026-11-13
+
+- feature: Promote in the status window's Config view saves straight into the vega checkout this
+  vega was built from (`vega window promote <name>` without `--repo`); the folder picker only
+  appears when no checkout is known.
+
+## 200 · 2026-11-13
+
+- feature: status windows use a fork of herdr-app's stock pill tab bar, with program icons, active-tab close, scrolling and window controls. Double-click a tab to rename inline; drag it onto another tab to persist its order, including when optional groups are unavailable.
+- feature: the right-side Config button shows a colored, numbered diff from the applied repo profile to the effective local profile, with Promote and Reset actions.
+- unit: after upgrading, run `vega config apply herdr-app.profiles`, then `vega window status` to load the updated bar and diff viewer.
+
+## 199 · 2026-11-13
+
+- feature: status tabs support + / leader-c machine selection, inline rename, drag reorder and close. Local edits persist in `~/.config/vega/windows/<profile>.toml`; closing hides a tab without killing its terminal.
+- feature: Config shows the effective profile with promote/reset. `vega window promote <name> --repo <checkout>` writes an uncommitted repo profile for review; rebuild/install, apply it and reset local edits afterward.
+- unit: run `vega config apply herdr-app.profiles` after upgrading, then `vega window status` to load the management bar and keys.
+
+## 198 · 2026-11-13
+
+- feature: the sidebar project badge opens a Needs you popover with waiting panes, decisions and notes, including Open and resolution actions. Waiting hands appear on the child's row and clear after viewing its turn and a later turn advance; Done dismisses them immediately. UAC rows no longer repeat project counts.
+
+## 197 · 2026-11-13
+
+- feature: `vega window status` gives proteus, ganymede, optional io btop, and ganymede tokens their own top tabs, preserving tab-switching keys and reusing live terminals. io is skipped with a warning when btop is unavailable.
+- unit: run `vega config apply herdr-app.profiles` to update the status profile, layout, navigation mod and keys before `vega window status`. Profiles support `[[tab]]` groups with one or two `[[tab.terminals]]` entries; two terminals split horizontally. Existing flat profiles still work.
+
+## 196 · 2026-11-13
+
+- feature: `vega window status` opens a separate herdr-app home with proteus/ganymede btop and ganymede token-burn tui. Reopening reuses live terminals; the main sidebar hides profile terminals.
+- unit: `herdr-app.profiles` writes TOML-defined profile homes, layouts, selected mods and settings. Run `vega config apply herdr-app.profiles` before opening a profile. Fresh homes skip welcome; existing shared state is preserved.
+
+## 195 · 2026-11-13
+
+- feature: the git shim hints at Worktrunk commands for branch deletion, worktree housekeeping and new-branch checkouts in wt-managed repos, preserving git's stdout and exit code.
+
+## 194 · 2026-11-13
+
+- feature: `scripts/check-mods.sh` checks every herdr-app mod and cleans its generated type files, including on failure.
+
+- unit: dcg.config allows safe `git branch -d` / `--delete`; force deletion stays blocked.
+
+- feature: `vega uac prune` delegates integrated branch deletion to Worktrunk, including squash merges. Unmerged work remains residue; fast-forward the local target before pruning.
+
+## 193 · 2026-11-13
+
+- feature: the sidebar shows a headless sentinel's unread done as a filled grey dot when its
+  parent is live: done, handed to the UAC. Headed sessions and UACs keep the blue unread dot.
+
+## 192 · 2026-11-12
+
+- feature: the Uber-UAC has its own hc role label (`vega.role=uber`, plus `vega.engaged=yes`
+  while its window is open), kept by vegad from the claim file like the UAC role. The sidebar
+  lists it as one "Über" row at the top; its project label no longer creates a project group
+  or a "no UAC" marker.
+
+## 191 · 2026-11-12
+
+- feature: the sidebar hides a project without a UAC when none of its agents or terminals
+  render in its own group and it is not pinned (no more empty "no UAC" headers).
+
+## 190 · 2026-11-12
+
+- feature: the sidebar lists a sentinel from another project in that project's group only
+  when the project has a UAC; otherwise it stays a branch under the agent that spawned it.
+
+## 189 · 2026-11-12
+
+- feature: agents lost in a reboot resume in place. hc restores kept terminals with a
+  shell; once per boot vegad finds those whose spawn record names a session and, per
+  `~/.config/vega/resume.toml` `mode = "offer" | "auto" | "off"` (default offer), leaves
+  one note with `vega mux reopen <t>...` or types the resume command itself. claude,
+  codex and pi are supported.
+- required: run `vega uac claim` once in each running UAC so its terminal is recorded;
+  agents spawned before this upgrade lack the launch argv and env and resume with the
+  default args plus their recorded extra args.
+
+## 188 · 2026-11-12
+
+- feature: in the project sidebar a child whose own project differs from its parent's now shows in
+  its own project group with a "↑ parent" hint, not as a branch of the foreign parent. Run
+  `vega config apply herdr-app` to apply the mod.
+
+## 187 · 2026-11-12
+
+- feature: the project sidebar lists live terminals without an agent (token-burn tui, pdc, a dev
+  server, a shell) under their project as dim `◇` rows. Active hides idle shells unless the
+  project is pinned. Run `vega config apply herdr-app` to apply the mod.
+
+## 186 · 2026-11-12
+
+- feature: `vega mux spawn --worktree` leaves one terminal in the new herdr-app space, the agent.
+  The shell herdr-app makes for the space is removed once the agent runs; no migration needed.
+
+## 185 · 2026-11-12
+
+- feature: after a reboot, hc terminal labels follow the UAC claims: a UAC terminal keeps its
+  claimed project, and a bare login shell (hc keep's recovery shell) no longer takes a project
+  from its space folder. Upgrade vegad; stale labels clear on the next refresh.
+
+## 184 · 2026-11-11
+
+- feature: the project sidebar keeps live agents visible after their UAC exits, with a
+  "no UAC" marker. Project pins, filters and manual ordering still apply.
+
+## 183 · 2026-11-11
+
+- required: upgrade private hosts' vegad to reject command and quarantine replies outside
+  the authenticated sender's inbox. This closes response permission laundering by granted
+  inbox-only hosts; no broker authorization change is required.
+
+## 182 · 2026-11-11
+
+- feature: `vega post auth-config --retired-host <host>` (repeatable) keeps the admin/viewer
+  read subjects for retired inbox archives without a host key or grants. Remove the host's
+  active key entry and grants; use `--retired-host deimos` to preserve its archive access.
+
+## 181 · 2026-11-11
+
+- feature: tmux-style last navigation in the sidebar: `ctrl-s l` or `cmd-;` toggles
+  the last agent, `ctrl-s shift-l` the last space, and `ctrl-s ;` the last pane in
+  the current tab. Run `vega config apply herdr-app` to apply the mod and keys.
+
+## 180 · 2026-11-10
+
+- migration: deimos is retired and replaced by puck. The built-in inbox-only host default and
+  current user-facing host examples now name puck.
+
+## 179 · 2026-11-10
+
+- optional: dcg is pinned to 0.16.0 via `mise run install-dcg` (verified release archive,
+  previous binary backed up, strict doctor failure rolls back). Install it per host;
+  vega deploy does not upgrade dcg automatically.
+- unit: `pi.dcg` adds a bash guard at `~/.pi/agent/extensions/dcg-guard.ts` in the `hooks`
+  group. Review/apply it and restart pi. `claude.settings` and `codex.hooks` now own dcg's
+  shared `dcg/hook.json` PreToolUse entry; review their diff before applying.
+- unit: guard-only `claude.dcg` preserves preferences. Fresh hosts use installer
+  `--configure-hooks`; failed fresh installs remove managed guards after binary rollback.
+- migration: review/apply `dcg.config` to disable hook self-repair; vega owns the hooks.
+  `vega config check` reports dcg version >=0.16.0 and each installed agent's guard.
+  Run `dcg doctor --strict` for Codex approval/reachability; approvals remain human-owned.
+
+## 178 · 2026-11-10
+
+- feature: post waits up to 60 s for slow broker operations. Send and done retry uncertain
+  publishes with the same message ID, preventing duplicate mail after a lost acknowledgement;
+  vegad tolerates short broker pauses before reporting an outage.
+
+## 177 · 2026-11-10
+
+- feature: inbox-only hosts deliver relay tool mail (hygiene, CI, beads sync and upgrade
+  proposals) directly to free local panes, holding drafts as in local mode. This avoids denied
+  broker publishes and endless retries; Uber asks and digests are skipped on these hosts.
+
+## 176 · 2026-11-10
+
+- optional: the sidebar shows done (blue) only while unread, like the tab bar (turn past
+  `herdr.seen`); seen sessions read as idle and the Active filter hides them. Apply the updated
+  vega-sidebar mod (`vega config apply herdr-app`).
+
+## 175 · 2026-11-10
+
+- feature: sidebar sub-agents now show unread done as a blue dot like tabs and remain in Active
+  until read. Pin a project with its header needle to keep its UAC visible even when idle;
+  pins respect label/machine views and persist via `vega project config <id> --pin|--unpin`.
+  Apply the updated vega-sidebar mod (`vega config apply herdr-app`).
+
+## 174 · 2026-11-10
+
+- optional: the sidebar's Active filter now also hides finished sentinels: a sub-agent's done
+  shows as a grey ring and counts as idle. Apply the updated vega-sidebar mod
+  (`vega config apply herdr-app`).
+
+## 173 · 2026-11-10
+
+- migration: `vega board`, `vega open` and the herdr TUI config unit are removed.
+  Install/deploy removes stale command binaries and links from `~/.local/bin` and
+  the agent shim directory. On hosts that used the plugins, run `herdr plugin unlink vega.board`
+  and `herdr plugin unlink vega.open`, then remove their keybindings from the host-owned
+  `~/.config/herdr/config.toml`. Remove obsolete local `~/.config/vega/config/herdr/`
+  overrides and leftover plugin-local `bin/` files. Keep the live herdr config while
+  legacy panes still use it; mux's herdr backend and herdr-app mods remain supported.
+  The prior state is tagged `herdr-tui-final` (dbd11a8); the last commit with them is a652b82.
+
+## 172 · 2026-11-10
+
+- feature: the herdr-app sidebar has an Active toggle beside the view selector. It hides idle
+  and unknown sessions and empty groups, keeps working, blocked, done and focused agents,
+  and keeps a UAC with active descendants. The setting survives restarts and combines with
+  label/machine views; click the dim idle-hidden count to show everything in the view again.
+  Apply the updated vega-sidebar mod (`vega config apply herdr-app`).
+
+## 171 · 2026-11-10
+
+- optional: the herdr-app vega status line and project Overview read beads, asks and CI in the
+  project's registry checkout instead of the UAC terminal's shell folder, which could show another
+  repo's counts. Apply the updated vega and vega-sidebar mods (`vega config apply herdr-app`).
+
+## 170 · 2026-11-10
+
+- feature: the herdr-app project/config window has a Models tab for registry defaults and all
+  known hosts, including inbox-only hosts. Choose an allowed model or Reset a lane/tier pin;
+  each cell shows the effective model, source and expiry, and CLI failures stay visible.
+  Pi defaults are configured through zai. Apply the updated vega-sidebar mod to use it.
+
+## 169 · 2026-11-10
+
+- optional: codex `gpt-6.1-terra` is in the seats allowlist without a global tier. Hosts may pin it,
+  e.g. `vega lanista pin codex --tier budget --host puck --set gpt-6.1-terra`. Run `vega lanista install`
+  (or deploy) on the setting host first.
+
+## 168 · 2026-11-10
+
+- feature: private hosts can configure shared model defaults with
+  `vega lanista pin <lane> --tier <tier> --default --set <model>` or `--clear`.
+  Defaults live at `<control>.lanista.default` (theme control, normally proteus).
+  Resolution is project > host > registry default > repo seats. Inbox-only hosts
+  never read defaults and need no new grant; their own host pins stay independent.
+  `hosts --json` identifies project, host, default, or global sources per cell.
+
+## 167 · 2026-11-10
+
+- required: orrery must regenerate titan auth-config with existing flags plus
+  `--cmd-grant puck=vega.cmd.proteus.lanista.puck` and
+  `--registry-read puck=puck.lanista.host`, keeping `--inbox-only puck`.
+  Applying this requires Slayer approval. Puck gets no KV publish rights;
+  proteus validates commands and writes only the derived host key.
+- feature: lanista resolves project > host > global. `pin --host <host> --set`
+  edits host tiers (default expiry never); inbox-only hosts relay their own edits
+  and cache exact-key reads offline. `hosts --json` exposes models and allowlists.
+  Pi allowlists Google Argon/Flash for host/project pins; its global fallback remains
+  zai/GLM. Puck mappings are configured after deploy.
+
+## 166 · 2026-11-10
+
+- feature: `vega mux spawn --worktree` starts a tab in the caller's space when no local
+  herdr-app is available, preserving the worktree cwd, brief and parent link. Remote
+  `--machine` worktrees are created on the target and use the same tab fallback.
+
+## 165 · 2026-11-10
+
+- required: to show puck's keychain lock, regenerate titan's broker authorization with the existing
+  arguments plus `--cmd-grant puck=vega.cmd.proteus.keychain.puck`, keeping puck under `--inbox-only`.
+  Applying this is a separate Slayer step. Puck gets only this command; the private recipient gets
+  the exact status-key write needed to relay it. Never grant inbox-only hosts KV publish rights:
+  a `Nats-Rollup: all` header on even one allowed subject can erase the shared registry.
+- migration: all hosts publish keychain state as `<host>.status.keychain`. Upgrade publishing vegad
+  and the app host reader together. Inbox-only vegad sends bounded, validated status to its theme
+  control host on change and every 60 seconds. Samples appear without a host beat and age out
+  after 180 seconds.
+
+## 164 · 2026-11-10
+
+- feature: the keychain lock turns green within seconds of the password: while an unlock window
+  is open, herdr-app probes that host directly instead of waiting for vegad's next round.
+
+## 163 · 2026-11-10
+
+- feature: the keychain unlock window explains the lock and shows the exact command, retries a
+  failed unlock, and stays open after the unlock until you close it (the title turns green).
+
+## 162 · 2026-11-10
+
+- feature: the status line shows one keychain lock, the focused terminal's machine's, instead of
+  one per Mac. Unlock windows for other machines still open when they lock. Apply with
+  `vega config apply herdr-app`.
 
 ## 161 · 2026-11-10
 

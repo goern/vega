@@ -1,7 +1,7 @@
 # vega config
 
-Owns the config of the coding agents, herdr and dcg: CLAUDE.md, AGENTS.md, output styles, Claude settings keys, agent
-hooks, global skills and herdr's config.toml. Each file is rendered from the repo default in `config/` or a local
+Owns the config of the coding agents, herdr-app and dcg: CLAUDE.md, AGENTS.md, output styles, Claude settings keys, agent
+hooks, global skills and herdr-app config. Each file is rendered from the repo default in `config/` or a local
 override in `~/.config/vega/config/`, so one source drives every host. Shared files are key-merged: only vega's
 keys change.
 
@@ -22,7 +22,15 @@ falls back to the last cached machine inventory.
 `infra` flags a leftover `vegad-start` login job (`vega post relay install` removes it);
 runtime daemon state remains in `vega post relay status`.
 
-Commands: `vega config`, `diff`, `apply`, `print`, `init`, `infra`.
+Commands: `vega config`, `diff`, `apply`, `print`, `init`, `infra` (`check`).
+
+`mise run install-dcg` installs checksum-pinned dcg 0.16.0, backing up the old binary
+and restoring it if strict doctor fails. `vega config check` reports dcg version and
+Claude/Codex/pi guard registration for agents on PATH. `claude.settings` and `codex.hooks`
+merge dcg entries from `dcg/hook.json`; `claude.dcg` applies only that guard entry.
+Absent pinned binaries skip new guards and remove existing vega guards. Use the explicit
+installer `--configure-hooks` option to bootstrap a fresh host before strict doctor; `pi.dcg` in the `hooks` group manages
+`~/.pi/agent/extensions/dcg-guard.ts`. Preview the diff and restart agents after apply.
 
 `infra` also warns above 50,000 entries in this checkout's `target/debug/deps`;
 its directory scan stops at 50,001. `mise run target-sweep` performs bounded
@@ -52,3 +60,9 @@ in [Service endpoints](../../docs/design/config.md#service-endpoints).
 Design: [config.md](../../docs/design/config.md).
 
 Agent guide: `vega skills config`
+
+`vega-window` opens applied profiles (`vega window status`). The personal
+`herdr-app.profiles` unit writes independent homes from TOML under
+`config/herdr-app/profiles/`, including layout, mods, settings and terminal argv.
+Local overrides use the same source tree as the main home. See
+[profile windows](../../docs/design/herdr-app-ui.md#profile-windows-poc-vega-0h4c85).

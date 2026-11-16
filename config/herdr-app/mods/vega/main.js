@@ -27,8 +27,20 @@ p=pathlib.Path(os.environ.get('XDG_STATE_HOME') or str(pathlib.Path.home()/'.loc
 try: print(p.read_text())
 except OSError: print('{"rows":[]}')`;
 
-// Only the human's Enter reaches security. No password argument or shell history.
-const unlockScript = `printf 'Press Enter to unlock the login keychain on %s\\n' "$1"; IFS= read -r enter || exit; stty -echo || exit; trap 'stty echo' EXIT; security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"`;
+// Only the human's Enter reaches security. No password argument or shell history. The
+// terminal stays after the unlock: the Slayer closes the window (Slayer 2026-11-10).
+const unlockScript = [
+  `kc="$HOME/Library/Keychains/login.keychain-db"`,
+  `printf '\\nThe login keychain on %s is locked.\\n\\n' "$1"`,
+  `printf 'Why it matters: ssh keys and passwords stored in it are unusable, so git over ssh\\n'`,
+  `printf 'and other tools of agents on %s fail until it is unlocked.\\n\\n' "$1"`,
+  `printf 'Command (runs on %s):\\n  security unlock-keychain %s\\n\\n' "$1" "$kc"`,
+  `printf 'Your password is typed into this terminal only: not shown, not stored, never in argv.\\n'`,
+  `while :; do printf '\\nPress Enter to run it, ctrl+c to cancel. '; IFS= read -r enter || exit`,
+  `stty -echo; security unlock-keychain "$kc"; rc=$?; stty echo; [ $rc -eq 0 ] && break; printf 'Unlock failed (exit %s).\\n' "$rc"; done`,
+  `printf '\\nUnlocked. vegad sees it within a minute. Close this window with x.\\n'`,
+  `IFS= read -r enter`,
+].join("; ");
 
 // Only saved, connected hc machines are read. No reverse link or registry ACL
 // change is needed; hc's SSH connection already authorizes execution there.
@@ -128,29 +140,54 @@ export default class Vega extends View {
       const data = JSON.parse(r.stdout);
       this.localKeychainHost = data.local;
       this.applyKeychains(data.rows ?? [], data.at, cx);
+      this.probeOpenPopups(cx);
     } catch (_) {
       this.keychains = this.keychains.map(r => ({...r, state: "unknown"}));
       cx.notify();
     } finally { this.readingKeychains = false; }
   }
 
+  // While an unlock window is open for a locked host, read its keychain directly every few
+  // seconds, so the lock turns green right after the password instead of after vegad's next
+  // probe and registry round (up to about 80 s). One probe per host across mod copies.
+  probeOpenPopups(cx) {
+    const popups = shared("vega.keychain-popups") ?? {};
+    const last = shared("vega.keychain-probe-at") ?? {};
+    for (const host of Object.keys(popups)) {
+      if ((this.keychains ?? []).find(r => r.host === host)?.state !== "locked") continue;
+      if (Date.now() - (last[host] ?? 0) < 4000) continue;
+      setShared("vega.keychain-probe-at", {...(shared("vega.keychain-probe-at") ?? {}), [host]: Date.now()});
+      const check = 'security show-keychain-info "$HOME/Library/Keychains/login.keychain-db"';
+      cx.spawn(async (cx) => {
+        try {
+          let code;
+          if (host === this.localKeychainHost) code = (await exec("sh", ["-c", check])).code;
+          else {
+            const r = await exec("hc", ["exec", "--json", "--on", host, "--timeout", "8", "--", "sh", "-c", check]);
+            code = r.code === 0 ? JSON.parse(r.stdout).code : null;
+          }
+          if (code !== 0) return;
+          setShared("vega.keychain-unlocked-at", {...(shared("vega.keychain-unlocked-at") ?? {}), [host]: Date.now()});
+          this.applyKeychains(this.lastKeychainRows ?? [], this.lastKeychainAt ?? 0, cx);
+        } catch (_) {}
+      });
+    }
+  }
+
   applyKeychains(rows, at, cx) {
+    this.lastKeychainRows = rows; this.lastKeychainAt = at;
     const now = Date.now()/1000;
-    this.keychains = rows.filter(r => /^[a-zA-Z0-9_-]+$/.test(r.host)).map(r => ({...r,
-      state: now-at <= 180 && now-r.at <= 180 && ["locked", "unlocked"].includes(r.state) ? r.state : "unknown"}));
+    // A direct unlock seen by probeOpenPopups wins over older registry samples.
+    const unlockedAt = shared("vega.keychain-unlocked-at") ?? {};
+    this.keychains = rows.filter(r => /^[a-zA-Z0-9_-]+$/.test(r.host)).map(r => {
+      const state = now-at <= 180 && now-r.at <= 180 && ["locked", "unlocked"].includes(r.state) ? r.state : "unknown";
+      const seen = unlockedAt[r.host];
+      return seen && seen > r.at * 1000 && state !== "unlocked" ? {...r, state: "unlocked", since: Math.floor(seen / 1000)} : {...r, state};
+    });
     setShared("vega.keychains", this.keychains);
     for (const row of this.keychains) {
       const key = `${row.host}/${row.since}`;
-      if (row.state === "unlocked") {
-        const popup = (shared("vega.keychain-popups") ?? {})[row.host];
-        if (popup) {
-          if (popup.session === KEYCHAIN_SESSION) closeOverlay(popup.overlay);
-          const popups = {...shared("vega.keychain-popups")}; delete popups[row.host];
-          setShared("vega.keychain-popups", popups);
-          // Only this mod's dedicated terminal; it may still be waiting for Enter.
-          cx.spawn(async () => { try { await exec("hc", ["kill", popup.terminal]); } catch (_) {} });
-        }
-      }
+      // An unlock keeps the window: its title turns green, the Slayer closes it (closeKeychain).
       if (row.state !== "locked") continue;
       const seen = shared("vega.keychain-seen") ?? [];
       if (!seen.includes(key)) {
@@ -183,7 +220,7 @@ export default class Vega extends View {
           await exec("hc", ["kill", terminal]); return;
         }
         if (old?.session === KEYCHAIN_SESSION) closeOverlay(old.overlay);
-        const overlay = openOverlay({kind: "window", key: `vega-keychain-${row.host}`, width: 680, height: 300,
+        const overlay = openOverlay({kind: "window", key: `vega-keychain-${row.host}`, width: 720, height: 380,
           layout: {type: "column", children: [
             {type: "block", size: {px: 32}, content: {mod: "vega", props: {keychainTitle: row.host}}},
             {type: "block", content: {terminal}},
@@ -198,8 +235,12 @@ export default class Vega extends View {
     });
   }
 
+  // One lock: the focused terminal's machine (local terminals: this host). Unlock popups for
+  // other machines still open on their own when those lock.
   keychainSegments(t) {
-    return (this.keychains ?? []).map(row => div().id(`keychain-${row.host}`).px(4)
+    const f = focused()?.terminal ?? "";
+    const host = (f.includes("/") ? f.split("/")[0] : this.localKeychainHost ?? "").toLowerCase();
+    return (this.keychains ?? []).filter(row => row.host === host).map(row => div().id(`keychain-${row.host}`).px(4)
       .text_color(row.state === "locked" ? t.ansi1 : row.state === "unlocked" ? t.ansi2 : t.dim)
       .tooltip(`${row.host}: ${row.state} since ${new Date(row.since*1000).toLocaleString()}`)
       .on_click((_e, cx) => { if (row.state === "locked") this.openKeychain(row, cx); })
@@ -225,7 +266,9 @@ export default class Vega extends View {
     if (!ctx?.project || this.readingContext) return;
     this.readingContext = true;
     const local = ctx.uac && !ctx.uac.address.includes("/");
-    const cwd = ctx.uac?.cwd;
+    // The registry checkout, not the terminal's cwd: that is the login shell's folder, which
+    // drifts (a UAC started from another repo read that repo's beads).
+    const cwd = (shared("vega.badges") ?? []).find(r => r.project === ctx.project && !r.machine)?.checkout ?? ctx.uac?.cwd;
     const json = async (program, args) => {
       try {
         const r = await exec(program, args, { cwd, timeout: 10000 });
@@ -389,13 +432,31 @@ export default class Vega extends View {
 
   // The shipped status line (workspace-status) without the palette hint; vega's own
   // work (badges, vegad, inbox) runs in the background and shows nothing here.
+  // The window's close: the overlay and its dedicated unlock terminal (only that one).
+  closeKeychain(host, cx) {
+    const popup = (shared("vega.keychain-popups") ?? {})[host];
+    closeOverlay(popup?.session === KEYCHAIN_SESSION ? popup.overlay : this.overlay);
+    if (!popup) return;
+    const popups = {...shared("vega.keychain-popups")}; delete popups[host];
+    setShared("vega.keychain-popups", popups);
+    cx.spawn(async () => { try { await exec("hc", ["kill", popup.terminal]); } catch (_) {} });
+  }
+
   render(_cx) {
     const t = theme();
-    if (this.keychainTitle) return h_flex().size_full().items_center().justify_between().px(10).bg(t.chrome).text_color(t.foreground)
-      .child(`Login keychain · ${this.keychainTitle}`)
-      .child(div().id("keychain-close").cursor_pointer().child("×")
-        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click((_e, cx) => { cx.stop_propagation(); closeOverlay(this.overlay); }));
+    if (this.keychainTitle) {
+      const row = (shared("vega.keychains") ?? []).find(r => r.host === this.keychainTitle);
+      const state = row?.state ?? "unknown";
+      const when = row?.since ? new Date(row.since * 1000).toLocaleTimeString() : "";
+      return h_flex().size_full().items_center().gap(8).px(10).bg(t.chrome).text_color(t.foreground)
+        .child(svg("mods/vega/lock.svg").size(13).text_color(state === "locked" ? t.ansi1 : state === "unlocked" ? t.ansi2 : t.dim))
+        .child(div().font_semibold().child(`Login keychain · ${this.keychainTitle}`))
+        .child(div().text_color(t.dim).child(`${state}${when ? ` since ${when}` : ""}`))
+        .child(div().flex_1())
+        .child(div().id("keychain-close").px(6).cursor_pointer().tooltip("Close this window and its unlock terminal").child("×")
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => { cx.stop_propagation(); this.closeKeychain(this.keychainTitle, cx); }));
+    }
     const space = spaces().find(s => s.active);
     const list = agents();
     const shown = [this.error, this.startError].filter(Boolean).join("; ");

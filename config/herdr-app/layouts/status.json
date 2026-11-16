@@ -1,0 +1,13 @@
+{
+  "id": "root",
+  "type": "column",
+  "children": [
+    {
+      "id": "navigation",
+      "type": "block",
+      "size": { "px": 38 },
+      "content": { "mod": "vega-window-tabs" }
+    },
+    { "id": "profile:tabs", "type": "stack", "children": [] }
+  ]
+}

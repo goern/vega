@@ -11,7 +11,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use async_nats::{jetstream, HeaderMap};
+use async_nats::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use vega_herdr::notes::{Note, Store};
@@ -20,6 +20,7 @@ use vega_registry::View;
 const POLL_EVERY: i64 = 15 * 60;
 const REMIND_EVERY: i64 = 4 * 3600;
 const TIMEOUT: Duration = Duration::from_secs(60);
+const MAIL_ACCEPTANCE_TIMEOUT: &str = "pagerduty: mail acceptance timeout";
 const AGENT: &str = "tool vega-pagerduty";
 const CONFIG: &str = ".vega/pagerduty.toml";
 // pdc v0.13.5 internal/agent/detect.go. Agent mode wins over --format json.
@@ -179,6 +180,9 @@ struct Receipt {
     changed_at: String,
     to: Destination,
     at: i64,
+    /// Broker acceptance was uncertain; suppress retries until the reminder is due.
+    #[serde(default)]
+    maybe_delivered: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -586,7 +590,7 @@ fn mail_text(i: &Incident, to: &Destination, reminder: bool) -> String {
     } else {
         &i.title
     };
-    format!("pagerduty: #{} {} {marker}{} ({}) — {}\nService: {} ({}); project: {}\n{}\nCreated: {}\nYou may investigate, acknowledge and add notes. Resolve, escalate or reassign only after the Slayer approves a board decision. Use vega secrets run --for pdc -- pdc ...{fallback}",
+    format!("pagerduty: #{} {} {marker}{} ({}) — {}\nService: {} ({}); project: {}\n{}\nCreated: {}\nYou may investigate, acknowledge and add notes. Resolve, escalate or reassign only after the Slayer approves a decision bead. Use vega secrets run --for pdc -- pdc ...{fallback}",
         i.incident_number, clean(&i.id, 80), i.status, clean(&i.urgency, 30), clean(title, 800),
         clean(&i.service.summary, 160), clean(&i.service.id, 80), clean(project, 250), clean(&i.html_url, 500), clean(&i.created_at, 80))
 }
@@ -628,7 +632,7 @@ fn cycle(path: &Path, now: i64, ops: &mut impl Ops) -> Result<(), String> {
         return Err(error);
     }
     let ownership = ops.ownership()?;
-    // Unmapped/conflicting incidents do not require a working registry to reach the board.
+    // Unmapped/conflicting incidents do not require a working registry to reach the inbox.
     let needs_registry = state
         .incidents
         .values()
@@ -657,18 +661,20 @@ fn cycle(path: &Path, now: i64, ops: &mut impl Ops) -> Result<(), String> {
             continue;
         }
         let text = mail_text(&tracked.incident, &to, tracked.reminder(&to));
-        match ops.deliver(&to, &tracked.incident, &text, now) {
-            Ok(()) => {
-                tracked.delivered = Some(Receipt {
-                    status: tracked.incident.status.clone(),
-                    changed_at: tracked.incident.last_status_change_at.clone(),
-                    to,
-                    at: now,
-                });
-            }
-            Err(e) => {
-                errors.insert(e);
-            }
+        let result = ops.deliver(&to, &tracked.incident, &text, now);
+        let maybe_delivered = matches!(&to, Destination::Mail { .. })
+            && result.as_ref().is_err_and(|e| e == MAIL_ACCEPTANCE_TIMEOUT);
+        if result.is_ok() || maybe_delivered {
+            tracked.delivered = Some(Receipt {
+                status: tracked.incident.status.clone(),
+                changed_at: tracked.incident.last_status_change_at.clone(),
+                to,
+                at: now,
+                maybe_delivered,
+            });
+        }
+        if let Err(e) = result {
+            errors.insert(e);
         }
     }
     state.save(path)?; // Failure here permits a rare duplicate, not a lost notification.
@@ -822,7 +828,7 @@ impl Ops for System {
                         publish_mail(client, host, pane, text),
                     )
                     .await
-                    .map_err(|_| "pagerduty: mail acceptance timeout".to_string())?
+                    .map_err(|_| MAIL_ACCEPTANCE_TIMEOUT.to_string())?
                 })
             }
             Destination::Board { .. } => {
@@ -945,7 +951,7 @@ async fn publish_mail(
     headers.insert(crate::h::FROM_CWD, "vegad");
     headers.insert(crate::h::SENT_MS, crate::now_ms().to_string().as_str());
     crate::history::mail(
-        &jetstream::new(client),
+        &vega_registry::broker_context(client),
         crate::inbox_subject(&crate::subject_token(host), pane, &crate::host()),
         headers,
         text.to_string(),
@@ -953,7 +959,13 @@ async fn publish_mail(
     .await
     .map_err(|_| "pagerduty: mail publish failed")?
     .await
-    .map_err(|_| "pagerduty: mail not durably accepted")?;
+    .map_err(|e| {
+        if e.kind() == async_nats::jetstream::context::PublishErrorKind::TimedOut {
+            MAIL_ACCEPTANCE_TIMEOUT
+        } else {
+            "pagerduty: mail not durably accepted"
+        }
+    })?;
     Ok(())
 }
 

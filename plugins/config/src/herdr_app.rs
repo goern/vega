@@ -173,6 +173,51 @@ const MOD_FILES: [&str; 2] = ["main.js", "mod.json"];
 fn mod_files(name: &str) -> &[&str] {
     if name == "vega" {
         &["main.js", "mod.json", "lock.svg"]
+    } else if name == "vega-sidebar" {
+        &["main.js", "mod.json", "pin.svg"]
+    } else if name == "vega-window-tabs" {
+        &[
+            "main.js",
+            "mod.json",
+            "navigation.js",
+            "tabs.js",
+            "diff.js",
+            "UPSTREAM.md",
+            "changes.svg",
+            "win-min.svg",
+            "win-max.svg",
+            "win-close.svg",
+            "win-restore.svg",
+        ]
+    } else if name == "vega-tabs" {
+        &[
+            "main.js",
+            "mod.json",
+            "UPSTREAM.md",
+            "win-min.svg",
+            "win-max.svg",
+            "win-close.svg",
+            "win-restore.svg",
+        ]
+    } else if name == "vega-services" {
+        &[
+            "main.js",
+            "model.js",
+            "helper.py",
+            "mod.json",
+            "UPSTREAM.md",
+        ]
+    } else if name == "vega-pane" {
+        &[
+            "main.js",
+            "mod.json",
+            "UPSTREAM.md",
+            "close.svg",
+            "split-down.svg",
+            "split-right.svg",
+            "zoom.svg",
+            "unzoom.svg",
+        ]
     } else {
         &MOD_FILES
     }
@@ -186,6 +231,10 @@ fn mod_name(unit: crate::Unit) -> Option<&'static str> {
         crate::Unit::HerdrAppMods => Some("vega"),
         crate::Unit::HerdrAppSidebar => Some("vega-sidebar"),
         crate::Unit::HerdrAppInbox => Some("vega-inbox"),
+        crate::Unit::HerdrAppWindowTabs => Some("vega-window-tabs"),
+        crate::Unit::HerdrAppTabs => Some("vega-tabs"),
+        crate::Unit::HerdrAppPane => Some("vega-pane"),
+        crate::Unit::HerdrAppServices => Some("vega-services"),
         _ => None,
     }
 }
@@ -322,7 +371,14 @@ pub fn apply(
     // switch command validates activation, and owns persistence in shared.json.
     let mut previous_layout = None;
     if plan.herdr_app_pending {
-        for name in ["vega", "vega-sidebar", "vega-inbox"] {
+        for name in [
+            "vega",
+            "vega-sidebar",
+            "vega-inbox",
+            "vega-tabs",
+            "vega-pane",
+            "vega-services",
+        ] {
             if !home(&ctx.env)
                 .join("mods")
                 .join(name)

@@ -4,10 +4,11 @@
 //! target host serves `vega.cmd.<host>.>`: it takes the sender from the
 //! subject (the broker enforces it per key), allows only the kinds in
 //! HANDLERS, and runs that handler with fixed argv and the JSON on stdin.
+//! Keychain status is the in-process exception: a private receiver validates
+//! the inbox-only sender and reconstructs a header-free registry publish.
 //!
-//! The handler owns the meaning and its checks (for `open`: vega-open's
-//! remote-open maps the sender's paths to mounts and refuses anything
-//! outside its roots). The relay only routes, limits and reports.
+//! The handler owns the meaning and its checks. The relay only routes, limits
+//! and reports.
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -21,7 +22,6 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Allowed kinds and their handler argv; the relay appends `<from host>`.
 pub const HANDLERS: &[(&str, &[&str])] = &[
     ("notify", &["vega-notify", "remote-update", "--from"]),
-    ("open", &["vega-open", "remote-open", "--from"]),
     (
         "orchestration",
         &["vega-orchestration", "remote-update", "--from"],
@@ -54,6 +54,73 @@ fn reply(ok: bool, code: &str, message: &str) -> Vec<u8> {
     json!({"ok": ok, "code": code, "message": message})
         .to_string()
         .into_bytes()
+}
+
+/// Reply subjects are authority: allow_responses must not delegate a write
+/// outside the authenticated sender's literal inbox namespace.
+pub fn valid_reply(from: &str, reply_to: &str) -> bool {
+    !from.is_empty()
+        && reply_to
+            .strip_prefix(&format!("_INBOX_{from}."))
+            .is_some_and(|tail| {
+                !tail.is_empty()
+                    && tail.split('.').all(|t| {
+                        !t.is_empty()
+                            && t.bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    })
+            })
+}
+
+/// Daemon command dispatch. Keychain is handled in-process so the trusted
+/// receiver reconstructs the registry write, without forwarding headers.
+pub async fn respond(
+    client: &async_nats::Client,
+    receiver: &str,
+    request: &async_nats::Message,
+) -> Vec<u8> {
+    let Some(reply_to) = request.reply.as_ref() else {
+        return reply(false, "denied", "command requires a reply inbox");
+    };
+    if !parse_subject(&request.subject)
+        .is_some_and(|(to, _, from)| to == receiver && valid_reply(from, reply_to))
+    {
+        return reply(false, "denied", "relay reply must use the sender inbox");
+    }
+    let answer = dispatch(client, receiver, &request.subject, &request.payload).await;
+    let _ = tokio::time::timeout(
+        crate::outage::CALL,
+        client.publish(reply_to.clone(), answer.clone().into()),
+    )
+    .await;
+    answer
+}
+
+pub async fn dispatch(
+    client: &async_nats::Client,
+    receiver: &str,
+    subject: &str,
+    payload: &[u8],
+) -> Vec<u8> {
+    let Some((to, kind, from)) = parse_subject(subject).filter(|(to, _, _)| *to == receiver) else {
+        return reply(false, "denied", "invalid command destination or subject");
+    };
+    if kind == "lanista" {
+        return match vega_lanista::hosts::receive(client, to, from, payload).await {
+            Ok(()) => reply(true, "ok", "host pins published"),
+            Err((code, why)) => reply(false, code, &why),
+        };
+    }
+    if kind == "keychain" {
+        return match crate::keychain::receive(client, to, from, payload).await {
+            Ok(()) => reply(true, "ok", "keychain status published"),
+            Err((code, why)) => reply(false, code, &why),
+        };
+    }
+    let (kind, from, payload) = (kind.to_string(), from.to_string(), payload.to_vec());
+    tokio::task::spawn_blocking(move || serve(&kind, &from, &payload))
+        .await
+        .unwrap_or_default()
 }
 
 /// What the serving relay answers to one request.
@@ -157,10 +224,12 @@ mod tests {
     fn unknown_kind_big_or_bad_payload_is_denied() {
         let v: Value = serde_json::from_slice(&serve("shell", "x", b"{}")).unwrap();
         assert_eq!(v["code"], "denied");
-        let big = vec![b' '; MAX_PAYLOAD + 1];
-        let v: Value = serde_json::from_slice(&serve("open", "x", &big)).unwrap();
+        let v: Value = serde_json::from_slice(&serve("open", "x", b"{}")).unwrap();
         assert_eq!(v["code"], "denied");
-        let v: Value = serde_json::from_slice(&serve("open", "x", b"not json")).unwrap();
+        let big = vec![b' '; MAX_PAYLOAD + 1];
+        let v: Value = serde_json::from_slice(&serve("notify", "x", &big)).unwrap();
+        assert_eq!(v["code"], "denied");
+        let v: Value = serde_json::from_slice(&serve("notify", "x", b"not json")).unwrap();
         assert_eq!(v["code"], "denied");
     }
 
@@ -179,5 +248,30 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(serde_json::from_str::<Value>(&line).unwrap(), receipt);
         assert!(HANDLERS.iter().any(|(kind, _)| *kind == "orchestration"));
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    #[test]
+    fn replies_require_literal_tokens_in_the_authenticated_senders_inbox() {
+        for reply in ["_INBOX_puck.nuid", "_INBOX_puck.a_b-C.123"] {
+            assert!(super::valid_reply("puck", reply));
+        }
+        for reply in [
+            "_INBOX_puck",
+            "_INBOX_puck.",
+            "_INBOX_puck..x",
+            "_INBOX_puck.*",
+            "_INBOX_puck.>",
+            "_INBOX_puck.x y",
+            "_INBOX_puck-other.x",
+            "_INBOX_proteus.x",
+            "$KV.VEGA_REGISTRY.puck.beat",
+            "$JS.API.INFO",
+        ] {
+            assert!(!super::valid_reply("puck", reply), "{reply}");
+        }
+        assert!(!super::valid_reply("", "_INBOX_.x"));
     }
 }

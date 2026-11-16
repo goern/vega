@@ -2,16 +2,85 @@
 
 Slice 5b of the [hc migration](hc-migration.md) (vega-0h4c.10): what vega shows in herdr-app and how the
 Slayer acts on it. Decided with the Slayer on 2026-11-07. Background: the herdr TUI sidebar (machines tree,
-priority-sorted agents list, vega tokens from `report-metadata`) and the `vega board` Inbox
-([board-ui](board-ui.md)).
+priority-sorted agents list, vega tokens from `report-metadata`) and the former dashboard Inbox (preserved at `herdr-tui-final`).
+
+## Profile windows (vega-0h4c.85, vega-0h4c.86)
+
+`config/herdr-app/profiles/<name>.toml` declares `layout`, `mods`, `[settings]`,
+`[shared]` seeds and `[[tab]]` groups (`name`, one or two `[[tab.terminals]]`
+entries with `name`, `machine`, `argv`, optional `optional = true`). Terminal slot
+names are unique across groups. Legacy flat `[[terminals]]` remains supported;
+a profile cannot mix flat terminals and groups. The personal
+`herdr-app.profiles` config unit resolves embedded defaults and local overrides
+under `$XDG_CONFIG_HOME/vega/config`, and writes `$XDG_CONFIG_HOME/herdr-app-<name>`.
+Like the other herdr-app units, it skips hosts without `$XDG_CONFIG_HOME/herdr-app`
+before reading profile sources or running mod checks (only proteus uses the app).
+Mod folders come from the same sources (local third-party folders are supported).
+Settings overrides merge into the main settings source. Only a missing `shared.json`
+is seeded with the selected layout and `frame.welcomed = "finished"`; running app
+state is never edited. An existing manual home may still need its welcome dismissed.
+
+`vega window <name>` is a `vega-window` binary in `plugins/config`. It reuses live
+hc terminals by `vega.window=<name>` and `vega.window.slot=<terminal-name>`, starts
+missing entries with `hc run --bg --no-parent --no-notify --on <machine>` and explicit
+argv, then resolves `{ "terminal": "profile:<terminal-name>" }` layout slots to
+terminal addresses. It opens/raises `herdr-app` with the profile's `HERDR_APP_HOME`
+and selects that layout. Direct terminal blocks need no `herdr.space`/`herdr.tab`
+labels: all homes still share hc inventory, but this window creates no shared spaces.
+The main sidebar excludes terminals labelled `vega.window` from its lists and trees.
+
+The shipped `status` profile has top tabs proteus, ganymede, io (btop), and tokens
+(ganymede token-burn tui), giving each TUI the full body below the bar. io is optional:
+when its labelled live slot is absent, `hc exec --on io` checks btop in its login
+shell before starting; absence or an unavailable machine warns and omits that group.
+Other start failures remain errors. Live slots skip the availability check.
+
+Grouped layouts contain exactly one `id: "profile:tabs"` node. The launcher fills
+that stack with stable group IDs, using one direct terminal block per slot (two
+split horizontally). `vega-window-tabs` is a small top-nav mod included in the
+profile's mods; it draws groups from the live layout and calls `layout.select`.
+Model tabs (`tab.new`) belong to one machine's space, so layout tabs avoid shared
+spaces, placeholder shells, and adopting cross-machine terminals into the wrong
+core. No duplicate model tabs are created on rerun. Herdr owns active stack click
+state; regenerating the same tree preserves it. The profile's keys.json derives
+from the configured main keys source, remapping tab.next/prev/select bindings to
+mod commands (Ctrl-Tab, Cmd-Shift-[ / ], Cmd-1..9 and ctrl-s n/p/1..9); terminal
+bindings are retained. App-owned shared state is never rewritten.
+
+Tests use temporary homes and fakes; live validation belongs to the UAC.
+Closing a window leaves its terminals running; reopening reuses them. Failed starts
+leave successfully created terminals available for the next invocation.
+
+## Last-focus navigation (vega-0h4c.70)
+
+`ctrl-s l` or `cmd-;` toggles the last agent, `ctrl-s shift-l` the last space,
+and `ctrl-s ;` the last pane in the current tab. Press again to return (A → B → A).
+Pane history includes mod panes; agent history includes qualified remote addresses
+and ignores shells. Closed targets are skipped; without a previous live target the
+command does nothing. The keys deliver `vega-sidebar.last-agent`,
+`vega-sidebar.last-space` and `vega-sidebar.last-pane` through `nextCommand()`.
+
+History stays in module memory, shared by all sidebar copies on herdr-app 0.1.14+,
+and resets on mod reload or app restart. Renders sample focus; a 300 ms background
+loop also samples because the API does not guarantee a render for every focus
+change. Copies share the polling budget and only read agent inventory when the
+terminal changes. Broadcast key deliveries are batched for one microtask so only
+one shown sidebar acts; hidden or removed copies cannot strand a retained owner.
+Popup, mail and project-window copies do not participate. Sampling never forces redraws.
+Run `vega config apply herdr-app` to apply the updated mod and keys.
 
 ## Login keychain windows (vega-oiwq)
 
 The `vega` status mod reads vegad's local `keychains.json` registry projection every five seconds
 in one local read. It uses the same `XDG_STATE_HOME` as vegad, as for badges. There is no per-host
-exec polling. The right side shows one monochrome lock per macOS host, coloured with theme
+exec polling. The right side shows one monochrome lock for the focused terminal's machine (local
+terminals: this host; Slayer 2026-11-10), coloured with theme
 `ansi2` (unlocked), `ansi1` (locked), or `dim` (unknown). Tooltips give host, state, and `since`.
 Stale snapshots and stale probe samples become unknown rather than retaining a red/green claim.
+The projection reads `<host>.status.keychain` for all hosts. Samples carry their own `at`, so
+inbox-only hosts such as puck appear without a `<host>.beat`. Their vegad sends an exact keychain
+command to its theme control host; that private daemon validates and relays only the display
+sample. Puck receives no registry write permission. Unknown inbox-only status keys are ignored.
 
 A newly observed lock opens one global non-modal window, deduped across mod copies and restarts
 by `host + since` in shared state. A click on a red lock opens it again. The mod starts an
@@ -19,15 +88,19 @@ unlabelled hc terminal on that host (`hc run --bg --no-parent --no-notify`, `--o
 it is never adopted into a tab. An existing live dedicated terminal is reused when reopening.
 The window layout contains a draggable title bar with Close, and that terminal exactly once.
 The title bar is a `vega` copy with `keychainTitle` props and no background pollers. The window
-does not take focus automatically. Closing it leaves the waiting terminal available to reopen;
-the next unlocked observation closes the window and kills only its dedicated terminal.
+does not take focus automatically. The title bar shows the lock in its state colour, the host
+and the state with its `since` time. The window stays until the Slayer closes it (Slayer
+2026-11-10): an unlock only turns the title green; Close closes the window and kills only its
+dedicated terminal. While the window is open and the host is locked, the mod
+reads that host's keychain itself every 5 s (`security show-keychain-info`, through `hc exec` for
+peers, one probe per host across mod copies), so the lock turns green right after the password;
+a newer locked sample from vegad wins again.
 
-The terminal prints `Press Enter to unlock the login keychain on <host>`, waits for Enter, then
-runs `security unlock-keychain "$HOME/Library/Keychains/login.keychain-db"`. Echo is disabled
-before that command and restored on exit; security prompts on the tty. The password is never
-in argv (no `-p`), files, logs, mail, notes, agent send/keys, or visible output. Agents never
-press Enter, type a password, or run unlock/lock themselves. Failed launches show a short toast
-and the red lock offers retry. A probe that becomes unlocked during launch suppresses the window.
+The terminal explains the lock (host, why agents fail, the exact command
+`security unlock-keychain ~/Library/Keychains/login.keychain-db` it runs on that host, that the
+password is typed only there, without echo, never in argv), waits for Enter, then runs it with
+echo off, retries on a failure after the next Enter, and on success says so and waits for the
+window to be closed.
 
 Development stays in the worktree: run `herdr-app check config/herdr-app/mods/vega` and
 `node --test scripts/herdr-app-mods.test.mjs`. For a live tour use an isolated `HERDR_APP_HOME`
@@ -110,6 +183,7 @@ syncing the file is a future option if the app runs on several hosts.
 [projects."github.com/team/repo"]
 name = "My project" # empty means use the UAC's vega.project label
 labels = ["work"]
+pinned = true # keep the UAC visible with the Active filter
 
 [views.Work]
 labels = ["work"]
@@ -117,18 +191,18 @@ machines = ["puck"]
 ```
 
 `vega project config <project-id> [--name <name>] [--label <label>]...
-[--unlabel <label>]... [--json]` reads or edits one entry. Keys are the full normalized
+[--unlabel <label>]... [--pin|--unpin] [--json]` reads or edits one entry. Keys are the full normalized
 remote from `vega.project-id`, never a terminal ID or short repository name.
 Label additions/removals are idempotent; removal wins if both are requested.
 `vega project config --json` returns `{projects: {...}, views: {...}}` in one exec.
-An individual read returns `{projects: {<id>: {name, labels}}}`; absent entries have
-empty defaults, and a read never creates the file.
+An individual read returns `{projects: {<id>: {name, labels, pinned}}}`; absent entries have
+empty defaults with pinned false, and a read never creates the file.
 
 Right-clicking a project header or its UAC row opens a popup with a descriptor-driven
 tab bar. Stage 1 exposes only Config (display name, comma-separated labels, Save).
 This requires the full `vega.project-id` label; legacy UACs without that label remain
 visible but cannot open Config until vegad supplies their stable identity.
-Later stages add UAC, Board, Decisions and Notifications descriptors and renderers.
+Later stages add UAC, Inbox, Decisions and Notifications descriptors and renderers.
 Inputs load once on opening, never autofocus, and remain editable on save errors.
 Save uses argv via `exec("vega", ["project", "config", ...])` on the app host, including
 for remote UACs. Escape closes. Non-UAC Spaces rows retain Rename.
@@ -168,11 +242,11 @@ the collapsed rail and keyboard navigation.
   `watchFolder()`.
 - **Answers:** `exec()` of the vega CLI, JSON where a command needs to return data.
 
-## vega board
+## Retired TUI UI
 
-The board Inbox moves to `vega-inbox`; the herdr plugin (dock, popup, `prefix+u`) goes with the TUI. The
-bead tabs (List, Table, Kanban) stay a TUI that runs as an hc tab when needed. `vega open` is still open
-(vega-0h4c.11).
+The dashboard and path menu were dropped by decision vega-0h4c.11. Their plugin
+crates and TUI config are removed; the inbox, sidebar and project window are the
+supported UI. The old implementation is preserved at `herdr-tui-final`.
 
 ## Limits of herdr-app mods
 
@@ -240,7 +314,9 @@ children remain under their visible parent regardless of those labels.
 
 vegad first resolves the foreground cwd. If no project resolves, it uses that
 terminal's space folder from the local core's `herdr-app` document (`doc.get`),
-without asking the desktop app or inspecting remote paths. Project
+without asking the desktop app or inspecting remote paths; never for a terminal
+whose foreground is its own launch shell (hc keep's recovery shell after a reboot).
+A UAC claim's pane takes the claim's project over either. Project
 attribution never replaces a resolved foreground project with the launch or space
 folder: an agent in rally-coach launched from a vega shell stays in rally-coach.
 Own-terminal metadata likewise prefers `foreground.cwd`, falling back to `cwd`.
@@ -266,6 +342,13 @@ answering on one machine leaves another machine's identical bead ID visible.
 Remote transport or inner-command failures keep the card open. Waiting panes
 retain their qualified machine address, and positive group totals still match
 both source machine and project.
+
+For local worktree spawns, mux checks the configured app socket and reads the shown
+space once. Without a local app binary, socket or window, it starts the ordinary hc
+tab in the caller's space with cwd set to the worktree, preserving the brief, labels
+and parent link, and prints one stdout placement line. `--machine` worktrees run wt
+and trust preparation on the target; they always use the ordinary remote tab path,
+without copying local app space IDs. An available local app keeps the new-space path.
 
 `space.new` creates a shell before mux starts a worktree agent. It also shows the
 new space, so mux reads the shown space (`herdr-app ls`) first and selects it again
@@ -305,6 +388,40 @@ A thin binding window on spendable credits keeps its quota percentages and sets
 `on_credits: true`, `warns: false`. Missing/stale credit data stays unknown;
 provider credit units must not be rendered as USD (vega-lweq).
 
+## Inactive sidebar sessions (vega-0h4c.63)
+
+The **Active** toggle beside the view selector hides idle (grey ring) and unknown/no-status
+sessions. Working, blocked and done sessions stay: done is unread completion news, including
+sub-agents. `kidStatus` preserves done as a blue dot like the tabs and maps error to blocked.
+Done counts as unread only while the terminal's `turn` is past its `herdr.seen` label (what
+herdr-app's tab bar uses); a seen done reads as idle (`seenDone`), for top-level rows and
+sub-agents alike, in the glyph and in the filter. The
+focused terminal's agent also stays, even when idle. This filter applies within the selected
+label/machine view, and does not change that view.
+
+A UAC stays when it is active itself or has any active live descendant. Only active descendants
+are shown beneath it; active grandchildren are promoted past hidden idle parents, with tree
+connectors rebuilt for the visible rows. Spaces without a UAC use the same per-agent rule.
+Project and space groups with no remaining sessions disappear unless the project is pinned.
+Worktree placeholder shells and exited descendants remain excluded. Folds still control expansion; folded rows do not
+increase the inactive count.
+
+Each project header has a small needle pin: dim when unpinned, theme accent when pinned.
+Its click toggles the pin and stops propagation, as does its left mouse-down, so it does not
+fold or drag the header. Pins live in vega project preferences (`projects.toml`, `pinned: true`),
+not localStorage. The sidebar reads `vega project config --json`, writes
+`vega project config <id> --pin|--unpin --json`, then refreshes; failures use the config error line.
+With Active on, a pinned project's group and UAC remain even if idle or without status; idle
+sub-agents and other idle agents still hide. Pins respect the current label/machine view and
+do not retain projects outside it. Retained pinned UACs do not count in `N idle hidden`.
+
+The toggle defaults off and uses shared state `vega.hide-inactive`, mirrored into each sidebar
+copy's `localStorage` key `hide-inactive` as `true`/`false`, with that copy as the restart fallback,
+like `vega.view`/`active-view`. A dim `N idle hidden` line counts sessions removed by activity
+within the current view, including unknown sessions, excluding UACs retained as context and
+the focused agent. Clicking the line disables the activity filter. It remains available in the
+narrow rail too, where active descendants remain navigable.
+
 ## Project window, status line and sidebar badge (vega-0h4c.50, built live)
 
 Each place has one job: the sidebar navigates, the status line shows the focused project's
@@ -319,7 +436,7 @@ context, the project window holds details and actions.
   `vega-project-follow`; each second the window reopens in place on the focused terminal's
   project, keeping the tab). The window owns a focus handle so Esc closes it.
   Tabs: Overview (UAC, needs-you tiles, beads counts, sentinels with beads, CI watches,
-  capacity bars), Board (in progress / ready / blocked from `bd`, expandable rows),
+  capacity bars), Inbox (in progress / ready / blocked from `bd`, expandable rows),
   Decisions (answer via `vega uac answer`, dismiss via `bd close --reason`), Asks
   (`vega notify list --json --project <id>`, read locally for every project because the list
   comes from the registry; Ack and Resolve run `vega notify ack|resolve <host>=<id>`, which
@@ -343,10 +460,189 @@ context, the project window holds details and actions.
   mod copy and the filter popup is another copy; the sidebar mirrors it into its own
   `localStorage` (key `active-view`) to keep it across restarts. Saving a view shows it.
 - **Waiting on you**: the Overview lists the badge row's `waiting_panes` under the tiles with
-  Go (focus) and, for `silent` and `asking`, Dismiss; the vega inbox offers the same Dismiss.
+  Go (focus) and, for `silent` and `asking`, Dismiss; the vegan inbox offers the same Dismiss.
   Dismiss runs `vega mux dismiss <pane>` on the badge row's machine (the parent's vegad host,
   through `hc exec` when remote, pane unqualified to `hc:<pane>`). A live dialog (`input`) and an
   open ask (`unanswered`) are not dismissable (vega-0h4c.56).
 - **Inputs in the project window** sit in `inputBox`, which stops the left press: the window
   refocuses its own handle on every press (for Esc) and would take the focus from the input.
 - Colours come from theme tokens only (working, blocked, done, idle), for light and dark.
+
+## Vega settings window (vega-idc8)
+
+The gear beside **VEGA** in the expanded sidebar header opens a keyed
+`vega-sidebar` window (`vega-settings`, `globalConfig: true`), even with no project
+or terminal selected. It has Models, Windows and Theme sections. Its own title bar
+has a close button that stops mouse-down propagation; Escape closes it too.
+The title bar drags the window, and content controls keep their presses.
+The settings copy creates no inputs and starts no polling timers. Each section
+loads on selection and has an explicit Refresh control; mutations refresh Models.
+
+Windows reads the profile list from `vega window` (named text rows with applied
+status), including unapplied profiles. Applied rows offer Open, invoking
+`vega window <name>`, and Edit tabs, opening the existing `vega-window-tabs`
+config dialog with that profile. The dialog retains its diff, Promote and Reset
+behavior; opening the settings section itself starts no windows or terminals.
+Unapplied profiles are labelled and have no live actions. The
+`herdr-app.vega-window-tabs` config unit installs the existing tab mod and its
+assets into the main app home too, so its dialog can open from settings.
+Apply that unit alongside `herdr-app.vega-sidebar`, or apply the herdr-app group.
+
+Theme displays the full read-only `vega theme` status (there is no JSON form),
+including OS/preference/due/applied mode, tool drift and every Claude pane's
+applied, pending or failed delivery with its reason. Reads and action errors
+appear inline, retaining the last successful snapshot. Refresh requests new data;
+there is no background theme polling or automatic theme mutation.
+
+### Estate and project Models (vega-aysa.2, vega-idc8)
+
+The settings window owns the fleet-wide Default and per-host groups, read and
+edited on the app host. It consumes `vega lanista hosts --json` (`{rows: [...]}`),
+from the app host home (avoiding the sidebar process checkout's project pins),
+without filtering by connected hc machines: inbox-only hosts such as puck remain
+visible. Each host group lists seat, lane and tier, effective model, source
+(host/default/global) and expiry.
+
+The Default group is independent of host/project overrides: one read-only
+`vega lanista pin <lane> --tier <tier> --default` per unique seat/lane/tier reads
+its model, source and expiry. That command currently prints named text fields.
+Pi is omitted from Default because the CLI rejects pi default writes; use zai's
+default cells for its fallback. Host pi cells still offer only their own allowlist,
+even when the displayed effective model is inherited from zai.
+
+Choose model opens an inline dropdown containing only the row's `allowed` models.
+Selection runs `vega lanista pin <lane> --tier <tier> --host <host> --set <model>`;
+Reset substitutes `--clear`. Default actions substitute `--default` for `--host`.
+Nonstandard seats add `--seat <seat>`. Commands use argv without a shell. Controls
+stop left mouse-down like `inputBox`, preserving the window's focus handling.
+All colours use theme tokens. CLI stdout errors, stderr errors, launch failures,
+and parse failures appear inline; failed host reads retain the last good snapshot.
+
+The project window's Models tab contains only Project overrides. It deduplicates
+seat/lane/tier cells, reads effective project resolution and edits pins with
+`vega lanista pin` without `--host` or `--default`, in the project's recorded
+checkout (through the existing remote checkout helper when necessary). It shows
+the inherited source until a project pin is set. New project pins explicitly use
+`--until never`; Reset clears only the project pin and restores inheritance.
+A missing checkout produces an inline error rather than falling back to the app
+process directory.
+
+The estate snapshot and project snapshots use separate shared keys (`vega.models`
+and `vega.models.<project-id>`). The mutation guard uses `shared()`/`setShared()`
+so copies cannot submit simultaneous edits. Reads run when Models is selected,
+on Refresh, and after each action; the existing project-only 15-second refresh
+also reads project pins while that tab is selected.
+`node --test scripts/herdr-app-mods.test.mjs` covers rendering, independent defaults,
+puck, allowlists, exact estate/project set/clear argv, pi omission, refresh,
+inline errors, the gear/close controls, profile actions and theme delivery status.
+
+### Status tab management (vega-0h4c.87)
+
+Rechecked the installed `herdr-app --skill`, `AGENTS.md`, and `commands` on
+2026-11-13: native tabs still belong to a space on one machine; composition
+terminal blocks are not model panes. Keep the layout stack and `vega-window-tabs`
+mod for cross-machine groups and existing window/slot labels. Use native input
+widgets and the shipped tab bar's press/release reorder interaction.
+
+Local changes live in `$XDG_CONFIG_HOME/vega/windows/<profile>.toml`: added tabs,
+display titles, ordered stable IDs and hidden repo tabs. Closing hides a tab and
+leaves its terminal alive for reuse. Reset discards this overlay. Promote writes
+the effective profile into an explicitly selected vega checkout as an uncommitted
+change; it does not apply, install or commit it.
+
+### Stock tab bar fork and profile diff (vega-0h4c.89)
+
+The status bar now forks herdr-app 0.1.15's stock `tabs` mod render tree in
+`vega-window-tabs/tabs.js`; `UPSTREAM.md` records source hashes and adapter
+differences for rebasing. Keep stock pill dimensions, active close, program icons,
+scroll tracking, window controls and pill-level double-click rename. The old
+label's nested click handler competed with the enclosing press/release gesture;
+the fork uses stock's passive title. Drag state uses stable group IDs, and drop
+positions use the full effective profile order, since an optional group without
+a running terminal is missing from the visible layout but still in the profile.
+
+Config uses the stock `changes` line-numbering and virtualized diff viewport,
+extracted into `diff.js`. `vega window show` adds a unified `diff` from canonical
+applied repo profile to effective profile, so formatting alone is not a change.
+This is the same applied base checked by Promote, not a read of an arbitrary
+checkout. Reset refreshes the view to “No local changes”; Promote keeps the diff
+until the reviewed profile is installed/applied and the local overlay reset.
+
+
+## Services right panel (vega-0h4c.95)
+
+`vega-services` is a child of `panel-body` beside Files and Changes, toggled by
+vega-tabs. Apply its new `herdr-app.vega-services` whole-folder config unit before
+the layout; no shipped layout or mod is edited in place. The original small
+implementation and prior-art licenses are documented in its UPSTREAM.md.
+
+On first show and explicit Refresh it snapshots listeners (`ss -tlnpH` on Linux,
+`lsof` on macOS), parent PIDs and listener cwds through `exec` on each space’s hc
+machine. Python 3 plus ps and ss/lsof are required there. The panel groups by
+`vega.project-id` (a UAC’s label wins within its space), space and machine.
+Only the focused project's services appear, across all its machines/spaces;
+the focused live `vega.role=uber` terminal alone enables the unscoped list.
+Project resolution follows sidebar identity rules: full IDs, unambiguous legacy
+names, UAC space labels and live ancestors. An unresolved focus shows only
+unattributed registrations in their explicit host group.
+Herdr's live focus renders update the filter without timers or rescanning. Owned
+forwards survive a scope switch and become visible again with their project.
+Attribution follows PID ancestry to a live terminal, then the most specific pane
+or foreground cwd, excluding root/home and ambiguous equal matches. Unregistered unattributed
+listeners and listeners bound only to a specific non-loopback interface are omitted.
+Unregistered identities include PID and machine; registered identities use host/port.
+
+Forward is explicit, or started by clicking a remote web URL. The app host and
+SSH destination must be known private hosts (proteus, ganymede, io/io-wsl, titan);
+puck, unknown aliases/IPs and command
+transports are read only. This preserves the private-to-corp direction rule in
+hc-migration.md; it never gives a corporate app a private tunnel. Refresh never
+starts a forward. Each panel owns private SSH control sockets under `/tmp/vega-services-UID`,
+uses strict existing host-key trust and batch authentication, binds only local
+127.0.0.1, selects an ephemeral local port for unregistered listeners and retries bind collisions.
+Registered services use same-port binds; a conflict is an error rather than a random-port fallback. Nothing
+changes the remote listener’s loopback binding. Stop targets only its socket.
+Close marks the owner closed before serializing cleanup, covering an in-flight
+start too. The app’s close hook is best effort (250 ms); exec cleanup already
+launched continues, but forced termination/crash can leave a tunnel. The private
+owner tombstones are tiny and remain in /tmp to reject late starts. There are no
+hc terminal creations or global process-pattern kills. Hiding the side stack
+keeps the panel alive: use Stop, switch layout or quit to tear it down.
+
+Manual Refresh identifies HTTP and HTTPS with loopback HEAD requests (400 ms per
+attempt, at most eight listeners concurrently). TLS verification is skipped only
+for protocol identification; opening still uses the browser's normal validation.
+Unrecognized services retain `tcp://` addresses; a slow/nonresponsive web service
+may need another Refresh. There is no periodic health polling or redraw timer.
+Clicking a local web URL uses `cx.open_url`; a remote private web URL awaits its
+forward then opens the forwarded localhost URL, preserving scheme/path/query.
+Existing forwards are reused, repeated pending clicks ignored, and failures stay
+inline without opening the unreachable remote URL. Puck/unknown targets and
+non-HTTP addresses (including socket addresses supplied as rows) use
+`cx.write_to_clipboard` and a 1.8-second confirmation toast; clicks never forward
+these addresses. Explicit Forward/Stop remains available for private TCP services.
+Refresh failures show per machine; a vanished listener with an owned
+forward stays visible with Stop. Refresh also checks the owned SSH masters and
+drops dead forwards. Authentication and bind errors stay inline.
+
+Live trial after the UAC installs/applies the three units: on ganymede open the
+spellkave UAC space and run `just spire` (127.0.0.1:5187). In proteus’s vega
+window focus spellkave, choose Services, Refresh, then click the ganymede :5187 URL.
+The displayed ephemeral localhost URL reaches Spire without exposing its remote
+listener. Stop removes it; a second forward followed by layout teardown exercises
+cleanup. This sentinel only used fake tests, never started that live flow.
+
+Registered services use host/port identities, retaining titles and owned forwards
+across listener restarts. When ancestry/cwd attribution fails they appear under
+Registered services / Host registrations across project filters, explicitly host
+scoped rather than guessed into a project. A still-live registered process without
+a listener shows Stopped. Rows independently label running/forwarded/stopped,
+host, and remote port versus local forward; only owned forwards offer Stop.
+
+`vega service register --port 5320 --also-forward 8367 --title "Classic app"`
+adds a dependency bundle (repeatable extra ports). One Forward owns one SSH master
+with multiple loopback binds; one Stop closes all. The primary process controls
+registration lifetime, dependencies may start/restart independently. Registered
+services default to same local ports to preserve embedded URLs; the panel labels
+the bundle ports. Preflight checks every local bind and SSH catches bind races.
+No forwards start during registration or Refresh.

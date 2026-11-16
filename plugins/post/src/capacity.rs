@@ -51,7 +51,7 @@ async fn run(config: vega_herdr::otlp::Config) {
                 continue;
             }
         };
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         let mut points = Vec::new();
         let inbox_name = format!("{INBOX_STREAM_PREFIX}{host}");
         match stream_info(&js, &inbox_name).await {
@@ -224,6 +224,7 @@ mod tests {
             &[],
             &[],
             None,
+            &[],
         );
         let (_server, url) = start(dir.path(), &authz);
         crate::runtime().unwrap().block_on(async {

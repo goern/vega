@@ -57,11 +57,14 @@ mod reach;
 #[cfg(test)]
 mod registry_read_test;
 mod registry_ttl;
+mod resume;
 mod service;
 mod sidebar;
 mod supervise;
 mod terminals;
 mod theme;
+#[cfg(test)]
+mod tool_mail_test;
 mod uber;
 mod uber_ask;
 mod uber_brief;
@@ -165,7 +168,7 @@ enum Cmd {
     },
     /// Send a command to another machine's vegad and wait for its answer (JSON on stdin)
     #[command(
-        after_help = "Core NATS request/reply on vega.cmd.<to>.<kind>.<this host>; the target's vegad runs the\nhandler for <kind> with the JSON on stdin (max 4 KiB). Kinds served: open, orchestration (authenticated wait updates), notify (origin ask ack/resolve).\nErrors: no_responder (no vegad there), timeout, denied (kind or payload refused, or no broker\nright), broker_unreachable, handler_failed.\n\nExamples:\n  echo '{\"kind\":\"open\",\"choice\":\"vscode\",\"path\":\"/Users/me/src/x/README.md\"}' | vega post cmd open --to proteus",
+        after_help = "Core NATS request/reply on vega.cmd.<to>.<kind>.<this host>; the target's vegad runs the\nhandler for <kind> with the JSON on stdin (max 4 KiB). Kinds served: open, orchestration (authenticated wait updates), notify (origin ask ack/resolve), keychain (validated inbox-only status relay).\nErrors: no_responder (no vegad there), timeout, denied (kind or payload refused, or no broker\nright), broker_unreachable, handler_failed.\n\nExamples:\n  echo '{\"kind\":\"open\",\"choice\":\"vscode\",\"path\":\"/Users/me/src/x/README.md\"}' | vega post cmd open --to proteus",
         name = "cmd"
     )]
     Command {
@@ -175,7 +178,7 @@ enum Cmd {
         #[arg(long)]
         to: String,
         /// How long to wait for the answer: 10s, 1m
-        #[arg(long, default_value = "15s")]
+        #[arg(long, default_value = "60s")]
         timeout: String,
     },
     /// Ask several agents one question; their answers come back as one pointer
@@ -239,7 +242,7 @@ enum Cmd {
     },
     /// List the notifications vega showed the human (all hosts), newest first
     #[command(
-        after_help = "vegad keeps each toast it shows (drafts it held or could not restore) as a note: this host's store\n($XDG_STATE_HOME/vega/notes, 7 days, at most 200; open asks exempt), published to the registry as <host>.note.<id>.\nEach UAC pane shows its project's unread count as \u{1f514}<n> (notes without a project, such as quarantine and\ndrafts, on the vega UAC); `vega board` lists them (N) and marks them read. A note with a cause (bd-sync:<DB>)\nresolves by itself when the cause clears (the project syncs again): read everywhere, still listed.\nread / clear move this host's watermarks per source host; without --upto, to the newest note.\nOpen asks stay visible after clear; use vega notify resolve.\n\nExamples:\n  vega post notes\n  vega post notes read\n  vega post notes clear --upto proteus=1791000000000\n  vega post notes --json --all"
+        after_help = "vegad keeps each toast it shows (drafts it held or could not restore) as a note: this host's store\n($XDG_STATE_HOME/vega/notes, 7 days, at most 200; open asks exempt), published to the registry as <host>.note.<id>.\nEach UAC pane shows its project's unread count as \u{1f514}<n> (notes without a project, such as quarantine and\ndrafts, on the vega UAC); `vega post notes` lists them and `notes read` marks them read. A note with a cause (bd-sync:<DB>)\nresolves by itself when the cause clears (the project syncs again): read everywhere, still listed.\nread / clear move this host's watermarks per source host; without --upto, to the newest note.\nOpen asks stay visible after clear; use vega notify resolve.\n\nExamples:\n  vega post notes\n  vega post notes read\n  vega post notes clear --upto proteus=1791000000000\n  vega post notes --json --all"
     )]
     Notes {
         /// read: mark read (the badge clears); clear: also hide from the list
@@ -248,7 +251,7 @@ enum Cmd {
         /// With read or clear: only up to this note per host, <host>=<id>; repeat
         #[arg(long, value_name = "HOST=ID", requires = "action")]
         upto: Vec<String>,
-        /// One JSON object per line (for the board)
+        /// One JSON object per line (for UI consumers)
         #[arg(long, conflicts_with = "action")]
         json: bool,
         /// Also list cleared notes
@@ -315,6 +318,9 @@ enum Cmd {
         /// The host that puts the lanista catalog (the builder, e.g. ganymede); every host reads it
         #[arg(long)]
         lanista_writer: Option<String>,
+        /// Retired hosts: retain admin/viewer reads without a host user or grants; repeat
+        #[arg(long)]
+        retired_host: Vec<String>,
     },
     /// Create the archive streams for hosts (needs the admin key)
     #[command(
@@ -335,7 +341,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum RelayAction {
-    /// Start vegad detached unless a relay runs (idempotent; the app mod, herdr hook and board call it)
+    /// Start vegad detached unless a relay runs (idempotent; the app mod, herdr hook call it)
     #[command(
         after_help = "vegad runs in its own session, outlives herdr and logs to ~/.local/state/vega/post-relay-<host>.log.\nEnv: this shell's without pane variables and agent shims, plus ~/.local/state/vega/vegad.env (`relay install`).\nA host with a launchd/systemd unit from before (not migrated): the unit is kickstarted instead.\n\nExamples:\n  vega post relay start"
     )]
@@ -351,7 +357,7 @@ enum RelayAction {
     Uninstall,
     /// Show whether vegad runs: pid, version, binary current or stale, delivery mode, last log lines
     Status {
-        /// One JSON object (the board reads it)
+        /// One JSON object (UI consumers read it)
         #[arg(long)]
         json: bool,
     },
@@ -491,6 +497,7 @@ fn main() -> ExitCode {
             quarantine,
             registry_read,
             lanista_writer,
+            retired_host,
         }) => auth_config(
             &entries,
             file.as_deref(),
@@ -502,6 +509,7 @@ fn main() -> ExitCode {
             &quarantine,
             &registry_read,
             lanista_writer.as_deref(),
+            &retired_host,
         ),
         Some(Cmd::Provision {
             hosts,
@@ -534,7 +542,7 @@ const ACK_WAIT: Duration = Duration::from_secs(30);
 /// the status bar can show a background shell first.
 const SILENT_AFTER: Duration = Duration::from_secs(3);
 /// `send` keeps trying to reach the broker this long, e.g. across a restart.
-const SEND_WAIT: Duration = Duration::from_secs(10);
+const SEND_WAIT: Duration = vega_registry::BROKER_WAIT;
 
 /// Header names. `Nats-Msg-Id` makes a retried publish idempotent.
 mod h {
@@ -648,7 +656,7 @@ fn home() -> Result<(), Failure> {
     println!("me: {} ({}, {})", me.pane, me.agent, cell(&me.cwd));
     let unread = runtime()?.block_on(async {
         let client = connect("home", None).await?;
-        let stream = inbox_stream(&jetstream::new(client), &host).await?;
+        let stream = inbox_stream(&vega_registry::broker_context(client), &host).await?;
         unread(&stream, &host, &me.pane).await
     })?;
     println!("unread: {unread}");
@@ -870,8 +878,8 @@ async fn connect_as(
             Seed::Host => inbox_prefix(&host()),
             Seed::Admin => ADMIN_INBOX.to_string(),
         })
-        .connection_timeout(Duration::from_secs(2))
-        .request_timeout(Some(Duration::from_secs(3)))
+        .connection_timeout(vega_registry::BROKER_WAIT)
+        .request_timeout(Some(vega_registry::BROKER_WAIT))
         // A broker host that vanishes sends no FIN: vegad's pings notice it
         // within ~30 s instead of the default ~3 min (vega-lhc.205).
         .ping_interval(if role == "relay" {
@@ -920,20 +928,23 @@ async fn connect_as(
                 }
             }
         });
-    opts.connect(&url).await.map_err(|e| {
-        if e.to_string().contains("authorization violation") {
-            return Failure::new(
-                "auth_failed",
-                format!("{url} rejected this machine's key"),
-                "run `vega post keygen` and add its host=U... line to the server's auth config (`vega post auth-config`)",
-            );
-        }
-        Failure::new(
-            "broker_unreachable",
-            format!("cannot connect to {url}: {e}"),
-            unreachable_hint(broker_configured()),
-        )
+    outage::bounded("connect", async {
+        opts.connect(&url).await.map_err(|e| {
+            if e.to_string().contains("authorization violation") {
+                return Failure::new(
+                    "auth_failed",
+                    format!("{url} rejected this machine's key"),
+                    "run `vega post keygen` and add its host=U... line to the server's auth config (`vega post auth-config`)",
+                );
+            }
+            Failure::new(
+                "broker_unreachable",
+                format!("cannot connect to {url}: {e}"),
+                unreachable_hint(broker_configured()),
+            )
+        })
     })
+    .await
 }
 
 /// The hint of `broker_unreachable`, distinguishing missing configuration.
@@ -1026,7 +1037,7 @@ fn provision(hosts: &[String], ttl: bool, archive: bool) -> Result<(), Failure> 
             println!("help: remove --create archive from auth-config and reload the broker");
             return Ok(());
         }
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         if hosts.iter().any(|h| h == "history") {
             history::provision(&js).await?;
             println!("history: VEGA_HISTORY ready; remove --create history and reload the broker");
@@ -1115,8 +1126,10 @@ fn auth_config(
     quarantine: &[String],
     registry_read: &[String],
     lanista_writer: Option<&str>,
+    retired_host: &[String],
 ) -> Result<(), Failure> {
     let entries = auth::read_entries(entries, file)?;
+    auth::validate_retired_hosts(&entries, retired_host)?;
     if let Some(h) = quarantine.iter().find(|h| !inbox_only.contains(h)) {
         return Err(Failure::new(
             "usage",
@@ -1134,6 +1147,17 @@ fn auth_config(
             format!("--cmd-grant for {h}: only inbox-only hosts take grants"),
             "other hosts may already send commands as themselves",
         ));
+    }
+    for (_, subject) in &grants {
+        if let Some((to, "keychain" | "lanista", _)) = cmd::parse_subject(subject) {
+            if inbox_only.iter().any(|h| h == to) || !entries.iter().any(|e| e.host == to) {
+                return Err(Failure::new(
+                    "usage",
+                    "relay command recipient must be a configured private host",
+                    "grant host=vega.cmd.<private-host>.<keychain|lanista>.<host>",
+                ));
+            }
+        }
     }
     let reads = registry_read
         .iter()
@@ -1191,11 +1215,12 @@ fn auth_config(
             ));
         }
     }
-    if entries.len() > auth::MAX_HOSTS_100GB {
+    let stream_hosts = entries.len() + retired_host.len();
+    if stream_hosts > auth::MAX_HOSTS_100GB {
         eprintln!(
             "warning: {} hosts reserve {} GiB; 100 GiB with history reserves room for at most {} hosts (plus other streams)",
-            entries.len(),
-            entries.len() as i64 * ARCHIVE_MAX_BYTES / (1 << 30),
+            stream_hosts,
+            stream_hosts as i64 * ARCHIVE_MAX_BYTES / (1 << 30),
             auth::MAX_HOSTS_100GB
         );
     }
@@ -1221,6 +1246,7 @@ fn auth_config(
             quarantine,
             &reads,
             lanista_writer,
+            retired_host,
         )
     );
     Ok(())
@@ -1422,14 +1448,14 @@ async fn resolve_target(
                     Failure::new(
                         "registry_unavailable",
                         format!("cannot resolve --uber: registry: {e}"),
-                        "without the registry there is no Uber-UAC; use the bead and the board",
+                        "without the registry there is no Uber-UAC; use the bead and the inbox",
                     )
                 })?;
             let c = view.live_uber().ok_or_else(|| {
                 Failure::new(
                     "uber_absent",
                     "no live Uber-UAC claim; nothing was sent",
-                    "the Slayer's session runs `vega uber claim`; until then use the bead and the board",
+                    "the Slayer's session runs `vega uber claim`; until then use the bead and the inbox",
                 )
             })?;
             return Ok((
@@ -1550,7 +1576,7 @@ fn send(
             .map(|p| collapse_home(&p.display().to_string()))
             .unwrap_or_default()
     };
-    // Outside any pane (the vega board's popup): the user, without a return
+    // Outside any pane (a user shell): the user, without a return
     // path; the message carries no sender pane, so nobody can reply by mail.
     // A tool (`--from-tool`) likewise has no pane, so it may mail its own.
     let me = match from_tool {
@@ -1614,12 +1640,10 @@ fn send(
     let subject = inbox_subject(&to_host, target, &my_host);
     let headers = send_headers(&me, &thread, hop, now, done, kind);
     let ack = rt.block_on(async {
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         // No stream lookup: the target host's stream captures the subject. If
         // that host never ran `relay` or `inbox`, nothing does.
-        history::mail(&js, subject.clone(), headers, text.to_string())
-            .await
-            .map_err(broker_err)?
+        history::mail_retry(&js, subject.clone(), headers, text.to_string())
             .await
             .map_err(|e| {
                 if e.kind() == jetstream::context::PublishErrorKind::StreamNotFound {
@@ -1705,7 +1729,7 @@ fn send_quarantine(
         let req = async_nats::Request::new()
             .headers(headers)
             .payload(text.to_string().into())
-            .timeout(Some(Duration::from_secs(10)));
+            .timeout(Some(vega_registry::BROKER_WAIT));
         let answer = client.send_request(subject.clone(), req).await.map_err(|e| {
             use async_nats::client::RequestErrorKind as K;
             match e.kind() {
@@ -1737,6 +1761,26 @@ fn send_quarantine(
     println!("quarantined: {what} for {target} on {to_host}");
     println!("help: this host is inbox-only by design: the {what} reached the human on {to_host} as a notice, not the agent; expect no answer by mail");
     Ok(())
+}
+
+/// Validate before either storing peer mail or publishing an acknowledgement.
+async fn respond_quarantined(
+    client: &async_nats::Client,
+    req: async_nats::Message,
+    host: String,
+    js: &jetstream::Context,
+) {
+    let Some(reply) = req.reply.clone() else {
+        return;
+    };
+    if !quarantine::parse_subject(&req.subject)
+        .is_some_and(|(to, _, from)| to == host && cmd::valid_reply(from, &reply))
+    {
+        log("quarantine: refused reply outside sender inbox");
+        return;
+    }
+    let answer = receive_quarantined(req, host, js).await;
+    let _ = tokio::time::timeout(outage::CALL, client.publish(reply, answer.into())).await;
 }
 
 /// Granted requests use the existing durable inbox archive. The receiver's
@@ -1772,7 +1816,7 @@ async fn receive_quarantined(
     }
 }
 
-/// vegad's side of a quarantined reply: a note for the human (toast, board,
+/// vegad's side of a quarantined reply: a note for the human (toast, inbox,
 /// `vega post notes`), nothing typed into any pane. Returns the answer.
 fn store_quarantined(req: &async_nats::Message, my_host: &str) -> Vec<u8> {
     if let Some(no) = quarantine::refuse(&req.subject, my_host, &req.payload) {
@@ -2108,20 +2152,23 @@ fn recorded_parent(pane: &str) -> Option<vega_herdr::state::Parent> {
 
 /// `send` outlives a short broker restart: retry the connect for SEND_WAIT.
 async fn connect_patiently() -> Result<async_nats::Client, Failure> {
-    let deadline = Instant::now() + SEND_WAIT;
-    loop {
-        match connect("send", None).await {
-            Ok(c) => return Ok(c),
-            Err(f)
-                if f.code == "broker_unreachable"
-                    && broker_configured()
-                    && Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    outage::within(SEND_WAIT, "connect", async {
+        let deadline = Instant::now() + SEND_WAIT;
+        loop {
+            match connect("send", None).await {
+                Ok(c) => return Ok(c),
+                Err(f)
+                    if f.code == "broker_unreachable"
+                        && broker_configured()
+                        && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(f) => return Err(f),
             }
-            Err(f) => return Err(f),
         }
-    }
+    })
+    .await
 }
 
 // Mail needs caller metadata, but no TUI workspace or target operation.
@@ -2155,7 +2202,7 @@ fn inbox(keep: bool, max: usize) -> Result<(), Failure> {
     let parent = own_parent();
     runtime()?.block_on(async {
         let client = connect("inbox", None).await?;
-        let js = jetstream::new(client.clone());
+        let js = vega_registry::broker_context(client.clone());
         let stream = inbox_stream(&js, &host).await?;
         let consumer = stream
             .get_or_create_consumer(
@@ -2167,14 +2214,13 @@ fn inbox(keep: bool, max: usize) -> Result<(), Failure> {
         let mut batch = consumer
             .fetch()
             .max_messages(max)
-            .expires(Duration::from_millis(500))
             .messages()
             .await
             .map_err(broker_err)?;
 
         let mut shown = Vec::new();
         let children = st::children();
-        while let Some(m) = batch.next().await {
+        while let Some(m) = outage::bounded("inbox read", async { Ok(batch.next().await) }).await? {
             let m = m.map_err(broker_err)?;
             let info = m.info().map_err(broker_err)?;
             shown.push((info.stream_sequence, info.delivered, info.pending));
@@ -2222,7 +2268,7 @@ fn inbox_show(id: u64) -> Result<(), Failure> {
     let parent = own_parent();
     runtime()?.block_on(async {
         let client = connect("inbox", None).await?;
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         let stream = inbox_stream(&js, &host).await?;
         let consumer = stream
             .create_consumer(pull::OrderedConfig {
@@ -2237,7 +2283,7 @@ fn inbox_show(id: u64) -> Result<(), Failure> {
             .await
             .map_err(broker_err)?;
         let mut msgs = consumer.messages().await.map_err(broker_err)?;
-        let first = match tokio::time::timeout(Duration::from_millis(500), msgs.next()).await {
+        let first = match tokio::time::timeout(vega_registry::BROKER_WAIT, msgs.next()).await {
             Ok(Some(m)) => Some(m.map_err(broker_err)?),
             _ => None,
         };
@@ -2327,7 +2373,7 @@ fn print_msg(
     } else if from_pane == "?" && hv(h::FROM_AGENT).starts_with("tool vega-") {
         println!("reply: none (sent by a vega tool, not an agent)");
     } else if from_pane == "?" && hv(h::THREAD) != "?" {
-        println!("reply: none (sent from outside a pane, e.g. the vega board)");
+        println!("reply: none (sent from outside a pane)");
     } else if from_pane == "?" || hv(h::THREAD) == "?" {
         println!("reply: none (no return path; not sent by `vega post send`)");
     } else {
@@ -2551,6 +2597,8 @@ impl Jobs {
             catalog::spawn();
             // PagerDuty: one configured host, independent of the mail relay.
             pagerduty::spawn();
+            // Lost agents after a boot (resume.rs): once per boot.
+            resume::spawn();
             match service::state_dir() {
                 Ok(dir) => upstream::spawn(utx, dir),
                 Err(f) => log(&format!("upgrade check: off ({})", f.message)),
@@ -2715,17 +2763,11 @@ impl Jobs {
 }
 
 /// A theme event: logged, or the Claude panes to switch when idle.
-fn theme_event(e: theme::Event, live_theme: &mut theme::Live, next: &mut Instant) {
+fn theme_event(e: theme::Event, next: &mut Instant) {
     match e {
         theme::Event::Log(l) => log(&l),
         theme::Event::Live(m) => {
-            let panes = theme::claude_panes(&local_agents());
-            log(&format!(
-                "theme: {} claude pane(s) get /config theme={} now",
-                panes.len(),
-                m.as_str()
-            ));
-            live_theme.start(m, panes.into_keys());
+            log(&format!("theme: durable live request for {}", m.as_str()));
             *next = Instant::now();
         }
     }
@@ -2890,16 +2932,14 @@ async fn local(
     let mut hygiene = hygiene::Pass::new(service::state_dir().ok().as_deref());
     let mut meta_next: Option<Instant> = None;
     let mut park_failing: HashSet<String> = HashSet::new();
-    let mut live_theme = theme::Live::default();
     let mut live_theme_next = Instant::now();
     let mut probe_at = Instant::now() + jobs.backoff.next();
     let mut probe: Option<tokio::task::JoinHandle<bool>> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         let started = Instant::now();
-        if !live_theme.pending.is_empty() && Instant::now() >= live_theme_next {
-            live_theme_next = Instant::now() + LIVE_THEME_EVERY;
-            type_theme(&mut live_theme, &drafts);
+        if Instant::now() >= live_theme_next {
+            live_theme_next = Instant::now() + type_theme(&drafts);
         }
         let changed = notes_store.as_ref().and_then(|s| s.changed());
         if changed != notes_at {
@@ -2975,7 +3015,7 @@ async fn local(
                     mail.push((upstream::AGENT.to_string(), pane, text));
                 }
             },
-            Some(e) = jobs.theme.recv() => theme_event(e, &mut live_theme, &mut live_theme_next),
+            Some(e) = jobs.theme.recv() => theme_event(e, &mut live_theme_next),
             // Started by an earlier broker loop: their mail is typed here.
             Some(e) = jobs.ci.recv() => match e {
                 ci::Event::Log(l) => log(&l),
@@ -3062,7 +3102,7 @@ async fn serve(
     let host = host.to_string();
     let filter = format!("vega.inbox.{host}.>");
     {
-        let js = jetstream::new(client.clone());
+        let js = vega_registry::broker_context(client.clone());
         // A broker that drops during setup is an outage, not a crash.
         let setup = async {
             let stream = inbox_stream(&js, &host).await?;
@@ -3131,7 +3171,6 @@ async fn serve(
         // UAC.
         jobs.start_broker_jobs();
         let theme_remote = jobs.theme_remote.clone();
-        let mut live_theme = theme::Live::default();
         let mut live_theme_next = Instant::now();
         let Carry {
             mut d,
@@ -3147,6 +3186,7 @@ async fn serve(
         // The registry (vegad M4): this host's state into NATS KV every
         // REGISTRY_EVERY, and the other hosts' view back for supervision.
         let mut registry = Registry::default();
+        let mut status_publisher = keychain::Publisher::default();
         let mut meta_next: Option<Instant> = None;
         // Parks whose bead bd could not show (logged once each).
         let mut park_failing: HashSet<String> = HashSet::new();
@@ -3217,6 +3257,10 @@ async fn serve(
             if jobs.take_waiting_changed() {
                 registry.soon();
             }
+            if !once && up && st::is_inbox_only(&host) {
+                let run = status_publisher.run(&client, &host);
+                let _ = while_up(&client, REGISTRY_CALL, run).await;
+            }
             if !once && up && registry.due() {
                 let t = Instant::now();
                 if st::is_inbox_only(&host) {
@@ -3235,13 +3279,12 @@ async fn serve(
                 }
                 slow("registry", t);
             }
-            if !live_theme.pending.is_empty() && Instant::now() >= live_theme_next {
-                live_theme_next = Instant::now() + LIVE_THEME_EVERY;
+            if Instant::now() >= live_theme_next {
                 let t = Instant::now();
-                type_theme(&mut live_theme, &drafts);
+                live_theme_next = Instant::now() + type_theme(&drafts);
                 slow("live theme", t);
             }
-            // A new note or a read one (the board) redraws the badge now.
+            // A new note or a read one (the inbox) redraws the badge now.
             let changed = notes_store.as_ref().and_then(|s| s.changed());
             if changed != notes_at {
                 notes_at = changed;
@@ -3262,10 +3305,10 @@ async fn serve(
                     &mut decisions,
                     &mut hygiene,
                 );
-                // Published with the CI mail on the next tick.
+                // Routed with the CI mail (locally on inbox-only hosts).
                 ci_unsent.extend(due);
                 slow("metadata", t);
-                if up {
+                if up && !st::is_inbox_only(&host) {
                     // Open Uber asks: withdraw on bead close, resend on a new epoch.
                     let t = Instant::now();
                     let run = uber_ask::round(&js, &host, registry.view.as_ref());
@@ -3279,6 +3322,12 @@ async fn serve(
                     ));
                 }
                 meta_next = Some(Instant::now() + pace::of(REGISTRY_EVERY));
+            }
+            // Inbox-only hosts cannot publish to their own inboxes. Retry
+            // local tool mail every pass, independently of broker availability
+            // and CI_RETRY, so a freed pane or cleared draft can receive it.
+            if st::is_inbox_only(&host) {
+                ci_unsent = deliver_local(ci_unsent, &d, &mut drafts);
             }
             for line in sup.hook_disagreements(vega_herdr::notes::now_ms()) {
                 log(&line);
@@ -3351,14 +3400,16 @@ async fn serve(
                 }
                 // No status from the backend for STALE (vega-lhc.257): only into an
                 // input box read as empty; no box or any text keeps it pending.
-                if d.unknown_long(&pane)
-                    && !d.is_urgent(&pane)
-                    && !matches!(
+                // Typing into an unknown terminal needs that empty box.
+                let mut unknown_ok = false;
+                if d.unknown_long(&pane) && !d.is_urgent(&pane) {
+                    if !matches!(
                         screen(&pane).as_deref().map(delivery::draft),
                         Some(Draft::None)
-                    )
-                {
-                    continue;
+                    ) {
+                        continue;
+                    }
+                    unknown_ok = true;
                 }
                 if drafts.holds(&pane) {
                     continue; // stays pending
@@ -3371,7 +3422,7 @@ async fn serve(
                     Some((s, _)) => wake_line(s, count),
                     None => pointer(count),
                 };
-                let typed = match notify_queued(&pane, &line, d.may_queue(&pane)) {
+                let typed = match notify_with(&pane, &line, d.may_queue(&pane), unknown_ok) {
                     Ok(()) => {
                         log(&format!(
                             "pointer: {pane} ({count} pending{}{}, agent {}), {} {} ms",
@@ -3467,13 +3518,12 @@ async fn serve(
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(reply) = req.reply.clone() {
+                    if req.reply.is_some() {
                         let c = client.clone();
                         let host = host.clone();
                         let js = js.clone();
                         tokio::spawn(async move {
-                            let answer = receive_quarantined(req, host, &js).await;
-                            let _ = tokio::time::timeout(outage::CALL, c.publish(reply, answer.into())).await;
+                            respond_quarantined(&c, req, host, &js).await;
                         });
                     }
                 }
@@ -3484,19 +3534,15 @@ async fn serve(
                     }
                 } => {
                     let parsed = cmd::parse_subject(&req.subject).map(|(_, k, f)| (k.to_string(), f.to_string()));
-                    if let (Some(reply), Some((kind, from))) = (req.reply.clone(), parsed) {
-                        let payload = req.payload.to_vec();
+                    if let (Some(_), Some((kind, from))) = (req.reply.clone(), parsed) {
                         let c = client.clone();
+                        let receiver = host.clone();
                         let busy = in_flight.clone();
                         busy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         tokio::spawn(async move {
-                            let (k, f) = (kind.clone(), from.clone());
-                            let answer = tokio::task::spawn_blocking(move || cmd::serve(&k, &f, &payload))
-                                .await
-                                .unwrap_or_default();
+                            let answer = cmd::respond(&c, &receiver, &req).await;
                             let v: serde_json::Value = serde_json::from_slice(&answer).unwrap_or_default();
                             log(&format!("cmd: {kind} from {from}: {} {}", v["code"].as_str().unwrap_or("?"), v["message"].as_str().unwrap_or("")));
-                            let _ = tokio::time::timeout(outage::CALL, c.publish(reply, answer.into())).await;
                             busy.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         });
                     }
@@ -3516,18 +3562,18 @@ async fn serve(
                     ci::Event::Mail(pane, text) => {
                         ci_unsent.push((ci::AGENT.to_string(), pane, text));
                         if up && Instant::now() >= ci_retry_at {
-                            ci_unsent = publish_tool_mail(&js, &host, ci_unsent).await;
+                            ci_unsent = deliver_tool_mail(&js, &host, ci_unsent, &d, &mut drafts).await;
                             ci_retry_at = Instant::now() + CI_RETRY;
                         }
                     }
                 },
-                Some(e) = jobs.theme.recv() => theme_event(e, &mut live_theme, &mut live_theme_next),
+                Some(e) = jobs.theme.recv() => theme_event(e, &mut live_theme_next),
                 Some(e) = jobs.bd.recv() => match e {
                     bdsync::Event::Log(l) => log(&l),
                     bdsync::Event::Mail(pane, text) => {
                         ci_unsent.push((bdsync::AGENT.to_string(), pane, text));
                         if up && Instant::now() >= ci_retry_at {
-                            ci_unsent = publish_tool_mail(&js, &host, ci_unsent).await;
+                            ci_unsent = deliver_tool_mail(&js, &host, ci_unsent, &d, &mut drafts).await;
                             ci_retry_at = Instant::now() + CI_RETRY;
                         }
                     }
@@ -3537,7 +3583,7 @@ async fn serve(
                     upstream::Event::Mail(pane, text) => {
                         ci_unsent.push((upstream::AGENT.to_string(), pane, text));
                         if up && Instant::now() >= ci_retry_at {
-                            ci_unsent = publish_tool_mail(&js, &host, ci_unsent).await;
+                            ci_unsent = deliver_tool_mail(&js, &host, ci_unsent, &d, &mut drafts).await;
                             ci_retry_at = Instant::now() + CI_RETRY;
                         }
                     }
@@ -3552,7 +3598,7 @@ async fn serve(
                 }
                 _ = tick.tick() => {
                     if up && !ci_unsent.is_empty() && Instant::now() >= ci_retry_at {
-                        ci_unsent = publish_tool_mail(&js, &host, ci_unsent).await;
+                        ci_unsent = deliver_tool_mail(&js, &host, ci_unsent, &d, &mut drafts).await;
                         ci_retry_at = Instant::now() + CI_RETRY;
                     }
                 }
@@ -3563,43 +3609,88 @@ async fn serve(
 }
 
 /// How often vegad looks at the Claude panes still waiting for a theme
-/// switch (a fresh inventory of both terminal backends, only while some wait).
+/// switch and refreshes persisted pane status from both terminal backends.
 const LIVE_THEME_EVERY: Duration = Duration::from_secs(2);
-
-/// This host's agents from both terminal backends; unavailable sources are omitted.
-fn local_agents() -> Vec<serde_json::Value> {
-    terminals::Inventory::read().agents()
-}
 
 /// Types `/config theme=<mode>` into each waiting Claude pane that is idle,
 /// done or working with an empty input and no dialog (theme::decide); a
-/// working pane gets it queued, a closed one is dropped. Once per pane.
-fn type_theme(live: &mut theme::Live, drafts: &Drafts) {
-    let Some(line) = live.line() else { return };
-    let now = theme::claude_panes(&local_agents());
-    for pane in live.pending.clone() {
-        let status = now.get(&pane).map(String::as_str);
-        let working = status == Some("working");
-        let held = drafts.stashed.contains_key(&pane);
-        match theme::decide(status, held, || screen(&pane)) {
-            theme::Action::Wait => {}
-            theme::Action::Drop => {
-                live.pending.remove(&pane);
-            }
-            theme::Action::Send => {
-                live.pending.remove(&pane);
-                match notify_queued(&pane, &line, working) {
-                    Ok(()) => {
-                        log(&format!("theme: typed {line} into {pane}"));
-                        if working {
-                            submit_slash_menu(&pane, &line);
-                        }
-                    }
-                    Err(f) => log(&format!("theme: {pane}: {} {}", f.code, f.message)),
-                }
-            }
+/// working pane gets it queued. Failed sends remain pending with backoff;
+/// successful inventory snapshots remove closed panes.
+fn type_theme(drafts: &Drafts) -> Duration {
+    let Some(env) = vega_theme_sync::Env::from_env() else {
+        return REGISTRY_EVERY;
+    };
+    match type_theme_in(&env, drafts) {
+        Ok(true) => LIVE_THEME_EVERY,
+        Ok(false) => REGISTRY_EVERY,
+        Err(e) => {
+            log(&format!("theme: live journal: {e}"));
+            REGISTRY_EVERY
         }
     }
+}
+
+fn type_theme_in(env: &vega_theme_sync::Env, drafts: &Drafts) -> Result<bool, String> {
+    use vega_theme_sync::{live, prefs, state};
+    if !prefs::load(env)?.live_claude {
+        return Ok(false);
+    }
+    let mut journal = live::Journal::load(env)?;
+    if let Some(request) = live::read_request(env)? {
+        journal.accept(request);
+    }
+    let inventory = terminals::Inventory::read();
+    for (backend, source) in [("hc", &inventory.hc), ("herdr", &inventory.herdr)] {
+        if let Ok(agents) = source {
+            journal.inventory(backend, theme::claude_panes(agents).into_keys());
+        }
+    }
+    // Do not type until the recipients and intent are durable.
+    journal.save(env)?;
+    let statuses = theme::claude_panes(&inventory.agents());
+    let Some(mode) = journal.request.as_ref().map(|r| r.mode) else {
+        return Ok(false);
+    };
+    // A request is written before tool application; do not deliver it until
+    // that apply succeeded, or replay obsolete work after a disabled period.
+    if state::read(env).is_none_or(|applied| applied.mode != mode) {
+        return Ok(false);
+    }
+    let line = format!("/config theme={}", mode.as_str());
+    for pane in journal.due(state::unix_now()) {
+        // Missing from an unavailable backend is unknown, not gone.
+        let Some(status) = statuses.get(&pane).map(String::as_str) else {
+            continue;
+        };
+        let working = status == "working";
+        let held = drafts.stashed.contains_key(&pane);
+        if theme::decide(Some(status), held, || screen(&pane)) != theme::Action::Send {
+            continue;
+        }
+        journal.send(env, &pane, state::unix_now(), || {
+            let result = theme::send_checked(
+                &line,
+                || {
+                    notify_queued(&pane, &line, working)
+                        .map_err(|f| format!("{} {}", f.code, f.message))
+                },
+                || screen(&pane),
+            );
+            match &result {
+                Ok(()) => {
+                    log(&format!("theme: typed {line} into {pane}"));
+                    if working {
+                        submit_slash_menu(&pane, &line);
+                    }
+                }
+                Err(e) => log(&format!(
+                    "theme: {pane}: {e}; bounded delivery policy applies"
+                )),
+            }
+            result
+        })?;
+    }
+    Ok(journal.panes.values().any(|p| p.pending))
 }
 
 /// In a working Claude pane the Enter after a typed slash command only picks
@@ -3622,6 +3713,23 @@ fn submit_slash_menu(pane: &str, line: &str) {
 /// A broker that refused CI mail is retried this often, so a broker outage
 /// does not stall the relay loop on every tick.
 const CI_RETRY: Duration = Duration::from_secs(30);
+
+/// Broker mode's tool mail uses local delivery on inbox-only hosts, which
+/// have no right to publish to their own inbox subjects. All producers share
+/// this route, including mail carried from local mode or an earlier binary.
+async fn deliver_tool_mail(
+    js: &jetstream::Context,
+    host: &str,
+    mails: Vec<ToolMail>,
+    d: &Delivery,
+    drafts: &mut Drafts,
+) -> Vec<ToolMail> {
+    if st::is_inbox_only(host) {
+        deliver_local(mails, d, drafts)
+    } else {
+        publish_tool_mail(js, host, mails).await
+    }
+}
 
 /// Publishes tool mails (CI watch, ci.rs; beads sync, bdsync.rs) into this
 /// host's inboxes, without a sender pane: nobody to reply to. The relay's own
@@ -3758,7 +3866,7 @@ async fn bounce(
     let mut ok = true;
     for o in senders {
         if o.pane.is_empty() {
-            // The user from the board on this host: a note; tools get none.
+            // The user from the inbox on this host: a note; tools get none.
             if o.agent == "the user" && o.host == host {
                 vega_herdr::notes::notify(
                     "bounce",
@@ -3804,9 +3912,9 @@ async fn bounce(
 }
 
 /// Wait for the first archive message (cold wildcard scans are slow).
-const LOG_FIRST_WAIT: Duration = Duration::from_secs(10);
+const LOG_FIRST_WAIT: Duration = vega_registry::BROKER_WAIT;
 /// Gap allowed between archive messages once they flow.
-const LOG_IDLE_WAIT: Duration = Duration::from_secs(5);
+const LOG_IDLE_WAIT: Duration = vega_registry::BROKER_WAIT;
 
 // A timeout is not evidence of an empty archive. Only consumer metadata can
 // establish that; once a read is expected, any premature end is a broker error.
@@ -3844,7 +3952,7 @@ fn log_view(
     );
     runtime()?.block_on(async {
         let client = connect("log", None).await?;
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         let stream = inbox_stream(&js, &host).await?;
         let deliver_policy = match since {
             Some(d) => jetstream::consumer::DeliverPolicy::ByStartTime {
@@ -4353,7 +4461,7 @@ fn settles(pane: &str, want: impl Fn(Draft) -> bool) -> bool {
 }
 
 /// A draft vegad could not put back: a herdr notification carries it, and
-/// the board's notification list keeps it.
+/// the inbox notification list keeps it.
 fn lost_draft(pane: &str, text: &str) {
     log(&format!(
         "draft restore failed: {pane}; sent as a notification"
@@ -4387,6 +4495,11 @@ fn notify(pane: &str, line: &str) -> Result<(), Failure> {
 }
 
 fn notify_queued(pane: &str, line: &str, queued: bool) -> Result<(), Failure> {
+    notify_with(pane, line, queued, false)
+}
+
+/// `unknown_ok`: see `terminals::send_hc_with` (hc only; herdr has its own status).
+fn notify_with(pane: &str, line: &str, queued: bool, unknown_ok: bool) -> Result<(), Failure> {
     // The pane token comes from the sender's subject: never let it reach
     // herdr as anything but a pane id (e.g. `--flag` or an agent name).
     if !valid_pane_id(pane) {
@@ -4397,7 +4510,7 @@ fn notify_queued(pane: &str, line: &str, queued: bool) -> Result<(), Failure> {
         ));
     }
     if terminals::is_hc(pane) {
-        return terminals::send_hc(pane, line, queued);
+        return terminals::send_hc_with(pane, line, queued, unknown_ok);
     }
     herdr(&["agent", "prompt", terminals::bare(pane), line])?;
     Ok(())
@@ -4628,7 +4741,7 @@ fn ask(
     };
     let sent = runtime()?.block_on(async {
         let client = connect_patiently().await?;
-        let js = jetstream::new(client);
+        let js = vega_registry::broker_context(client);
         let mut sent = Vec::new();
         for (to_host, pane) in &targets {
             let mut headers = HeaderMap::new();
@@ -5121,7 +5234,12 @@ impl Layout {
                 .find(|w| w["workspace_id"] == p["workspace_id"]);
             let cwd = p["cwd"].as_str().unwrap_or_default();
             let mut id = resolve(ws, cwd);
-            if id.is_none() && terminals::is_hc(p["pane_id"].as_str().unwrap_or_default()) {
+            // A bare launch shell names no project of its own: after hc keep's
+            // recovery the space folder is not evidence (vega-0h4c.73).
+            if id.is_none()
+                && p["launch_shell"] != true
+                && terminals::is_hc(p["pane_id"].as_str().unwrap_or_default())
+            {
                 if let Some(folder) = p["space_folder"].as_str().filter(|s| !s.is_empty()) {
                     id = resolve(None, folder);
                     if id.is_some() {
@@ -5139,6 +5257,23 @@ impl Layout {
             let id = resolve(Some(w), "");
             w["schema"] = 2.into();
             w["project"] = id.into();
+        }
+        self
+    }
+
+    /// A UAC claim names its pane's project, whatever the pane's cwd or
+    /// space folder resolves to (vega-0h4c.73).
+    fn apply_claims(mut self, uacs: &[(String, String, i64)]) -> Self {
+        for (key, pane, _) in uacs {
+            if let Some(p) = self
+                .panes
+                .iter_mut()
+                .find(|p| p["pane_id"] == pane.as_str())
+            {
+                p["schema"] = 2.into();
+                p["project"] = key.as_str().into();
+                p["project_name"] = project_display_name(key).into();
+            }
         }
         self
     }
@@ -5307,34 +5442,6 @@ impl Layout {
                     })
             })
             .filter_map(|w| w["workspace_id"].as_str().map(String::from))
-            .collect()
-    }
-
-    /// The board panes (by the terminal title the board sets) and their
-    /// project among `keys`, else the project of their workspace's repo.
-    fn boards(&self, keys: &[String]) -> Vec<(String, Option<String>)> {
-        self.panes
-            .iter()
-            .filter(|p| {
-                p["terminal_title"]
-                    .as_str()
-                    .is_some_and(|t| t.starts_with("vega-board"))
-            })
-            .filter_map(|p| {
-                let id = p["pane_id"].as_str()?;
-                let key = keys
-                    .iter()
-                    .find(|k| self.in_project(k, id))
-                    .cloned()
-                    .or_else(|| {
-                        self.workspaces
-                            .iter()
-                            .find(|w| w["workspace_id"] == p["workspace_id"])
-                            .and_then(|w| w["project"].as_str())
-                            .map(str::to_owned)
-                    });
-                Some((id.to_string(), key))
-            })
             .collect()
     }
 }
@@ -5617,6 +5724,14 @@ fn report_metadata(
     let live: Vec<String> = d.panes();
     phases.mark("notes");
     let (layout, hc_available) = Layout::read();
+    let layout = layout.apply_claims(&uacs);
+    let uber = local_uber_pane();
+    // The Uber row says "engaged" while the claim's window is open (vega.engaged).
+    let uber_engaged = view.is_some_and(|view| {
+        view.live_uber()
+            .filter(|c| Some(&c.pane) == uber.as_ref() && c.host == st::post_host())
+            .is_some_and(|c| view.uber_engaged(&c, vega_ci_watch::unix_now()).on())
+    });
     phases.mark("layout");
     log_theme_errors(&sym.errors);
     let projects = vega_bd_sync::store::projects();
@@ -5667,33 +5782,6 @@ fn report_metadata(
         args.extend(b.uac_tokens(sym));
     }
     phases.mark("uac badges");
-    // Without a UAC pane on this host, the open board panes carry the badges.
-    if !uacs.iter().any(|(_, p, _)| live.contains(p)) {
-        for (pane, key) in layout.boards(&uac_keys) {
-            let b = match key {
-                Some(k) => badges_of(&k).0,
-                None => vega_herdr::badges::Badges {
-                    notes: unread.len(),
-                    ..Default::default()
-                },
-            };
-            let mut args = vec![
-                "pane".to_string(),
-                "report-metadata".into(),
-                pane,
-                "--source".into(),
-                "vega:vegad".into(),
-                "--ttl-ms".into(),
-                sidebar::TTL_MS.into(),
-            ];
-            if b.is_zero() {
-                args.push("--clear-display-agent".into());
-            } else {
-                args.extend(["--display-agent".into(), b.after("vega board", sym)]);
-            }
-            cmds.push(args);
-        }
-    }
     // Each workspace holding a UAC or a local sentinel gets its `$badge`.
     let mut badges: HashMap<String, String> = HashMap::new();
     for pane in &live {
@@ -5786,11 +5874,20 @@ fn report_metadata(
             args.extend(["--clear-token".into(), "mail_since".into()]);
         }
         if terminals::is_hc(&pane) {
+            if uber_engaged && uber.as_deref() == Some(pane.as_str()) {
+                args.extend(["--token".into(), "engaged=yes".into()]);
+            }
             if let Some(cmd) = hc_metadata_cmd(
                 &layout,
                 d,
                 &pane,
-                uacs.iter().any(|(_, p, _)| p == &pane),
+                if uacs.iter().any(|(_, p, _)| p == &pane) {
+                    Some("uac")
+                } else if uber.as_deref() == Some(pane.as_str()) {
+                    Some("uber")
+                } else {
+                    None
+                },
                 args,
             ) {
                 cmds.push(cmd);
@@ -5825,22 +5922,31 @@ fn report_metadata(
     due
 }
 
+/// The pane of this host's own Uber-UAC claim (its claim file is the truth,
+/// docs/design/uber-uac.md §2), if it claims one.
+fn local_uber_pane() -> Option<String> {
+    let file = vega_registry::uber_state::file()?;
+    let claim = vega_registry::uber_state::local(&file, &st::post_host())?;
+    claim["pane"].as_str().map(String::from)
+}
+
 /// Build one hc report from the same snapshot used for project membership.
 /// A failed snapshot is not evidence for clearing metadata. Gate and mux also
-/// own role labels: only an old uac role is ours to clear, and a current claim wins.
+/// own role labels: only an old uac or uber role is ours to clear, and a current
+/// claim (`uac`, `uber`) wins.
 fn hc_metadata_cmd(
     layout: &Layout,
     delivery: &Delivery,
     pane: &str,
-    uac: bool,
+    claim: Option<&str>,
     mut args: Vec<String>,
 ) -> Option<Vec<String>> {
     let metadata = layout.pane(pane)?;
-    if uac {
-        args.extend(["--token".into(), "role=uac".into()]);
+    if let Some(role) = claim {
+        args.extend(["--token".into(), format!("role={role}")]);
     } else if let Some(role) = metadata["labels"]["vega.role"]
         .as_str()
-        .filter(|r| *r != "uac")
+        .filter(|r| !matches!(*r, "uac" | "uber"))
     {
         args.extend(["--token".into(), format!("role={role}")]);
     }
@@ -7394,10 +7500,73 @@ mod tests {
         assert_eq!(layout.panes[0]["cwd"], active.path().to_str().unwrap());
         assert_eq!(layout.panes[0]["project"], "github.com/team/rally-coach");
         let args = layout.project_token("t34", None).to_vec();
-        let cmd = hc_metadata_cmd(&layout, &Delivery::default(), "t34", false, args).unwrap();
+        let cmd = hc_metadata_cmd(&layout, &Delivery::default(), "t34", None, args).unwrap();
         assert!(cmd.contains(&"vega.project=rally-coach".into()));
         assert!(cmd.contains(&"vega.project-id=github.com/team/rally-coach".into()));
         assert!(!cmd.iter().any(|s| s.contains("team/vega")));
+    }
+
+    #[test]
+    fn hc_labels_after_reboot_follow_claims_not_shifted_space_folders() {
+        // ganymede 2026-11-12: hc keep recovered every terminal as a login
+        // shell in ~, and the herdr-app space folders were shifted by one
+        // space, so t2b (spellkave UAC) got rally-ng-meta (vega-0h4c.73).
+        let home = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(other.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(other.path())
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/team/rally-ng-meta.git"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let shell = |t: &str, pid: u64| {
+            serde_json::json!({"address":t,"state":"live","pid":pid,"cwd":home.path(),
+                "foreground":{"pid":pid,"cwd":home.path(),"argv":["/bin/zsh","-l"]},
+                "status":null,"labels":{"herdr.space":"sp1"}})
+        };
+        let mut panes = terminals::hc_agents(
+            &serde_json::json!({"terminals":[shell("t2b", 10), shell("t28", 11)]}),
+        )
+        .unwrap();
+        for p in &mut panes {
+            p["space_folder"] = serde_json::json!(other.path());
+        }
+        let uacs = vec![(
+            "github.com/team/spellkave".to_string(),
+            "t2b".to_string(),
+            0,
+        )];
+        let layout = Layout {
+            panes,
+            workspaces: vec![],
+            tabs: vec![],
+        }
+        .resolve_projects()
+        .apply_claims(&uacs);
+        let cmd = |pane: &str, role: Option<&str>| {
+            let args = layout.project_token(pane, None).to_vec();
+            hc_metadata_cmd(&layout, &Delivery::default(), pane, role, args).unwrap()
+        };
+        let uac = cmd("t2b", Some("uac"));
+        assert!(uac.contains(&"vega.project-id=github.com/team/spellkave".into()));
+        assert!(uac.contains(&"vega.project=spellkave".into()));
+        assert!(uac.contains(&"vega.role=uac".into()));
+        let plain = cmd("t28", None);
+        assert!(plain.contains(&"vega.project-id=".into()), "{plain:?}");
+        assert!(plain.contains(&"vega.project=".into()), "{plain:?}");
+        assert!(plain.contains(&"vega.role=".into()), "{plain:?}");
     }
 
     #[test]
@@ -7476,22 +7645,26 @@ mod tests {
         let mut delivery = Delivery::default();
         delivery.mail("t7", delivery::Sender::Other);
         delivery.mail("t7", delivery::Sender::Other);
-        let report = |layout: &Layout, uac| {
-            hc_metadata_cmd(layout, &delivery, "t7", uac, project.to_vec()).unwrap()
+        let report = |layout: &Layout, role| {
+            hc_metadata_cmd(layout, &delivery, "t7", role, project.to_vec()).unwrap()
         };
-        let foreign = report(&layout, false);
+        let foreign = report(&layout, None);
         assert!(foreign.contains(&"vega.role=gate-reviewer".into()));
         assert!(foreign.contains(&"vega.project-id=git:own-project".into()));
         assert!(foreign.contains(&"vega.project=own-project".into()));
         assert!(foreign.contains(&"vega.mail=✉ 2".into()));
-        let current = report(&layout, true);
+        let current = report(&layout, Some("uac"));
         assert!(current.contains(&"vega.role=uac".into()));
         assert!(!current.contains(&"vega.role=gate-reviewer".into()));
         layout.panes[0]["labels"]["vega.role"] = "sentinel".into();
-        assert!(report(&layout, false).contains(&"vega.role=sentinel".into()));
+        assert!(report(&layout, None).contains(&"vega.role=sentinel".into()));
         layout.panes[0]["labels"]["vega.role"] = "uac".into();
-        assert!(report(&layout, false).contains(&"vega.role=".into()));
-        assert!(hc_metadata_cmd(&layout, &delivery, "t8", false, vec![]).is_none());
+        assert!(report(&layout, None).contains(&"vega.role=".into()));
+        // The Uber claim writes role=uber; a stale uber role is cleared.
+        assert!(report(&layout, Some("uber")).contains(&"vega.role=uber".into()));
+        layout.panes[0]["labels"]["vega.role"] = "uber".into();
+        assert!(report(&layout, None).contains(&"vega.role=".into()));
+        assert!(hc_metadata_cmd(&layout, &delivery, "t8", None, vec![]).is_none());
     }
 
     #[test]
@@ -7632,16 +7805,14 @@ mod tests {
     }
 
     #[test]
-    fn layout_places_panes_and_boards_in_projects() {
+    fn layout_places_panes_in_projects() {
         use serde_json::json;
         let layout = Layout {
             panes: vec![
                 json!({"schema":2, "project":"github.com/team/vega", "pane_id": "w1:p2", "workspace_id": "w1", "cwd": "/Users/u/src/vega.fix"}),
                 json!({"schema":2, "project":"github.com/team/sk", "pane_id": "w2:p1", "workspace_id": "w2", "cwd": "/Users/u/src/sk/x"}),
-                json!({"schema":2, "project":"github.com/team/other", "pane_id": "w3:p1", "workspace_id": "w3", "cwd": "/srv/x",
-                    "terminal_title": "vega-board-other"}),
-                json!({"schema":2, "project":"github.com/team/vega", "pane_id": "w1:p3", "workspace_id": "w1", "cwd": "/Users/u/src/vega",
-                    "terminal_title": "vega-board-vega"}),
+                json!({"schema":2, "project":"github.com/team/other", "pane_id": "w3:p1", "workspace_id": "w3", "cwd": "/srv/x"}),
+                json!({"schema":2, "project":"github.com/team/vega", "pane_id": "w1:p3", "workspace_id": "w1", "cwd": "/Users/u/src/vega"}),
             ],
             workspaces: vec![
                 json!({"schema":2, "project":"github.com/team/vega", "workspace_id": "w1", "worktree": {"repo_key": "/Users/u/src/vega/.git"}}),
@@ -7657,16 +7828,6 @@ mod tests {
         // The snapshot has already resolved this pane to its project ID.
         assert!(layout.in_project("github.com/team/sk", "w2:p1"));
         assert!(!layout.in_project(vega, "w9:p9"));
-        assert_eq!(
-            layout.boards(&[vega.to_string()]),
-            vec![
-                (
-                    "w3:p1".to_string(),
-                    Some("github.com/team/other".to_string())
-                ),
-                ("w1:p3".to_string(), Some(vega.to_string())),
-            ]
-        );
     }
 
     #[test]

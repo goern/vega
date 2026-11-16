@@ -3,6 +3,42 @@ use std::{fs, path::Path, process::Command};
 use vega_config::sources;
 
 #[test]
+fn branch_deletion_test_verdicts_allow_only_merge_checked_forms() {
+    let Some(dcg) = vega_plugin::find_on_path("dcg") else {
+        return;
+    };
+    let d = tempfile::tempdir().unwrap();
+    let config = d.path().join("config.toml");
+    fs::write(&config, sources::default("dcg/config.toml").unwrap()).unwrap();
+    for (command, allowed) in [
+        ("git branch -d x", true),
+        ("git branch --delete x", true),
+        ("git branch -D x", false),
+        ("git branch -d -f x", false),
+        ("git branch -df x", false),
+        ("git branch -fd x", false),
+        ("git branch --force --delete x", false),
+        ("git branch --delete x --force", false),
+    ] {
+        let output = Command::new(&dcg)
+            .args(["test", "--robot", command])
+            .current_dir(d.path())
+            .env("HOME", d.path())
+            .env("XDG_CONFIG_HOME", d.path().join(".config"))
+            .env("DCG_CONFIG", &config)
+            .env("DCG_NO_SELF_HEAL", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if allowed { 0 } else { 1 }),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
 fn explain_keeps_core_blocks_and_shows_prune_hint() {
     let Some(dcg) = vega_plugin::find_on_path("dcg") else {
         eprintln!("dcg not installed; skipping external explain fixture");
@@ -61,6 +97,52 @@ fn explain_keeps_core_blocks_and_shows_prune_hint() {
                 .and_then(|s| s.as_str())
                 .unwrap_or("config_override");
             assert_eq!(result["match"]["source"], source, "{case}: {result}");
+        }
+    }
+}
+
+#[test]
+fn claude_and_codex_hook_payloads_block_destructive_commands() {
+    let Some(dcg) = vega_plugin::find_on_path("dcg") else {
+        return;
+    };
+    let d = tempfile::tempdir().unwrap();
+    let config = d.path().join("config.toml");
+    fs::write(&config, sources::default("dcg/config.toml").unwrap()).unwrap();
+    for tool in ["Bash", "exec_command"] {
+        for (command, blocked) in [("git reset --hard", true), ("ls", false)] {
+            use std::io::Write;
+            let payload = if tool == "Bash" {
+                serde_json::json!({"tool_name":tool,"tool_input":{"command":command}})
+            } else {
+                serde_json::json!({"tool_name":tool,"tool_input":{"cmd":command}})
+            };
+            let mut child = Command::new(&dcg)
+                .current_dir(d.path())
+                .env("HOME", d.path())
+                .env("XDG_CONFIG_HOME", d.path().join(".config"))
+                .env("DCG_CONFIG", &config)
+                .env("DCG_NO_SELF_HEAL", "1")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.to_string().as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success());
+            let verdict =
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap_or_default();
+            assert_eq!(
+                verdict["hookSpecificOutput"]["permissionDecision"] == "deny",
+                blocked,
+                "{tool}: {command}: {verdict}"
+            );
         }
     }
 }

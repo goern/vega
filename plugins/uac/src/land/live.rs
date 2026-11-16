@@ -818,6 +818,7 @@ mod tests {
             extra: vec![],
             tier: None,
             model: None,
+            ..Default::default()
         };
         let of =
             |a: &Value, r: &st::SpawnRecord| session_in(a, std::slice::from_ref(r), home.path());

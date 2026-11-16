@@ -62,7 +62,7 @@ Settle sentinels: land, more work, or release (`vega mux close <pane>`, then `wt
 ## PagerDuty rights
 
 Agents may investigate, acknowledge and add notes. Resolve/escalate/reassign require
-a Slayer-approved board decision. [Design](pagerduty.md).
+a Slayer-approved decision bead. [Design](pagerduty.md).
 
 ## Hard limits
 
@@ -96,7 +96,7 @@ member; member claims name the coordination project ID. Member records need no
 local checkout: they confer routing, not a filesystem location. Existing
 registry publication and `post send --uac` routing consume these unchanged;
 inbox-only hosts retain local records without new broker or ACL rights.
-An inbox-only host (deimos, puck) cannot read the registry by design, so `vega uac`
+An inbox-only host (puck) cannot read the registry by design, so `vega uac`
 skips the read (no 4 s wait) and prints `registry: off (inbox-only host: local agents
 only)`; `vega mux next` and `vega config infra --fleet` skip it the same way.
 Owners keep the registry read.

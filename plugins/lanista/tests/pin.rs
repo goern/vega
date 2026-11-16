@@ -11,6 +11,19 @@ fn run(dir: &std::path::Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn pi_registry_default_is_rejected_before_broker_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(
+        dir.path(),
+        &["pin", "pi", "--default", "--set", "google/gemini-3.8-flash"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("pin zai --default"));
+}
+
+#[test]
 fn project_reads_fall_back_visibly_and_mutations_fail_without_registry() {
     let dir = tempfile::tempdir().unwrap();
     assert!(Command::new("git")
@@ -61,4 +74,49 @@ fn project_and_flag_validation_happen_before_registry_access() {
         args.extend(flags);
         assert_eq!(run(dir.path(), &args).status.code(), Some(2));
     }
+}
+
+#[test]
+fn inbox_host_cache_resolves_offline_and_foreign_mutations_are_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("vega/lanista");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("puck.json"), r#"{"schema":1,"seats":{"herdr-agents":{"codex":{"budget":{"model":"gpt-6.1-sol","until":null}}}}}"#).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vega-lanista"))
+            .current_dir(dir.path())
+            .env("XDG_CACHE_HOME", dir.path())
+            .env("VEGA_POST_HOST", "puck")
+            .env("VEGA_NATS_URL", "nats://127.0.0.1:1")
+            .env("VEGA_NATS_NKEY", dir.path().join("absent"))
+            .env_remove("VEGA_LANISTA_PIN_HOSTS")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["pin", "codex", "--tier", "budget"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("model: gpt-6.1-sol"), "{text}");
+    assert!(text.contains("source: host (puck)"), "{text}");
+    let out = run(&["hosts", "--json"]);
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["host"] == "puck"));
+    let out = run(&["pin", "codex", "--host", "proteus", "--set", "gpt-6.1-sol"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("only their own"));
+    let denied_default = run(&["pin", "codex", "--default", "--set", "gpt-6.1-sol"]);
+    assert_eq!(denied_default.status.code(), Some(1));
+    assert!(String::from_utf8(denied_default.stdout)
+        .unwrap()
+        .contains("cannot read or edit registry defaults"));
+    let out = run(&["pin", "codex", "--host", "puck", "--set", "not-allowed"]);
+    assert_eq!(out.status.code(), Some(2));
 }

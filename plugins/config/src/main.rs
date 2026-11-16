@@ -43,7 +43,7 @@ enum Cmd {
     },
     /// Write the units (default: all); a unit chezmoi manages is left alone
     #[command(
-        after_help = "Results: written, unchanged, managed (chezmoi owns a target: nothing written), skipped (tool not set up here), rejected (herdr config check), failed. Exit 1 on rejected or failed.\nThe last line is `summary: written N, unchanged N, managed N, skipped N, failed N`.\n\nExamples:\n  vega config apply\n  vega config apply herdr\n  vega config apply hooks"
+        after_help = "Results: written, unchanged, managed (chezmoi owns a target: nothing written), skipped (tool not set up here), rejected (invalid config), failed. Exit 1 on rejected or failed.\nThe last line is `summary: written N, unchanged N, managed N, skipped N, failed N`.\n\nExamples:\n  vega config apply\n  vega config apply herdr-app\n  vega config apply hooks"
     )]
     Apply {
         /// Units or groups (default: all)
@@ -53,13 +53,14 @@ enum Cmd {
     Print { unit: String },
     /// Copy a repo default to ~/.config/vega/config/ for local editing
     #[command(
-        after_help = "Sources: herdr/config.toml, instructions/<part>.md, claude/output-styles/<name>.md,\nclaude/settings.json, agentsview/LOCAL-SETUP.md, dcg/config.toml, dcg/packs/oc.yaml, herdr-app/keys.json, herdr-app/settings.json, herdr-app/themes/<name>.json, herdr-app/mods/{vega,vega-sidebar,vega-inbox}/{main.js,mod.json}, herdr-app/layouts/vega.json. A local file that exists is never overwritten. With nonstandard XDG_CONFIG_HOME, edit dcg/config.toml packs.custom_paths to point at that dcg/packs directory after init (init copies literal defaults).\n\nExamples:\n  vega config init instructions/vega.md\n  vega config init claude/settings.json"
+        after_help = "Sources: herdr/config.toml, instructions/<part>.md, claude/output-styles/<name>.md,\nclaude/settings.json, agentsview/LOCAL-SETUP.md, dcg/config.toml, dcg/hook.json, pi/extensions/dcg-guard.ts, dcg/packs/oc.yaml, herdr-app/keys.json, herdr-app/settings.json, herdr-app/themes/<name>.json, herdr-app/mods/{vega,vega-sidebar,vega-inbox}/{main.js,mod.json}, herdr-app/layouts/vega.json. A local file that exists is never overwritten. With nonstandard XDG_CONFIG_HOME, edit dcg/config.toml packs.custom_paths to point at that dcg/packs directory after init (init copies literal defaults).\n\nExamples:\n  vega config init instructions/vega.md\n  vega config init claude/settings.json"
     )]
     Init { source: String },
     /// The infra vega needs on this host: level, state, what it enables, next step
     #[command(
         after_help = "Default: local checks only (PATH without the shims, env vars, config files). --fleet also checks hc machine names against registry hosts over the network; mismatches exit 1.\nRequired: build tools, vega and an agent. Optional: hc, herdr-app, legacy herdr and feature tools.\n\nExamples:\n  vega config infra\n  vega config infra --fleet"
     )]
+    #[command(visible_alias = "check")]
     Infra {
         /// Also verify that every hc machine name exists as a registry host (network)
         #[arg(long)]
@@ -292,6 +293,9 @@ fn diff(ctx: &Ctx, names: &[String]) -> Result<ExitCode, Failure> {
                 ""
             };
             println!("unit: {} {label}{held}", u.name());
+            if f.remove {
+                println!("note: removes the managed file (backup retained)");
+            }
             if f.link && !f.follow {
                 println!("note: a symlink now; apply replaces it with a file");
             }
@@ -488,7 +492,7 @@ fn init(ctx: &Ctx, source: &str) -> Result<ExitCode, Failure> {
         Failure::new(
             "init_failed",
             e,
-            "sources: herdr/config.toml, instructions/<part>.md, claude/output-styles/<name>.md, claude/settings.json, agentsview/LOCAL-SETUP.md, dcg/config.toml, dcg/packs/oc.yaml; nonstandard XDG_CONFIG_HOME: adjust dcg packs.custom_paths after init",
+            "sources: herdr/config.toml, instructions/<part>.md, claude/output-styles/<name>.md, claude/settings.json, agentsview/LOCAL-SETUP.md, dcg/config.toml, dcg/hook.json, pi/extensions/dcg-guard.ts, dcg/packs/oc.yaml; nonstandard XDG_CONFIG_HOME: adjust dcg packs.custom_paths after init",
         )
     })?;
     println!(

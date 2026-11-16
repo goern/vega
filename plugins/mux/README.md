@@ -16,6 +16,11 @@ Target commands accept `hc:t7` or `hc:machine/t7` independently of the caller's 
 `--machine` lookup uses `hc machine ls`, falling back to `herdr machine list` when hc
 is absent or its fleet is empty. hc remote spawn refuses corporate-to-private control.
 
+`mode --machine <host> <pane> [headed|headless]` executes on the pane host through
+hc, so its local mode query, question hooks and `vega review start` share the same
+record. Qualified pane addresses work too. Both ends need matching vega versions;
+unavailable transport, failed writes and unconfirmed replies return structured errors.
+
 Mail keeps machine-qualified addresses intact. The hc machine name must equal its
 vega registry host: `vega mux send machine/t7 "<text>"` needs no `--host`.
 Post verifies that host exists; unknown hosts or unavailable registry checks fail
@@ -98,6 +103,12 @@ terminal defaults and stays readable after a live light/dark appearance switch. 
 its startup background probe; see [openai/codex#54159](https://github.com/openai/codex/issues/54159#issuecomment-6294011108).
 An explicit `--env FORCE_COLOR=...` wins, including an empty value. This applies to every
 spawn location, including worktrees and remote machines.
+
+Remote spawns persist mode, parent lineage, task title, spawn identity/cwd,
+and brief state on the target host through a bounded, confirmed helper call.
+Review and hooks on that host see those local records. Both hosts need matching
+vega versions. If confirmation fails, `remote_spawn_record_failed` names the
+terminal already started: inspect it before retrying to avoid duplicate agents.
 
 Local hc spawns and reopens start the agent through the toolbox launcher
 `~/.local/bin/hc-toolbox-shell` when that file exists and is executable (a host without it, for

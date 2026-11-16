@@ -876,6 +876,9 @@ fn claim(
         Some((p, h)) if p == me && h == here => {
             retain_claim_location(key, &project.location)?;
             println!("uac: {p} on {h} (you, already registered)");
+            if let Some(line) = vega_herdr::resume::record_own(me) {
+                println!("{line}");
+            }
             if let Some(t) = tracker(key, &project.location.checkout)? {
                 println!("tracker: {t}");
             }
@@ -927,6 +930,10 @@ fn claim(
     std::fs::write(&file, record.to_string())
         .map_err(|e| Failure::new("state_io", e.to_string(), "check the state dir"))?;
     println!("uac: {me} on {here} (you)");
+    // A reboot loses the agent; the record lets vegad resume it (resume.rs).
+    if let Some(line) = vega_herdr::resume::record_own(me) {
+        println!("{line}");
+    }
     match tracker {
         Some(t) => println!("tracker: {t}"),
         None => println!("tracker: none (no beads in this repo; status counts from this claim)"),
@@ -1887,7 +1894,7 @@ fn attention_table(rows: &[Row], host: &str) -> Vec<String> {
                 .map(|d| shorten(&d.summary, 100))
                 .unwrap_or_default()
         };
-        // `io:w1:p2` off this machine: selecting it in herdr (vega open)
+        // `io:w1:p2` off this machine: selecting it in herdr
         // jumps there.
         out.push(format!(
             "  {},{},{},{},{}",
@@ -1971,7 +1978,7 @@ mod tests {
         let words = guide.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("Agents may investigate, acknowledge and add notes."));
         assert!(
-            words.contains("Resolve/escalate/reassign require a Slayer-approved board decision.")
+            words.contains("Resolve/escalate/reassign require a Slayer-approved decision bead.")
         );
         assert!(guide.contains("[Design](pagerduty.md)"));
     }

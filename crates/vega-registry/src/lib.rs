@@ -110,7 +110,8 @@ pub fn uac_key(host: &str, project: &str) -> String {
 /// Ordinary reconciliation must never garbage-collect them.
 pub fn is_legacy_project_key(key: &str) -> bool {
     let parts: Vec<_> = key.split('.').collect();
-    matches!(parts.get(1), Some(&"uac" | &"lanista"))
+    !matches!(parts.get(1..), Some(["lanista", "host" | "default"]))
+        && matches!(parts.get(1), Some(&"uac" | &"lanista"))
         && !(parts.get(2) == Some(&"v2") && parts.len() > 3)
 }
 
@@ -719,10 +720,20 @@ pub async fn connect_with(
         .map_err(|e| format!("broker unreachable: {e}"))
 }
 
+/// Broker operations tolerate accepted disk stalls of up to one minute.
+pub const BROKER_WAIT: Duration = Duration::from_secs(60);
+
+/// Use the same request/ack timeout for registry setup and post mail.
+pub fn broker_context(client: async_nats::Client) -> async_nats::jetstream::Context {
+    let mut js = async_nats::jetstream::new(client);
+    js.set_timeout(BROKER_WAIT);
+    js
+}
+
 pub async fn bucket(
     client: &async_nats::Client,
 ) -> Result<async_nats::jetstream::kv::Store, String> {
-    async_nats::jetstream::new(client.clone())
+    broker_context(client.clone())
         .get_key_value(BUCKET)
         .await
         .map_err(|e| format!("registry bucket {BUCKET}: {e}"))
@@ -741,15 +752,24 @@ pub async fn read(
     read_kinds(client, kv, None).await
 }
 
-/// `read`, fetching only the keys of these kinds (`beat`, `agent`, `uac`, ...):
-/// `vega post send --uac` and the pane-gone hint need no lineage or notes.
+/// Status from restricted hosts is display data with an explicit allowlist.
+fn accepted_status_key(key: &str, inbox_only: &[String]) -> bool {
+    let Some((host, rest)) = key.split_once('.') else {
+        return true;
+    };
+    !inbox_only.iter().any(|h| h == host)
+        || !rest.starts_with("status.")
+        || rest == "status.keychain"
+}
+
+/// `read`, fetching only the keys of these kinds (`beat`, `agent`, `uac`, ...).
 /// `None`: every kind.
 pub async fn read_kinds(
     client: &async_nats::Client,
     kv: &async_nats::jetstream::kv::Store,
     kinds: Option<&[&str]>,
 ) -> Result<View, String> {
-    let stream = async_nats::jetstream::new(client.clone())
+    let stream = broker_context(client.clone())
         .get_stream(format!("KV_{BUCKET}"))
         .await
         .map_err(|e| e.to_string())?;
@@ -759,10 +779,13 @@ pub async fn read_kinds(
         .await
         .map_err(|e| e.to_string())?;
     let mut view = View::default();
+    let inbox_only = vega_herdr::state::inbox_only_hosts();
     while let Some(s) = subjects.next().await {
         let (subject, _) = s.map_err(|e| e.to_string())?;
         if let Some(k) = subject.strip_prefix(&prefix) {
-            view.keys.push(k.to_string());
+            if accepted_status_key(k, &inbox_only) {
+                view.keys.push(k.to_string());
+            }
         }
     }
     // Concurrent direct gets: a deleted key keeps its subject (the delete
@@ -967,6 +990,8 @@ pub async fn reconcile(
             && *k != beat_key(host)
             && *k != format!("{}.notify.sent", token(host))
             && !pins::is_pin(k)
+            && *k != format!("{}.lanista.host", token(host))
+            && *k != format!("{}.lanista.default", token(host))
             && !is_legacy_project_key(k)
             && !desired.contains_key(k)
         {
@@ -1016,7 +1041,6 @@ mod tests {
         // Parallel-safe: the list is read from the env, so use the default hosts.
         if std::env::var_os("VEGA_POST_INBOX_ONLY").is_none() {
             assert!(view.check_hc_machine("puck").is_ok());
-            assert!(view.check_hc_machine("deimos").is_ok());
         }
         assert!(view.check_hc_machine("io").is_ok());
         assert_eq!(
@@ -1601,5 +1625,23 @@ esac
         v.entries.get_mut(&uber_key("io")).unwrap()["schema"] = json!(2);
         assert_eq!(v.uber_claims().len(), 1);
         assert_eq!(v.live_uber().unwrap().epoch, 100);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    #[test]
+    fn restricted_status_is_allowlisted() {
+        let hosts = vec!["corp".to_string()];
+        assert!(super::accepted_status_key("corp.status.keychain", &hosts));
+        for key in [
+            "corp.status.x",
+            "corp.status.agent.x",
+            "corp.status.keychain.extra",
+        ] {
+            assert!(!super::accepted_status_key(key, &hosts), "{key}");
+        }
+        assert!(super::accepted_status_key("home.status.x", &hosts));
+        assert!(super::accepted_status_key("home.beat", &hosts));
     }
 }

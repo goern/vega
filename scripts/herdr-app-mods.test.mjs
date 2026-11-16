@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 function load(name, {allowFocus=false}={}) {
   const state = new Map(), storage = new Map(), calls = [], tasks = [], commands = [];
-  let props = {}, rendering = false;
+  let props = {}, rendering = false, background = false;
   function el() {
     const obj={items:[],handlers:{}};let proxy;
     proxy=new Proxy(obj,{get(o,k){
@@ -13,31 +13,232 @@ function load(name, {allowFocus=false}={}) {
       if(k==='child')return c=>{o.items.push(c);return proxy;};
       if(k==='children')return cs=>{o.items.push(...cs);return proxy;};
       if(k==='when')return (yes,f)=>yes?f(proxy):proxy;
-      if(k==='id'||k==='tooltip'||k==='text_color')return v=>{o[k+'Value']=v;return proxy;};
-      if(k==='on_click'||k==='on_mouse_down'||k==='on_mouse_move'||k==='on_mouse_up'||k==='on_key_down')return (...a)=>{o.handlers[k]=a.at(-1);if(k==='on_mouse_down'){o.mouseButton=a[0];o.handlers[`${k}:${a[0]}`]=a.at(-1);}return proxy;};
+      if(k==='id'||k==='tooltip'||k==='text_color'||k==='bg'||k==='border_color'||k==='spin')return v=>{o[k+'Value']=v;return proxy;};
+      if(k==='on_click'||k==='on_mouse_down'||k==='on_mouse_move'||k==='on_mouse_up'||k==='on_key_down'||k==='on_scroll_wheel')return (...a)=>{o.handlers[k]=a.at(-1);if(k==='on_mouse_down'){o.mouseButton=a[0];o.handlers[`${k}:${a[0]}`]=a.at(-1);}return proxy;};
       return ()=>proxy;
     }});return proxy;
   }
-  const cx={notify(){},stop_propagation(){calls.push(['stop']);},timer:{every(){}},spawn(f){const p=f(cx);tasks.push(p);return p;}};
+  const cx={notify(){},open_url:url=>calls.push(['open-url',url]),write_to_clipboard:text=>calls.push(['clipboard',text]),stop_propagation(){calls.push(['stop']);},timer:{every(){}},sleep(){background=true;return new Promise(()=>{});},spawn(f){background=false;const p=f(cx);if(!background)tasks.push(p);return p;}};
   const api={View:class {},div:el,h_flex:el,v_flex:el,svg:el,image:el,
     InputState:{new(options={}){assert.equal(rendering,false,'input state created in render');let value=options.value??'';return {handlers:{},on(event,f){this.handlers[event]=f;},value:()=>value,set_value:v=>{value=v;},focus(){assert(allowFocus,'focus stolen');calls.push(['focus']);}};}},
-    Input:{new:el},theme:()=>({}),shared:k=>state.get(k),setShared:(k,v)=>state.set(k,v),
+    Input:{new:el},ScrollHandle:{new:()=>({scroll_to_item:i=>calls.push(['scroll',i])})},
+    Scrollbar:{vertical:el},v_virtual_list:(id,count,height,key,render)=>el().id(id).children(render({start:0,end:count})),
+    settings:()=>({zoom:1}),theme:()=>({}),shared:k=>state.get(k),setShared:(k,v)=>state.set(k,v),
     props:()=>props,home:()=>'/scratch',terminals:()=>[{address:'t7',state:'live'}],
     agents:()=>[],panes:()=>[],spaces:()=>[],focused:()=>null,layout:()=>null,window:()=>null,
     setAgentOrder:a=>calls.push(['order',a]),
     run:(...a)=>calls.push(['run',...a]),openOverlay:s=>{calls.push(['open',s]);return 'window';},
     closeOverlay:s=>calls.push(['close',s]),notify:s=>calls.push(['toast',s]),
-    nextCommand:()=>new Promise(r=>commands.push(r)),watchFolder:()=>new Promise(()=>{}),
+    nextCommand:()=>{background=true;return new Promise(r=>commands.push(r));},watchFolder:()=>new Promise(()=>{}),
     exec:async (...a)=>{calls.push(['exec',...a]);return {code:0,stdout:'{}'};},
     localStorage:{getItem:k=>storage.get(k)??null,removeItem:k=>storage.delete(k),setItem:(k,v)=>storage.set(k,v)},Date,Map,Set,JSON};
   let code=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/main.js`,import.meta.url),'utf8');
   code=code.replace(/^import .*;\n/gm,'').replace('export default class','globalThis.Mod = class');
-  const context=vm.createContext(api);vm.runInContext(code,context);
+  const context=vm.createContext(api);
+  if(['vega-window-tabs','vega-services'].includes(name)) for(const file of name==='vega-services'?['model.js']:['navigation.js','tabs.js','diff.js']) {
+    const helper=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/${file}`,import.meta.url),'utf8')
+      .replace(/^import .*;\n/gm,'').replaceAll('export function','function').replaceAll('export const','const');
+    vm.runInContext(helper,context);
+  }
+  vm.runInContext(code,context);
   const mod=new context.Mod();
-  return {mod,state,storage,calls,cx,api:context,setProps:p=>{props=p;},render(){rendering=true;try{return mod.render(cx);}finally{rendering=false;}},async flush(){await Promise.all(tasks.filter(p=>p));}};
+  return {mod,state,storage,calls,cx,api:context,commands,newCopy:()=>new context.Mod(),setProps:p=>{props=p;},render(){rendering=true;try{return mod.render(cx);}finally{rendering=false;}},async flush(){await Promise.all(tasks.filter(p=>p));}};
 }
 const row=()=>({schema:2,project:'project-a',checkout:'/repo with spaces',at:Date.now()/1000,decisions:1,
   decision_texts:[{id:'b-1',title:'Choose',question:'What next?',project:'project-a'}],waiting_panes:[]});
+
+test('stock tabs and pane forks render static themed working dots and keep actions',()=>{
+  const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
+  for(const name of ['vega-tabs','vega-pane']) {
+    const h=load(name);
+    h.api.theme=()=>({working:'#ffaa00',blocked:'#ff0000',done:'#00ff00'});
+    h.api.panes=()=>[{pane:'p1',tab:'tb1',cwd:'/scratch',status:'working',program:{name:'Agent',agent:true}}];
+    h.api.spaces=()=>[{id:'s1',active:true,tabs:[{id:'tb1',name:'Work',active:true,status:'working'}]}];
+    h.setProps({pane:'p1'});
+    h.mod.init();
+    const tree=h.render(),all=nodes(tree);
+    assert(all.some(n=>n.bgValue==='#ffaa00'),'working dot uses theme.working');
+    assert(!all.some(n=>Object.hasOwn(n,'spinValue')),'no status animation');
+    if(name==='vega-tabs') {
+      all.find(n=>n.idValue==='close-tb1').handlers.on_click({},h.cx);
+      assert(h.calls.some(c=>c[0]==='run'&&c[1]==='tab.close'&&c[2].id==='tb1'));
+    } else {
+      tree.handlers.on_click();
+      assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.focus'&&c[2].pane==='p1'));
+      h.mod.hovered=true;
+      nodes(h.render()).find(n=>n.idValue==='ph-r-p1').handlers.on_click({},h.cx);
+      assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.split'&&c[2].pane==='p1'));
+    }
+    const source=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/main.js`,import.meta.url),'utf8');
+    assert(!/\.(spin|frames|loop)\(/.test(source));
+  }
+});
+
+test('tabs follow the leading agent live title and preserve custom names and generic fallbacks',()=>{
+  const h=load('vega-tabs');
+  const program={name:'Claude Code',key:'claude',agent:true};
+  let tab={id:'tb1',name:'1',named:false,active:true};
+  let lead={tab:'tb1',terminal:'t1',title:'✳ Fix login',program};
+  h.api.spaces=()=>[{id:'s1',active:true,tabs:[tab]}];
+  // An agent takes precedence even with a shell first in the split.
+  h.api.panes=()=>[{tab:'tb1',program:{name:'zsh',agent:false}},lead];
+  h.mod.init();
+  const title=()=>texts(elements(h.render()).find(n=>n.idValue==='tab-tb1'))[0];
+  assert.equal(title(),'Fix login');
+  lead.title='[ ! ] [Review] “Unicode 修正”';
+  assert.equal(title(),'[Review] “Unicode 修正”');
+  tab={...tab,name:'My task',named:true};
+  assert.equal(title(),'My task');
+  tab.name='Claude Code';
+  assert.equal(title(),'[Review] “Unicode 修正”','program-named tabs follow live titles');
+  tab={...tab,name:'1',named:false};
+  for(const generic of ['',null,'t1','Claude Code','CLAUDE','✳ ~/repo','/repo','C:\\repo','user@host']) {
+    lead.title=generic;assert.equal(title(),'Claude Code',String(generic));
+  }
+  lead={...lead,program:{name:'zsh',agent:false},title:'Do not use a shell title'};
+  assert.equal(title(),'zsh');
+  h.api.panes=()=>[];
+  assert.equal(title(),'Terminal');
+  tab={...tab,name:'tb42',named:true};
+  assert.equal(title(),'tb42','explicit names resembling old automatic IDs stay');
+});
+
+test('tabs recover invalid saved panels and retain the Services choice per space',()=>{
+  for(const saved of ['{bad','null','[]','"text"','42','false',null]) {
+    const h=load('vega-tabs');
+    if(saved!==null) h.storage.set('panels',saved);
+    h.mod.init();
+    assert.equal(JSON.stringify(h.mod.panels),'{}');
+    h.render();
+  }
+  const h=load('vega-tabs');
+  h.storage.set('panels','{"s1":"services"}');
+  h.api.spaces=()=>[{id:'s1',active:true,tabs:[]}];
+  h.api.layout=()=>({children:[{id:'panel',hidden:true},{id:'panel-body',active:'files'},{id:'services'}]});
+  h.state.set('workspace.panels',[]);
+  h.mod.init();
+  const tree=h.render();
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='layout.select'&&c[2].child==='services'));
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='layout.show'&&c[2].id==='panel'));
+  assert(elements(tree).some(n=>n.idValue==='panel-services'));
+  assert.equal(JSON.parse(h.storage.get('panels')).s1,'services','pending restore is not overwritten');
+});
+
+test('tabs wheel notches switch once and smooth swipes accumulate with pacing and resets',()=>{
+  const h=load('vega-tabs');let now=1000;
+  h.api.Date={now:()=>now};h.mod.init();
+  const wheel=h.render().handlers.on_scroll_wheel;
+  const commands=()=>h.calls.filter(c=>c[0]==='run').map(c=>c[1]);
+  const smooth=(y,ms=0,phase)=>{now+=ms;wheel({delta:{x:0,y},touch_phase:phase});};
+  wheel({delta:{y:120},delta_lines:{x:0,y:3}});
+  wheel({delta:{y:-120},delta_lines:{x:0,y:-3}});
+  wheel({delta:{y:120},delta_lines:{x:1,y:0}});
+  assert.deepEqual(commands(),['tab.prev','tab.next']);
+  h.calls.length=0;
+  smooth(9);smooth(10,10);assert.deepEqual(commands(),[]);
+  smooth(1,10);assert.deepEqual(commands(),['tab.prev']);
+  smooth(60,50);assert.equal(commands().length,1,'rapid events are paced');
+  smooth(1,50);assert.equal(commands().length,2);
+  smooth(58,100);assert.equal(commands().length,2,'long swipe needs another 60px');
+  smooth(1);assert.equal(commands().length,3);
+  smooth(1,10);
+  smooth(-20,100);assert.equal(commands().at(-1),'tab.next','turn resets the gesture');
+  smooth(19,300);assert.equal(commands().length,4,'pause starts at the short-swipe threshold');
+  smooth(1);assert.equal(commands().length,5);
+  smooth(19,100,'started');assert.equal(commands().length,5,'explicit start resets the threshold');
+  smooth(1);assert.equal(commands().length,6);
+  smooth(0,300);assert.equal(commands().length,6,'horizontal-only motion does nothing');
+});
+
+function navigationFixture() {
+  const h=load('vega-sidebar');
+  let focus=null, liveAgents=['t1','puck/t1','t3'], liveSpaces=['s1','puck/s1','s3'];
+  let livePanes=[{pane:'p1',tab:'tab1'},{pane:'p2',tab:'tab1'},
+    {pane:'mod-pane',tab:'tab1'},{pane:'puck/p1',tab:'puck/tab1'}];
+  const snapshots={t1:{terminal:'t1',space:'s1',tab:'tab1',pane:'p1'},
+    'puck/t1':{terminal:'puck/t1',space:'puck/s1',tab:'puck/tab1',pane:'puck/p1'},
+    t3:{terminal:'t3',space:'s3',tab:'tab3',pane:'p3'}};
+  h.api.focused=()=>focus;
+  h.api.agents=()=>liveAgents.map(address=>({address}));
+  h.api.spaces=()=>liveSpaces.map(id=>({id}));
+  h.api.panes=()=>livePanes;
+  h.api.run=(command,args)=>{
+    h.calls.push(['run',command,args]);
+    if(command==='agent.focus') focus={...snapshots[args.terminal]};
+    if(command==='space.select') focus={...Object.values(snapshots).find(f=>f.space===args.id)};
+    if(command==='pane.focus') focus={...focus,pane:args.pane,terminal:args.pane==='mod-pane'?null:'t1'};
+  };
+  const sample=vm.runInContext('sampleFocus',h.api),last=vm.runInContext('lastFocus',h.api);
+  return {...h,sample,last,focus(f){focus=typeof f==='string'?{...snapshots[f]}:f;sample();},
+    current:()=>focus,gone(){liveAgents=liveAgents.filter(x=>x!=='puck/t1');liveSpaces=liveSpaces.filter(x=>x!=='puck/s1');livePanes=livePanes.filter(x=>x.pane!=='p2');}};
+}
+
+test('navigation MRU updates once per focus, toggles and skips gone agents/spaces',()=>{
+  for(const kind of ['agent','space']) {
+    const h=navigationFixture();
+    h.last(`last-${kind}`);assert.equal(h.calls.length,0,'empty history is a no-op');
+    h.focus('t1');h.sample();h.last(`last-${kind}`);assert.equal(h.calls.length,0,'one entry is a no-op');
+    h.focus('puck/t1');h.last(`last-${kind}`);assert.equal(h.current().terminal,'t1');
+    h.last(`last-${kind}`);assert.equal(h.current().terminal,'puck/t1');
+    h.focus('t3');h.gone();h.last(`last-${kind}`);assert.equal(h.current().terminal,'t1');
+    h.last(`last-${kind}`);assert.equal(h.current().terminal,'t3');
+    h.focus({...h.current(),terminal:'shell'});
+    assert(!vm.runInContext('navigation.agents',h.api).includes('shell'));
+  }
+});
+
+test('last pane remembers each tab, includes mod panes, skips closed panes and toggles',()=>{
+  const h=navigationFixture();h.focus('t1');h.focus({...h.current(),pane:'p2'});
+  h.focus('puck/t1');h.last('last-pane');assert.equal(h.calls.length,0,'no cross-tab jump');
+  h.focus('t1');h.last('last-pane');assert.equal(h.current().pane,'p2');
+  h.last('last-pane');assert.equal(h.current().pane,'p1');
+  h.focus({...h.current(),pane:'mod-pane',terminal:null});h.gone();
+  h.last('last-pane');assert.equal(h.current().pane,'p1');
+  h.last('last-pane');assert.equal(h.current().pane,'mod-pane');
+});
+
+test('sidebar copies share history and handle each broadcast key only once',async()=>{
+  const h=navigationFixture(),other=h.newCopy();
+  h.mod.startNavigation(h.cx);other.startNavigation(h.cx);
+  h.focus('t1');h.focus('puck/t1');
+  for(const resolve of h.commands.splice(0))resolve('last-agent');
+  await new Promise(r=>setImmediate(r));
+  assert.equal(h.calls.length,1);assert.equal(h.current().terminal,'t1');
+  for(const resolve of h.commands.splice(0))resolve('last-agent');
+  await new Promise(r=>setImmediate(r));
+  assert.equal(h.calls.length,2);assert.equal(h.current().terminal,'puck/t1');
+  // If the first copy is hidden/removed, only the other receives the key.
+  const listeners=h.commands.splice(0);listeners[1]('last-agent');
+  await new Promise(r=>setImmediate(r));
+  assert.equal(h.calls.length,3);assert.equal(h.current().terminal,'t1');
+});
+
+test('last navigation keys use mod command argument syntax',()=>{
+  const keys=JSON.parse(fs.readFileSync(new URL('../config/herdr-app/keys.json',import.meta.url),'utf8')).global;
+  for(const [key,command] of [['ctrl-s l','last-agent'],['cmd-;','last-agent'],['ctrl-s shift-l','last-space'],['ctrl-s ;','last-pane']])
+    assert.equal(keys[key],`vega-sidebar.${command}`);
+});
+
+test('background sampling catches focus without renders and shares a cheap polling budget',async()=>{
+  const h=navigationFixture();let now=1000,terminal='t1',reads=0,focusReads=0;
+  const sleeps=[];
+  h.api.Date={now:()=>now};
+  h.api.focused=()=>{focusReads++;return {terminal,space:'s1',tab:'tab1',pane:terminal};};
+  h.api.agents=()=>{reads++;return [{address:'t1'},{address:'puck/t1'}];};
+  const cx={...h.cx,sleep(ms){assert.equal(ms,300);return new Promise(r=>sleeps.push(r));}};
+  cx.spawn=f=>f(cx);
+  h.mod.startNavigation(cx);h.newCopy().startNavigation(cx);
+  assert.equal(focusReads,1,'copies share one poll');assert.equal(reads,1);
+  now+=300;
+  for(const resume of sleeps.splice(0))resume();
+  await new Promise(r=>setImmediate(r));
+  assert.equal(focusReads,2);assert.equal(reads,1,'unchanged focus does not copy inventory');
+  now+=300;terminal='puck/t1';
+  for(const resume of sleeps.splice(0))resume();
+  await new Promise(r=>setImmediate(r));
+  assert.equal(reads,2);
+  assert.deepEqual(Array.from(vm.runInContext('navigation.agents',h.api)),['puck/t1','t1']);
+});
 
 test('new decisions open once, timestamps and waiters do not reopen; stale decisions ignored',async()=>{
   const h=load('vega');const r=row();let rows=[r];
@@ -77,13 +278,156 @@ test('answer and dismiss use argv and the recorded project cwd; inputs never aut
   assert.equal(h.mod.results.get('project-a/b-1'),'failure');
 });
 
+test('waiting child owns the hand and header badge opens a popover without focusing or folding',()=>{
+  const h=load('vega-sidebar');
+  const project='project-a';
+  const uac={address:'t1',state:'live',space:'s1',labels:{'vega.role':'uac','vega.project-id':project,'vega.waiting':'✋1'}};
+  const child={address:'ganymede/t2',state:'live',space:'s1',parent:'t1',status:'idle',turn:3,
+    labels:{'vega.project-id':project,'herdr.seen':'3'}};
+  h.api.terminals=()=>[uac,child];
+  h.api.agents=()=>[{address:'t1',space:'s1',status:'idle'}];
+  h.state.set('vega.badges',[{...row(),notes:0,decisions:0,decision_texts:[],waiting:1,
+    waiting_panes:[{pane:'hc:ganymede/t2',name:'Worker',attention:'asking',title:'Need a choice'}]}]);
+  h.state.set('vega.hide-inactive',true);
+  h.mod.init({},h.cx);
+  const tree=h.render(),nodes=elements(tree);
+  assert(nodes.some(n=>n.idValue==='vega-ganymede/t2-waiting'),'waiting idle child survives Active');
+  assert(!nodes.some(n=>n.idValue==='vega-t1-waiting'),'no aggregate hand on UAC');
+  const badge=nodes.find(n=>n.idValue==='total-uac-project-a');
+  assert.deepEqual(texts(badge),['1']);
+  h.calls.length=0;badge.handlers.on_mouse_down({},h.cx);badge.handlers.on_click({},h.cx);
+  const popup=h.calls.find(c=>c[0]==='open')[1];
+  assert.equal(popup.kind,'popup');assert.equal(popup.props.attentionProject,project);assert.equal(popup.props.uac,'t1');
+  assert(!h.calls.some(c=>c[0]==='run'),'header opens detail without focusing a pane');
+  assert.equal(h.mod.folded.size,0);
+});
+
+test('attention popover routes remote Open and Done, decisions and project-scoped notes through fakes',async()=>{
+  const h=load('vega-sidebar');const now=Date.now();
+  const r={...row(),machine:'ganymede',notes:1,waiting:2,checkout:'/remote repo',
+    decision_texts:[{id:'d1',title:'Choose model',created:Math.floor(now/1000)-60}],
+    waiting_panes:[{pane:'hc:io/t2',name:'Worker',attention:'asking',title:'Question?'},
+      {pane:'hc:ganymede/t3',name:'Dialog',attention:'input',title:'Permission'}]};
+  const notes=[{host:'proteus',id:now-1,project:'project-a',unread:true,title:'A note'},
+    {host:'proteus',id:now,project:'other',unread:true,title:'Unrelated'}];
+  h.api.terminals=()=>[{address:'ganymede/t1',state:'live',labels:{'vega.role':'uac','vega.project-id':'project-a'}}];
+  h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,[...args]]);
+    return bin==='python3'?{code:0,stdout:JSON.stringify({code:0,stdout:'dismissed',stderr:''})}
+      :{code:0,stdout:args.includes('clear')?'':notes.map(n=>JSON.stringify(n)).join('\n')};};
+  h.state.set('vega.badges',[r]);h.setProps({attentionProject:'project-a',uac:'ganymede/t1',overlay:'popup'});
+  h.mod.init({},h.cx);await h.flush();
+  const click=id=>elements(h.render()).find(n=>n.idValue===id).handlers.on_click({},h.cx);
+  assert(texts(h.render()).some(s=>s.includes('Worker · waiting')));
+  assert(texts(h.render()).some(s=>s.includes('d1 · decision · 1m ago')));
+  assert(!texts(h.render()).includes('Unrelated'));
+  assert(!elements(h.render()).some(n=>n.idValue==='attention-wait-hc:ganymede/t3-done'),'live dialog has no dismiss');
+  click('attention-wait-hc:io/t2-open');
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.focus'&&c[2].terminal==='io/t2'));
+  click('attention-wait-hc:io/t2-done');await h.flush();
+  const dismiss=h.calls.find(c=>c[0]==='exec'&&c[2].includes('dismiss'));
+  assert.deepEqual(dismiss[2].slice(2),['ganymede','/remote repo','vega','mux','dismiss','hc:io/t2']);
+  assert(!elements(h.render()).some(n=>n.idValue==='attention-wait-hc:io/t2'));
+  click('attention-decision-d1-done');
+  assert(h.calls.some(c=>c[0]==='open'&&c[1].props?.tab==='decisions'));
+  click(`attention-note-proteus-${now-1}-done`);await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec'&&JSON.stringify(c[2])===JSON.stringify(['post','notes','clear','--upto',`proteus=${now-1}`])));
+  click('attention-notes');assert(h.calls.some(c=>c[0]==='open'&&c[1].props?.tab==='notes'));
+});
+
+test('unchanged waiting reconciliation never publishes or redraws, including empty and expired state',()=>{
+  const h=load('vega-sidebar');let writes=0, redraws=0;
+  h.api.setShared=(key,value)=>{writes++;h.state.set(key,value);};
+  h.cx.notify=()=>redraws++;
+  const reconcile=()=>h.mod.reconcileWaiting(h.cx);
+  reconcile();reconcile();assert.equal(writes,0);assert.equal(redraws,0);
+  const r={...row(),waiting_panes:[{pane:'hc:t7',attention:'input'}]};
+  h.state.set('vega.badges',[r]);reconcile();
+  assert.equal(writes,1);assert.equal(redraws,1);
+  const previous=h.state.get('vega.waiting-state');
+  reconcile();h.newCopy().reconcileWaiting(h.cx);
+  assert.equal(writes,1);assert.equal(redraws,1);
+  r.at-=61;reconcile();
+  assert.equal(writes,2);assert.equal(redraws,2);
+  assert.equal(Object.keys(previous).length,1,'published episodes are not mutated during reconciliation');
+  reconcile();assert.equal(writes,2);assert.equal(redraws,2);
+});
+
+test('attention clock only redraws for displayed age changes and stale badge expiry',async()=>{
+  const h=load('vega-sidebar');let now=1000000, redraws=0;const timers=new Map();
+  h.api.Date={now:()=>now};h.cx.notify=()=>redraws++;
+  h.cx.timer.every=(ms,f)=>timers.set(ms,f);
+  h.setProps({attentionProject:'project-a',uac:'t1'});
+  h.state.set('vega.badges',[{...row(),at:now/1000,decision_texts:[{id:'d1',created:now/1000-59}]}]);
+  h.mod.init({},h.cx);await h.flush();h.render();redraws=0;
+  const tick=()=>timers.get(1000)(h.cx);
+  tick();assert.equal(redraws,0);
+  now+=1000;tick();assert.equal(redraws,1,'minute boundary changes age');
+  h.render();tick();assert.equal(redraws,1);
+  now+=60000;tick();assert.equal(redraws,2,'expired badges disappear');
+  h.render();now+=1000;tick();assert.equal(redraws,2,'empty popover stays quiet');
+});
+
+test('waiting auto-clears only after a viewed turn advances, once across copies; a new episode can wait again',async()=>{
+  for(const remote of [false,true]) {
+    const h=load('vega-sidebar');const address=remote?'ganymede/t2':'t2';
+    const term={address,state:'live',turn:4,labels:{'herdr.seen':'3'}};
+    const w={pane:`hc:${address}`,name:'Worker',attention:'silent',title:''};
+    const r={...row(),machine:remote?'ganymede':'',waiting:1,waiting_panes:[w]};
+    let focus=null;
+    h.api.terminals=()=>[term];h.api.focused=()=>focus;
+    h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,[...args]]);return {code:0,stdout:bin==='python3'?JSON.stringify({code:0,stdout:'ok',stderr:''}):'ok'};};
+    h.state.set('vega.badges',[r]);h.mod.init({},h.cx);await h.flush();h.calls.length=0;
+    const reconcile=()=>h.mod.reconcileWaiting(h.cx);
+    reconcile();term.turn=5;reconcile();await h.flush();
+    assert(!h.calls.some(c=>c[0]==='exec'),'advancing unseen turns leaves the hand');
+    term.labels['herdr.seen']='5';focus={terminal:address};reconcile();await h.flush();
+    assert(!h.calls.some(c=>c[0]==='exec'),'focus alone leaves the hand');
+    focus=null;term.turn=6;reconcile();
+    const copy=h.newCopy();copy.dismissBusy=new Set();copy.dismissResults=new Map();copy.reconcileWaiting(h.cx);
+    await h.flush();
+    assert.equal(h.calls.filter(c=>c[0]==='exec').length,1,'one dismiss across copies');
+    assert.equal(h.mod.vegaTotals(remote?'ganymede/t1':'t1','project-a').waiting,0);
+    r.waiting_panes=[];reconcile();r.waiting_panes=[w];reconcile();
+    assert.equal(h.mod.vegaTotals(remote?'ganymede/t1':'t1','project-a').waiting,1,'new briefing restores waiting');
+  }
+});
+
+test('waiting sees focus between polls and keeps failed dismiss visible for explicit retry',async()=>{
+  const h=load('vega-sidebar');const term={address:'t2',state:'live',turn:4,labels:{'herdr.seen':'3'}};
+  const w={pane:'hc:t2',attention:'asking',title:'Choice'},r={...row(),waiting:1,waiting_panes:[w]};
+  h.api.terminals=()=>[term];h.state.set('vega.badges',[r]);h.mod.init({},h.cx);await h.flush();h.calls.length=0;
+  let code=1;h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,[...args]]);return {code,stdout:'failed'};};
+  h.mod.reconcileWaiting(h.cx);
+  term.labels['herdr.seen']='4';term.turn=5;w.title='New output';w.attention='silent';h.mod.reconcileWaiting(h.cx);await h.flush();
+  assert.equal(h.mod.vegaTotals('t1','project-a').waiting,1);
+  h.mod.reconcileWaiting(h.cx);await h.flush();
+  assert.equal(h.calls.filter(c=>c[0]==='exec').length,1,'no repeated background retries');
+  code=0;await h.mod.dismissWaiting(r,w,h.cx);
+  assert.equal(h.mod.vegaTotals('t1','project-a').waiting,0);
+  r.at=Date.now()/1000-61;assert.equal(h.mod.vegaIcons('t2',{}).items.length,0,'stale row has no hand');
+});
+
+test('auto-dismiss ignores stale waiters, live input dialogs and seen labels from before the waiting turn',async()=>{
+  const h=load('vega-sidebar');const term={address:'t2',state:'live',turn:6,labels:{}};
+  const w={pane:'hc:t2',attention:'asking'},r={...row(),waiting:1,waiting_panes:[w]};
+  h.api.terminals=()=>[term];h.state.set('vega.badges',[r]);h.mod.init({},h.cx);await h.flush();h.calls.length=0;
+  h.mod.reconcileWaiting(h.cx);
+  term.labels['herdr.seen']='4';term.turn=7;h.mod.reconcileWaiting(h.cx);await h.flush();
+  assert(!h.calls.some(c=>c[0]==='exec'),'old seen label cannot handle the new waiter');
+  term.labels['herdr.seen']='7';h.mod.reconcileWaiting(h.cx);
+  term.turn=8;w.attention='input';h.mod.reconcileWaiting(h.cx);await h.flush();
+  assert(!h.calls.some(c=>c[0]==='exec'),'live dialog cannot auto-dismiss');
+  w.attention='silent';r.at=Date.now()/1000-61;h.mod.reconcileWaiting(h.cx);await h.flush();
+  assert(!h.calls.some(c=>c[0]==='exec'),'stale row cannot auto-dismiss');
+});
+
 test('each agent icon stops row propagation and routes its own action',()=>{
   const h=load('vega-sidebar');
   h.mod.vegaTerminals=new Map([['t7',{labels:{'vega.mail':'2','vega.decisions':'1','vega.waiting':'1','vega.kind':'C','vega.uac':'UAC','vega.git':'dirty'}}]]);
   const icons=h.mod.vegaIcons('t7',{}).items;
-  assert.equal(icons.length,3,'uac and kind sit before the name; project decisions sit in the project badge');
+  assert.equal(icons.length,2,'uac and kind sit before the name; aggregate waiting and decisions stay off the UAC row');
   for(const icon of icons)icon.handlers.on_click({},h.cx);
-  assert.equal(h.calls.filter(c=>c[0]==='stop').length,3);
+  assert.equal(h.calls.filter(c=>c[0]==='stop').length,2);
   h.mod.vegaTerminals.set('t8',{labels:{'vega.git':'\u2800'}});
   assert.equal(h.mod.vegaIcons('t8',{}).items.length,0,'a blank token draws nothing');
   assert(!h.calls.some(c=>c[0]==='open'&&c[1].mod==='vega-inbox'),'agent rows no longer open the inbox');
@@ -248,7 +592,7 @@ test('UAC projects hold their agents across machines in dragged order; other spa
   assert.equal(ids.filter(i=>i.startsWith('uac-')).length,2,'one group per UAC project');
   assert(at('uac-github.com/team/lanista')<at('ag-ganymede/t2')&&at('ag-ganymede/t2')<at('ag-t5')&&at('ag-t5')<at('uac-github.com/team/vega'),'UAC first, then the project\'s agents on other machines');
   assert(at('sub-ganymede/t3')>at('ag-ganymede/t2'),'sentinel is a branch of its UAC');
-  assert(text.includes('feat/x')&&!text.some(s=>s.includes('⚙')),'sentinel name without the cog');
+  assert(text.includes('feat/x')&&!texts(nodes.find(n=>n.idValue==='sub-ganymede/t3')).some(s=>s.includes('⚙')),'sentinel name without the cog');
   assert(text.includes('♃₃')&&text.includes('♆₈'),'machine symbol on every row');
   assert(text.includes('Spaces')&&at('space-sp3')>at('uac-github.com/team/vega'),'a space without a UAC follows under Spaces');
   assert(!ids.includes('space-sp1'),'no folder rows inside a UAC project');
@@ -262,6 +606,31 @@ test('UAC projects hold their agents across machines in dragged order; other spa
   assert.deepEqual(JSON.parse(h.storage.get('project-order')),['github.com/team/vega','github.com/team/lanista']);
   const click=elements(h.render()).find(n=>n.idValue==='space-sp3');click.handlers.on_click({},h.cx);
   assert(h.calls.some(c=>c[0]==='run'&&c[1]==='space.select'&&c[2].id==='sp3'),'a space row selects that space');
+});
+
+test('the Uber-UAC is one row at the top, outside every project group and without a "no UAC" marker',()=>{
+  const h=load('vega-sidebar');
+  const agent=(address,space)=>({address,space_name:'x',space,tab:'tb',pane:address,status:'idle',program:{key:'claude'},seq:1});
+  h.api.spaces=()=>[
+    {id:'sp1',name:'vega',machine:null,branch:null,active:false,tabs:[]},
+    {id:'sp9',name:'uber',machine:null,branch:null,active:false,tabs:[]},
+  ];
+  h.api.agents=()=>[agent('t7','sp1'),agent('t9','sp9')];
+  const uber={'herdr.space':'sp9','vega.host':'♆₈','vega.role':'uber','vega.engaged':'yes','vega.project-id':'github.com/durandom/vega-uber-uac','vega.project':'vega-uber-uac'};
+  h.api.terminals=()=>[
+    {address:'t7',state:'live',labels:{'herdr.space':'sp1','vega.host':'♆₈','vega.role':'uac','vega.project-id':'github.com/team/vega','vega.project':'vega'}},
+    {address:'t9',state:'live',labels:uber},
+  ];
+  h.mod.init({},h.cx);
+  let tree=h.render(),ids=elements(tree).map(n=>n.idValue).filter(i=>typeof i==='string'),text=texts(tree);
+  assert(ids.indexOf('uber-t9')>=0&&ids.indexOf('uber-t9')<ids.indexOf('uac-github.com/team/vega'),'the Uber row leads the project list');
+  assert(!ids.includes('ag-t9')&&!ids.includes('uac-github.com/durandom/vega-uber-uac'),'no agent row and no project group for the Uber');
+  assert(!text.includes('vega-uber-uac')&&!text.includes('no UAC'),'no project name and no marker');
+  assert(text.includes('Über')&&text.includes('engaged'));
+  elements(tree).find(n=>n.idValue==='uber-t9').handlers.on_click({},h.cx);
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.focus'&&c[2].pane==='t9'),'a click focuses the Uber pane');
+  uber['vega.engaged']='';
+  assert(!texts(h.render()).includes('engaged'),'idle Uber shows no engaged marker');
 });
 
 test('mail archive and notification JSON render readable cards and empty/error states',async()=>{
@@ -554,6 +923,147 @@ function projectFixture(h) {
   return project;
 }
 
+test('inactive filter retains UAC context and active descendants; retains done sub-agents; hides idle and unknown rows and empty groups',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);
+  const all=h.api.terminals();
+  all.push(
+    {address:'t5',state:'live',parent:'puck/t1',status:'idle'},
+    {address:'t6',state:'live',parent:'t5',status:'blocked'},
+    {address:'t7',state:'live',parent:'puck/t1'},
+    {address:'t8',state:'live',parent:'puck/t1',status:'done'},
+    {address:'t9',state:'exited',parent:'puck/t1',status:'working'},
+    {address:'t10',state:'live',labels:{'vega.role':'uac','vega.project-id':'idle-project'}},
+    {address:'t11',state:'live',parent:'t10',status:'idle'},
+  );
+  h.api.terminals=()=>all;
+  const agents=h.api.agents();agents[1].status='working';
+  agents.push({address:'t10',status:'idle',program:{}});
+  h.api.agents=()=>agents;
+  h.mod.init({},h.cx);
+  elements(h.render()).find(n=>n.idValue==='ag-hide-inactive').handlers.on_click({},h.cx);
+  const tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+  for(const id of [`uac-${project}`,'ag-puck/t1','sub-t2','sub-t6','sub-t8']) assert(ids.includes(id),id);
+  for(const id of ['ag-t3','ag-t4','sub-t5','sub-t7','sub-t9','uac-idle-project','ag-t10','sub-t11','space-scratch']) assert(!ids.includes(id),id);
+  assert(texts(tree).includes('6 idle hidden'),'counts sessions once, including unknown, excluding retained UAC and exited child');
+  assert.equal(h.state.get('vega.hide-inactive'),true);
+  assert.equal(h.storage.get('hide-inactive'),'true');
+  assert(h.calls.some(c=>c[0]==='stop'),'toggle stops row propagation');
+  assert.deepEqual(Array.from(h.calls.filter(c=>c[0]==='order').at(-1)[1]),['puck/t1','t2']);
+});
+
+test('focused idle terminal and its UAC stay visible; activity toggle persists true and false across copies and restarts',()=>{
+  const h=load('vega-sidebar');projectFixture(h);h.mod.init({},h.cx);
+  h.api.focused=()=>({terminal:'t2'});
+  h.state.set('vega.hide-inactive',true);
+  let tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+  assert(ids.includes('ag-puck/t1'));assert(ids.includes('sub-t2'));assert(!ids.includes('ag-t3'));
+  assert(texts(tree).includes('2 idle hidden'));
+  assert.equal(h.storage.get('hide-inactive'),'true','copies shared state into this mod storage');
+  h.state.delete('vega.hide-inactive');
+  tree=h.render();assert(texts(tree).includes('2 idle hidden'),'restart uses localStorage fallback');
+  elements(tree).find(n=>n.idValue==='ag-idle-hidden').handlers.on_click({},h.cx);
+  assert.equal(h.state.get('vega.hide-inactive'),false);
+  tree=h.render();assert(!elements(tree).some(n=>n.idValue==='ag-idle-hidden'));
+  assert(elements(tree).some(n=>n.idValue==='space-scratch'));
+  assert.equal(h.storage.get('hide-inactive'),'false');
+  h.storage.set('hide-inactive','true');h.state.set('vega.hide-inactive',false);
+  h.render();assert.equal(h.storage.get('hide-inactive'),'false','shared false overrides an older true copy');
+  h.state.delete('vega.hide-inactive');assert(!texts(h.render()).some(s=>s.endsWith('idle hidden')));
+});
+
+test('inactive filter combines with label and machine views and hides fully idle projects',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);
+  const agents=h.api.agents();agents[1].status='working';agents[3].status='working';h.api.agents=()=>agents;
+  h.mod.preferences={projects:{[project]:{labels:['work']}},views:{Remote:{labels:[],machines:['puck']}}};
+  h.state.set('vega.hide-inactive',true);
+  for(const view of ['label:work','Remote']) {
+    h.state.set('vega.view',view);
+    const tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+    assert(ids.includes(`uac-${project}`));assert(ids.includes('sub-t2'),'working sentinel retained');
+    assert(!ids.includes('space-scratch'),'view still applies to active scratch agent');
+    assert(texts(tree).includes('1 idle hidden'),'count excludes sessions outside the view');
+  }
+  agents[1].status='done';
+  assert(elements(h.render()).some(n=>n.idValue==='sub-t2'),'done sentinel remains visible until read');
+  agents[1].status='idle';
+  const tree=h.render();assert(!elements(tree).some(n=>n.idValue===`uac-${project}`));
+  assert(texts(tree).includes('3 idle hidden'));
+  h.state.set('vega.hide-inactive',false);
+  assert(elements(h.render()).some(n=>n.idValue===`uac-${project}`));
+});
+
+test('project pin icon toggles persisted argv, stops header events, and shows CLI errors',async()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);await h.flush();
+  let pinned=false;
+  h.api.exec=async(bin,args)=>{
+    h.calls.push(['exec',bin,args]);
+    if(args.includes('--pin')) pinned=true;
+    if(args.includes('--unpin')) pinned=false;
+    return {code:0,stdout:JSON.stringify({projects:{[project]:{pinned,labels:[]}},views:{}})};
+  };
+  // A click's cx is valid only during the handler (herdr-app throws later): use it like the app.
+  const click=async handler=>{
+    let dead=false;const live=f=>(...a)=>{if(dead)throw new TypeError('cx is no longer valid');return f(...a);};
+    const cx={stop_propagation:live(()=>h.cx.stop_propagation()),notify:live(()=>{}),spawn:live(f=>h.cx.spawn(f)),timer:h.cx.timer};
+    handler({},cx);dead=true;await h.flush();
+  };
+  for(const flag of ['--pin','--unpin']) {
+    const pin=elements(h.render()).find(n=>n.idValue===`pin-uac-${project}`);
+    const stops=h.calls.filter(c=>c[0]==='stop').length;
+    pin.handlers['on_mouse_down:left']({},h.cx);
+    await click(pin.handlers.on_click);
+    assert.equal(h.calls.filter(c=>c[0]==='stop').length,stops+2);
+    assert.equal(h.mod.dragFrom,undefined,'pin does not start header drag');
+    const call=h.calls.filter(c=>c[0]==='exec'&&c[2].includes(flag)).at(-1);
+    assert.equal(call[1],'vega');
+    assert.deepEqual(Array.from(call[2]),['project','config',project,flag,'--json']);
+    assert.deepEqual(Array.from(h.calls.filter(c=>c[0]==='exec').at(-1)[2]),['project','config','--json']);
+    assert.equal(h.mod.preferences.projects[project].pinned,flag==='--pin');
+  }
+  h.api.exec=async()=>({code:1,stdout:'pin denied'});
+  await click(elements(h.render()).find(n=>n.idValue===`pin-uac-${project}`).handlers.on_click);
+  assert(texts(h.render()).some(s=>s.includes('pin denied')));
+  assert.equal(h.mod.preferences.projects[project].pinned,false);
+});
+
+test('pinned idle project retains its UAC only within the current view and excludes it from hidden count',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);
+  h.mod.preferences={projects:{[project]:{pinned:true,labels:['work']}},views:{Remote:{labels:[],machines:['puck']},Local:{labels:[],machines:['local']}}};
+  h.state.set('vega.hide-inactive',true);
+  for(const view of ['all','label:work','Remote']) {
+    h.state.set('vega.view',view);
+    const tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+    assert(ids.includes(`uac-${project}`));assert(ids.includes('ag-puck/t1'));
+    assert(!ids.includes('sub-t2'),'idle sub-agent still hides');
+    assert(!ids.includes('ag-t3'),'other idle project agent still hides');
+    assert(texts(tree).includes(view==='all'?'3 idle hidden':'2 idle hidden'));
+  }
+  for(const view of ['label:other','Local']) {
+    h.state.set('vega.view',view);
+    const tree=h.render();
+    assert(!elements(tree).some(n=>n.idValue===`uac-${project}`));
+    assert(texts(tree).includes(view==='Local'?'1 idle hidden':'0 idle hidden'));
+  }
+  h.state.set('vega.view','all');h.api.agents=()=>[];
+  assert(elements(h.render()).some(n=>n.idValue==='ag-puck/t1'),'pin retains a UAC without status');
+});
+
+test('unknown UAC without a status entry keeps active descendants; narrow rail can focus a terminal-only child and disable filtering',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);
+  h.api.agents=()=>[];
+  const all=h.api.terminals();all[1].status='working';h.api.terminals=()=>all;
+  h.state.set('vega.hide-inactive',true);h.mod.init({},h.cx);
+  let ids=elements(h.render()).map(n=>n.idValue);
+  assert(ids.includes(`uac-${project}`));assert(ids.includes('ag-puck/t1'));assert(ids.includes('sub-t2'));
+  h.api.layout=()=>({id:'sidebar',size:{px:76}});
+  const tree=h.render();
+  const child=elements(tree).find(n=>n.idValue==='ag-t2');assert(child);
+  child.handlers.on_click({},h.cx);
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='terminal.peek'&&c[2].terminal==='t2'));
+  elements(tree).find(n=>n.idValue==='ag-idle-hidden').handlers.on_click({},h.cx);
+  assert.equal(h.state.get('vega.hide-inactive'),false);
+});
+
 test('project Config overlay loads once, saves argv including label removal, and keeps failures editable',async()=>{
   const h=load('vega-sidebar'),project=projectFixture(h);
   h.mod.init({},h.cx);
@@ -611,6 +1121,120 @@ test('same-named repositories have separate config targets and legacy labels can
   h.mod.init({},h.cx);h.mod.preferences={projects:{[id]:{name:'One'},[other]:{name:'Two'}},views:{}};
   const text=texts(h.render());assert(text.includes('One'));assert(text.includes('Two'));
   const grouping=h.mod.projectGroups(h.api.terminals());assert.equal(grouping.projectOfAgent({address:'t6'}),null);
+});
+
+test('projects survive a missing UAC with orphan sentinels, filters, pins and navigation',async()=>{
+  const h=load('vega-sidebar'),project='github.com/b4arena/spellkave';
+  let all=[
+    {address:'ganymede/t1n',state:'live',labels:{}},
+    {address:'ganymede/t2',state:'live',parent:'ganymede/t1n',labels:{'vega.project-id':project,'herdr.space':'s'}},
+    {address:'ganymede/t3',state:'live',parent:'ganymede/t1n',labels:{'vega.project':'spellkave','herdr.space':'s'}},
+    {address:'gone',state:'exited',labels:{'vega.role':'uac','vega.project-id':project}},
+  ];
+  let status='working';
+  h.api.terminals=()=>all;
+  h.api.agents=()=>all.slice(1,3).map(a=>({...a,space:'ganymede/s',status,program:{}}));
+  h.mod.init({},h.cx);
+  h.mod.preferences={projects:{[project]:{name:'Spellkave',labels:['work']}},views:{Work:{labels:['work'],machines:['ganymede']},Local:{labels:[],machines:['local']}}};
+  h.state.set('vega.view','Work');
+  let tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+  assert(texts(tree).includes('Spellkave'));assert(texts(tree).includes('no UAC'));
+  assert(ids.includes('ag-ganymede/t2'));assert(ids.includes('ag-ganymede/t3'));
+  assert.equal(JSON.stringify(h.calls.filter(c=>c[0]==='order').at(-1)[1]),JSON.stringify(['ganymede/t2','ganymede/t3']));
+  elements(tree).find(n=>n.idValue===`gear-uac-${project}`).handlers.on_click({},h.cx);
+  assert.equal(h.calls.find(c=>c[0]==='open')[1].props.projectConfig,project);
+  h.state.set('vega.view','Local');assert(!projectHeaders(h).length);
+  h.state.set('vega.view','Work');h.state.set('vega.hide-inactive',true);
+  assert(projectHeaders(h).includes(`uac-${project}`));
+  status='idle';assert(!projectHeaders(h).length,'Active hides idle unpinned projects');
+  h.mod.preferences.projects[project].pinned=true;
+  assert(projectHeaders(h).includes(`uac-${project}`),'pin keeps no-UAC header in Active');
+  assert(texts(h.render()).includes('no UAC'));
+  h.state.set('vega.hide-inactive',false);
+  all=[...all,{address:'ganymede/new-uac',state:'live',labels:{'vega.role':'uac','vega.project-id':project}}];
+  assert(!texts(h.render()).includes('no UAC'),'marker clears when a UAC claims the project');
+  assert.equal(h.mod.projectGroups(all).projects.get(project).address,'ganymede/new-uac');
+});
+
+test('terminals without an agent list under their project; placeholders, exited and sub-agents stay out',()=>{
+  const h=load('vega-sidebar'),project='github.com/durandom/rally-ng-meta';
+  const fg=(name,argv)=>({name,argv,cwd:'/work/rally'});
+  const lab={'vega.project-id':project,'herdr.space':'s'};
+  const all=[
+    {address:'ganymede/t1',state:'live',labels:{...lab,'vega.role':'uac'}},
+    {address:'ganymede/t2s',state:'live',labels:lab,foreground:fg('token-burn',['token-burn','tui'])},
+    {address:'ganymede/t2t',state:'live',labels:lab,foreground:fg('zsh',['-zsh'])},
+    {address:'ganymede/t3',state:'live',labels:{...lab,'vega.worktree-owner':'t1'},foreground:fg('zsh',['-zsh'])},
+    {address:'ganymede/t4',state:'exited',labels:lab,foreground:fg('pdc',['pdc'])},
+    {address:'ganymede/t5',state:'live',parent:'ganymede/t1',labels:{},foreground:fg('node',['node'])},
+    {address:'ganymede/t6',state:'live',labels:{'herdr.space':'free'},foreground:fg('vite',['vite'])},
+  ];
+  h.api.terminals=()=>all;
+  h.api.agents=()=>[{...all[0],space:'ganymede/s',status:'idle',program:{key:'claude'}}];
+  h.mod.init({},h.cx);
+  let ids=elements(h.render()).map(n=>n.idValue);
+  assert(ids.includes('term-ganymede/t2s'));assert(ids.includes('term-ganymede/t2t'));
+  for(const hidden of ['t3','t4','t5','t1'])assert(!ids.includes(`term-ganymede/${hidden}`),hidden);
+  assert(ids.indexOf('ag-ganymede/t1')<ids.indexOf('term-ganymede/t2s'),'agents come first');
+  assert(texts(h.render()).includes('token-burn'));
+  assert(!JSON.stringify(h.calls.filter(c=>c[0]==='order').at(-1)?.[1]??[]).includes('t2s'),'navigation order stays agents only');
+  elements(h.render()).find(n=>n.idValue==='term-ganymede/t2s').handlers.on_click({},h.cx);
+  h.state.set('vega.hide-inactive',true);
+  ids=elements(h.render()).map(n=>n.idValue);
+  assert(!ids.includes('term-ganymede/t2t'),'Active hides idle shells');
+  h.mod.preferences={projects:{[project]:{pinned:true}}};
+  ids=elements(h.render()).map(n=>n.idValue);
+  assert(ids.includes('term-ganymede/t2t')&&ids.includes('term-ganymede/t2s'),'pinned project keeps them');
+});
+
+test('a child of another project renders in its own project group with a parent hint',()=>{
+  const h=load('vega-sidebar'),vega='github.com/durandom/vega',spell='github.com/b4arena/spellkave';
+  const all=[
+    {address:'proteus/t6p',state:'live',labels:{'vega.role':'uac','vega.project-id':vega,'herdr.space':'s'}},
+    {address:'proteus/t7',state:'live',parent:'proteus/t6p',labels:{'vega.role':'sentinel','vega.project-id':vega,'herdr.space':'s'}},
+    {address:'proteus/t11v',state:'live',parent:'proteus/t6p',labels:{'vega.role':'sentinel','vega.project-id':spell,'herdr.space':'s'}},
+    {address:'ganymede/u',state:'live',labels:{'vega.role':'uac','vega.project-id':spell,'herdr.space':'g'}},
+  ];
+  h.api.terminals=()=>all;
+  h.api.agents=()=>all.map(a=>({...a,space:a.address.startsWith('ganymede')?'ganymede/g':'proteus/s',status:'working',program:{key:'claude'}}));
+  h.mod.init({},h.cx);
+  const tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+  assert(ids.includes('sub-proteus/t7'),'same-project child stays a branch');
+  assert(!ids.includes('sub-proteus/t11v'));
+  const order=ids.filter(i=>typeof i==='string'&&/^(uac-|ag-|sub-)/.test(i));
+  assert(order.indexOf('ag-proteus/t11v')>order.indexOf(`uac-${spell}`)&&order.indexOf('ag-proteus/t11v')<order.indexOf(`uac-${vega}`)&&order.indexOf('sub-proteus/t7')>order.indexOf(`uac-${vega}`),'t11v is under spellkave, not vega');
+  assert(texts(tree).includes('↑ t6p'));
+});
+
+test('a child of a project without a UAC stays under its parent',()=>{
+  const h=load('vega-sidebar'),meta='github.com/b4arena/rally-ng-meta',app='github.com/b4arena/rally-ng-app';
+  const all=[
+    {address:'io/m',state:'live',labels:{'vega.role':'uac','vega.project-id':meta,'herdr.space':'s'}},
+    {address:'io/gdemo',state:'live',parent:'io/m',labels:{'vega.role':'sentinel','vega.project-id':app,'herdr.space':'s'}},
+  ];
+  h.api.terminals=()=>all;
+  h.api.agents=()=>all.map(a=>({...a,space:'io/s',status:'working',program:{key:'claude'}}));
+  h.mod.init({},h.cx);
+  const tree=h.render(),ids=elements(tree).map(n=>n.idValue);
+  assert(ids.includes('sub-io/gdemo'),'child stays a branch of its parent');
+  assert(!ids.includes('ag-io/gdemo'));
+  assert(!texts(tree).includes('↑ m'));
+  assert(!projectHeaders(h).includes(`uac-${app}`),'no empty no-UAC group for the child project');
+  h.mod.preferences={projects:{[app]:{pinned:true}}};
+  assert(projectHeaders(h).includes(`uac-${app}`),'a pinned project keeps its header');
+});
+
+test('legacy-only projects stay visible and no-UAC projects retain manual order',()=>{
+  const h=load('vega-sidebar'),[a,b,otherB,c]=orderedProjectsFixture(h);
+  const all=h.api.terminals();delete all[0].labels['vega.role'];delete all[3].labels['vega.role'];
+  all.push({address:'legacy',state:'live',labels:{'vega.project':'legacy'}});
+  h.api.terminals=()=>all;
+  const agents=h.api.agents;h.api.agents=()=>[...agents(),{address:'legacy',space:'s',tab:'tb',pane:'legacy',status:'idle',program:{}}];
+  h.storage.set('project-order',JSON.stringify([c,b,otherB,a,'legacy']));h.mod.init({},h.cx);
+  assert.deepEqual(projectHeaders(h),[c,b,otherB,a,'legacy'].map(id=>`uac-${id}`));
+  h.mod.move([c,b,otherB,a,'legacy'],a,c);
+  assert.deepEqual(projectHeaders(h),[a,c,b,otherB,'legacy'].map(id=>`uac-${id}`));
+  assert.equal(h.mod.projectGroups(all).projectOfAgent({address:'legacy'}),'legacy');
 });
 
 test('view popup selects, saves and deletes CLI-owned views without persisting config in shared state',async()=>{
@@ -774,7 +1398,7 @@ test('waiting panes offer Dismiss for silent and asking only, run vega mux dismi
   const call=w.calls.find(c=>c[0]==='exec'&&c[2].includes('dismiss'));
   assert.equal(call[1],'python3');
   assert.deepEqual(call[2].slice(2),['ganymede','/remote/a','vega','mux','dismiss','hc:t1w'],'machine-local pane id on the parent machine');
-  assert(texts(w.render()).some(s=>s.startsWith('Dismissed')));
+  assert(!elements(w.render()).some(n=>n.idValue==='ov-wait-hc:ganymede/t1w'),'successful dismissal removes the item immediately');
 
   const i=load('vega-inbox');i.setProps({project});i.api.terminals=()=>[{address:'t5',state:'live'}];
   i.state.set('vega.badges',[{project,at:Date.now()/1000,checkout:'/repo',decision_texts:[],waiting_panes:[{pane:'hc:t5',name:'chat',attention:'asking',title:'asks: ok?'}]}]);
@@ -795,7 +1419,7 @@ test('a match-any view shows projects with a chosen label or on a chosen machine
   assert(!nodes.some(n=>n.idValue===`uac-${project}`),'all: label and machine both needed');
 });
 
-test('keychain popup opens once globally per lock, click reopens only its own terminal, unlocked closes',async()=>{
+test('keychain popup opens once globally per lock, click reopens only its own terminal, stays until closed',async()=>{
   const h=load('vega'), now=Date.now()/1000;
   const row={host:'puck',state:'locked',since:now-10,at:now};
   h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,[...args]]);return {code:0,stdout:'{"address":"puck/t42"}'};};
@@ -808,8 +1432,10 @@ test('keychain popup opens once globally per lock, click reopens only its own te
   assert.deepEqual(start[2].slice(0,8),['run','--json','--bg','--no-parent','--no-notify','--on','puck','--']);
   assert(!start[2].includes('--label'),'unlock terminal is never adopted into a tab');
   const script=start[2][start[2].indexOf('-c')+1];
-  assert(script.indexOf('read -r')<script.indexOf('security unlock-keychain'));
-  assert(script.includes('stty -echo || exit'));
+  assert(script.indexOf('read -r')<script.indexOf('stty -echo; security unlock-keychain'),'Enter before the unlock runs');
+  assert(script.includes('stty -echo; security unlock-keychain'));
+  assert(script.includes('Command (runs on'),'shows the concrete command');
+  assert(script.trimEnd().endsWith('IFS= read -r enter'),'the terminal stays after the unlock');
   assert(!script.includes('unlock-keychain -p'));
   assert.equal(opens[0][1].layout.children[1].content.terminal,'puck/t42');
   assert.equal(opens[0][1].kind,'window');
@@ -817,13 +1443,23 @@ test('keychain popup opens once globally per lock, click reopens only its own te
   // Another copy shares the same dedupe state (as multiple status bars do).
   const copy=new h.mod.constructor();copy.applyKeychains([row],now,h.cx);await h.flush();
   assert.equal(h.calls.filter(c=>c[0]==='open').length,1);
+  h.api.focused=()=>({terminal:'puck/t1'});
   const red=elements(h.render()).find(e=>e.idValue==='keychain-puck');
   red.handlers.on_click({},h.cx);await h.flush();
   assert.equal(h.calls.filter(c=>c[0]==='open').length,2,'click reopens a dismissed popup');
   assert.equal(h.calls.filter(c=>c[0]==='exec'&&c[2][0]==='run').length,1,'reuse existing dedicated terminal');
+  const before=h.calls.length;
   h.mod.applyKeychains([{...row,state:'unlocked',since:now}],now,h.cx);await h.flush();
-  assert(h.calls.some(c=>c[0]==='close'));
-  assert(h.calls.some(c=>c[0]==='exec'&&c[2][0]==='kill'&&c[2][1]==='puck/t42'));
+  assert(!h.calls.slice(before).some(c=>c[0]==='close'),'an unlock keeps the window for the Slayer to close');
+  assert(!h.calls.some(c=>c[0]==='exec'&&c[2][0]==='kill'));
+  const title=load('vega');title.state.set('vega.keychains',h.state.get('vega.keychains'));
+  title.state.set('vega.keychain-popups',h.state.get('vega.keychain-popups'));
+  title.mod.init({keychainTitle:'puck',overlay:'kc'},title.cx);
+  assert(texts(title.render()).some(x=>x.startsWith('unlocked')),'title shows the new state');
+  elements(title.render()).find(e=>e.idValue==='keychain-close').handlers.on_click({},title.cx);await title.flush();
+  assert(title.calls.some(c=>c[0]==='close'));
+  assert(title.calls.some(c=>c[0]==='exec'&&c[2][0]==='kill'&&c[2][1]==='puck/t42'),'closing kills only its terminal');
+  for(const k of ['vega.keychain-popups']) h.state.set(k,title.state.get(k));
   assert(!h.calls.some(c=>c[0]==='exec'&&['send','keys','read'].includes(c[2][0])));
   h.mod.applyKeychains([{...row,since:now+1}],now,h.cx);await h.flush();
   assert.equal(h.calls.filter(c=>c[0]==='open').length,3,'new since is a new lock');
@@ -834,14 +1470,17 @@ test('keychain status uses theme colours, host and since tooltips, and stale dat
   const t={ansi1:'theme-red',ansi2:'theme-green',dim:'theme-dim'};h.api.theme=()=>t;
   h.mod.applyKeychains(['unlocked','locked','unknown'].map((state,i)=>({host:['localmac','puck','offline'][i],state,since:now-30,at:now})),now,h.cx);
   await h.flush();
-  const nodes=elements(h.render());
-  for(const [host,color] of [['localmac',t.ansi2],['puck',t.ansi1],['offline',t.dim]]) {
-    const n=nodes.find(n=>n.idValue===`keychain-${host}`);
+  h.mod.localKeychainHost='localmac';
+  const lockOf=focus=>{h.api.focused=()=>({terminal:focus});return elements(h.render()).filter(n=>String(n.idValue).startsWith('keychain-'));};
+  for(const [focus,host,color] of [['t1','localmac',t.ansi2],['puck/t1','puck',t.ansi1],['offline/t3','offline',t.dim]]) {
+    const locks=lockOf(focus);
+    assert.equal(locks.length,1,'one lock: the focused terminal\'s machine');
+    const n=locks[0];assert.equal(n.idValue,`keychain-${host}`);
     assert.equal(n.text_colorValue,color);assert(n.tooltipValue.includes(host));assert(n.tooltipValue.includes('since'));
   }
   const opens=h.calls.filter(c=>c[0]==='open').length;
-  nodes.find(n=>n.idValue==='keychain-localmac').handlers.on_click({},h.cx);
-  nodes.find(n=>n.idValue==='keychain-offline').handlers.on_click({},h.cx);await h.flush();
+  lockOf('t1')[0].handlers.on_click({},h.cx);
+  lockOf('offline/t3')[0].handlers.on_click({},h.cx);await h.flush();
   assert.equal(h.calls.filter(c=>c[0]==='open').length,opens);
   h.mod.applyKeychains([{host:'puck',state:'locked',since:1,at:now}],now-181,h.cx);
   assert.equal(h.mod.keychains[0].state,'unknown','stopped vegad cannot leave a red/green claim');
@@ -878,4 +1517,603 @@ test('persisted keychain overlay ids and pending launches cannot affect a new ap
   h.state.set('vega.keychain-popups',{puck:{overlay:'other-reused-id',terminal:'puck/t42',session:'previous-app'}});
   h.mod.applyKeychains([{host:'puck',state:'unlocked',since:now,at:now}],now,h.cx);await h.flush();
   assert(!h.calls.some(c=>c[0]==='close'&&c[1]==='other-reused-id'));
+});
+
+test('an open unlock window probes its host directly and turns the lock green before vegad',async()=>{
+  const h=load('vega'),now=Date.now()/1000;
+  h.mod.localKeychainHost='proteus';
+  h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,[...args]]);return bin==='hc'&&args[0]==='exec'?{code:0,stdout:'{"code":0}'}:{code:0,stdout:'{}'};};
+  const row={host:'ganymede',state:'locked',since:now-100,at:now-30};
+  h.state.set('vega.keychain-seen',['ganymede/'+row.since]);
+  h.mod.applyKeychains([row],now,h.cx);
+  h.mod.probeOpenPopups(h.cx);await h.flush();
+  assert(!h.calls.some(c=>c[2]?.[0]==='exec'),'no window: no direct probe');
+  h.state.set('vega.keychain-popups',{ganymede:{terminal:'ganymede/t9',overlay:'o',session:'x'}});
+  h.mod.probeOpenPopups(h.cx);h.mod.probeOpenPopups(h.cx);await h.flush();
+  const probes=h.calls.filter(c=>c[1]==='hc'&&c[2][0]==='exec');
+  assert.equal(probes.length,1,'throttled across calls');
+  assert.deepEqual(probes[0][2].slice(0,5),['exec','--json','--on','ganymede','--timeout']);
+  assert(probes[0][2].at(-1).startsWith('security show-keychain-info'),'read-only probe');
+  assert.equal(h.mod.keychains[0].state,'unlocked');
+  h.mod.applyKeychains([row],now,h.cx);
+  assert.equal(h.mod.keychains[0].state,'unlocked','an older registry sample cannot turn it red again');
+  h.mod.applyKeychains([{...row,at:now+60,since:now+60}],now+60,h.cx);
+  assert.equal(h.mod.keychains[0].state,'locked','a newer locked probe wins');
+});
+
+test('Models tab reads host cells including inbox-only hosts and independent defaults; exact set/clear argv and inline errors',async()=>{
+  const h=load('vega-sidebar');h.setProps({globalConfig:true});
+  const cell={seat:'herdr-agents',lane:'codex',tier:'budget',model:'project-model',source:'project',until:1234567890,allowed:['gpt-6-luna','gpt-6.1-terra']};
+  let rows=[{...cell,host:'proteus'},{...cell,host:'puck',model:'gpt-6.1-terra',source:'host'},
+    {...cell,host:'puck',lane:'pi',model:'glm-4.7',source:'global',allowed:['google/gemini-4-argon']}];
+  let mutation={code:0,stdout:'action: set'}, readError=null, defaultError=null;
+  h.api.exec=async(bin,args)=>{
+    h.calls.push(['exec',bin,[...args]]);
+    if(args[0]!=='lanista') return {code:0,stdout:'{}'};
+    if(args[1]==='hosts') return readError??{code:0,stdout:JSON.stringify({rows})};
+    if(args.includes('--set')||args.includes('--clear')) return mutation;
+    return defaultError??{code:0,stdout:'model: gpt-6-luna\nsource: default\nexpires: never\n'};
+  };
+  h.mod.init({},h.cx);await h.flush();
+  let nodes=elements(h.render()), text=texts(h.render());
+  assert(nodes.some(n=>n.idValue==='settings-tab-models'));
+  assert(nodes.some(n=>n.idValue==='models-group-puck'),'host list is independent of connected hc machines');
+  assert(text.includes('project-model · project'));assert(text.includes('gpt-6-luna · default'));
+  assert(text.includes('glm-4.7 · global'),'pi can show its zai fallback outside the pi allowlist');
+  assert(!nodes.some(n=>typeof n.idValue==='string'&&n.idValue.startsWith('model-default/herdr-agents/pi')));
+  assert(!h.calls.some(c=>c[0]==='exec'&&c[2][2]==='pi'&&c[2].includes('--default')));
+  const key='puck/herdr-agents/codex/budget';
+  nodes.find(n=>n.idValue===`model-select-${key}`).handlers.on_mouse_down({},h.cx);
+  assert(h.calls.some(c=>c[0]==='stop'),'controls stop window focus mouse-down');
+  nodes.find(n=>n.idValue===`model-select-${key}`).handlers.on_click({},h.cx);
+  nodes=elements(h.render());
+  assert.deepEqual(nodes.filter(n=>typeof n.idValue==='string'&&n.idValue.startsWith(`model-option-${key}/`)).map(n=>texts(n)[0]),cell.allowed);
+  rows=rows.map(r=>r.host==='puck'&&r.lane==='codex'?{...r,model:'gpt-6-luna',source:'host'}:r);
+  nodes.find(n=>n.idValue===`model-option-${key}/gpt-6-luna`).handlers.on_click({},h.cx);await h.flush();
+  const argv=()=>h.calls.filter(c=>c[0]==='exec'&&c[2][0]==='lanista').map(c=>c[2]);
+  assert(argv().some(a=>JSON.stringify(a)===JSON.stringify(['lanista','pin','codex','--tier','budget','--host','puck','--set','gpt-6-luna'])));
+  assert(texts(h.render()).includes('gpt-6-luna · host'));
+  let reads=argv().filter(a=>a[1]==='hosts').length;
+  elements(h.render()).find(n=>n.idValue===`model-clear-${key}`).handlers.on_click({},h.cx);await h.flush();
+  assert(argv().some(a=>JSON.stringify(a)===JSON.stringify(['lanista','pin','codex','--tier','budget','--host','puck','--clear'])));
+  assert(argv().filter(a=>a[1]==='hosts').length>reads,'refresh after each action');
+  const def='default/herdr-agents/codex/budget';
+  elements(h.render()).find(n=>n.idValue===`model-select-${def}`).handlers.on_click({},h.cx);
+  elements(h.render()).find(n=>n.idValue===`model-option-${def}/gpt-6.1-terra`).handlers.on_click({},h.cx);await h.flush();
+  assert(argv().some(a=>JSON.stringify(a)===JSON.stringify(['lanista','pin','codex','--tier','budget','--default','--set','gpt-6.1-terra'])));
+  mutation={code:2,stdout:'error: broker write denied'};
+  elements(h.render()).find(n=>n.idValue===`model-clear-${def}`).handlers.on_click({},h.cx);await h.flush();
+  assert(argv().some(a=>JSON.stringify(a)===JSON.stringify(['lanista','pin','codex','--tier','budget','--default','--clear'])));
+  assert(texts(h.render()).includes('error: broker write denied'));
+  defaultError={code:1,stderr:'default unavailable'};await h.mod.readModels(h.cx);
+  assert(texts(h.render()).includes('default unavailable'));
+  readError={code:1,stdout:'error: hosts unavailable'};await h.mod.readModels(h.cx);
+  assert(texts(h.render()).includes('error: hosts unavailable'));
+  assert(elements(h.render()).some(n=>n.idValue==='models-group-puck'),'failed reads retain last snapshot');
+  h.api.exec=async()=>{throw new Error('exec failed');};await h.mod.readModels(h.cx);
+  assert(texts(h.render()).includes('exec failed'));
+  const other=load('vega-sidebar');other.setProps({globalConfig:true});other.state.set('vega.models',h.state.get('vega.models'));
+  assert(texts(other.mod.modelsTab({})).includes('gpt-6-luna · host'),'other mod copies use shared data');
+  readError=null;rows=[];h.api.exec=async()=>({code:0,stdout:JSON.stringify({rows})});await h.mod.readModels(h.cx);
+  assert(texts(h.render()).includes('No known hosts'));
+});
+
+test('vega settings gear works without a project, closes from its titlebar and adds no timers',async()=>{
+  const h=load('vega-sidebar');h.mod.init({},h.cx);
+  elements(h.render()).find(n=>n.idValue==='vega-settings').handlers.on_click({},h.cx);
+  const spec=h.calls.find(c=>c[0]==='open')[1];
+  assert.equal(spec.kind,'window');assert.equal(spec.key,'vega-settings');assert.equal(spec.props.globalConfig,true);
+  const popup=load('vega-sidebar');popup.setProps({...spec.props,overlay:'settings'});
+  let timers=0;popup.cx.timer.every=()=>timers++;
+  popup.mod.init({},popup.cx);await popup.flush();
+  assert.equal(timers,0);
+  let tree=popup.render();
+  const close=elements(tree).find(n=>n.idValue==='close-settings');
+  close.handlers.on_mouse_down({},popup.cx);close.handlers.on_click({},popup.cx);
+  assert(popup.calls.some(c=>c[0]==='stop'));
+  assert(popup.calls.some(c=>c[0]==='close'&&c[1]==='settings'));
+  tree.handlers.on_key_down({keystroke:'escape'},popup.cx);
+  assert.equal(popup.calls.filter(c=>c[0]==='close').length,2);
+});
+
+test('settings lists profiles, routes Open and existing Edit tabs dialog, and preserves theme delivery status',async()=>{
+  const h=load('vega-sidebar');h.setProps({globalConfig:true,overlay:'settings'});
+  let error=false;
+  const status='os: dark\nmode: auto (theme.toml)\napplied: dark\nclaude_panes[3]{pane,mode,wanted,status}:\n  t1,dark,dark,applied\n  t2,light,dark,pending\n  t3,unknown,dark,failed: hc_timeout\n';
+  h.api.exec=async(bin,args)=>{
+    h.calls.push(['exec',bin,[...args]]);
+    if(error) return {code:1,stdout:'error: unavailable'};
+    return {code:0,stdout:args[0]==='theme'?status:args.length===1?'profiles[2]{name,applied}:\n  status,true\n  spare,false\n':'window: status'};
+  };
+  h.mod.settingsTab='windows';await h.mod.readSettings('windows',h.cx);
+  let nodes=elements(h.render());
+  assert(texts(h.render()).includes('spare · not applied'));
+  assert(!nodes.some(n=>n.idValue==='profile-open-spare'));
+  nodes.find(n=>n.idValue==='profile-edit-status').handlers.on_click({},h.cx);
+  const edit=h.calls.find(c=>c[0]==='open')[1];
+  assert.equal(edit.mod,'vega-window-tabs');assert.equal(edit.props.mode,'config');assert.equal(edit.props.profile,'status');
+  nodes.find(n=>n.idValue==='profile-open-status').handlers.on_click({},h.cx);await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec'&&JSON.stringify(c[2])==='["window","status"]'));
+  assert(texts(h.render()).includes('Opened status'));
+  nodes=elements(h.render());nodes.find(n=>n.idValue==='settings-tab-theme').handlers.on_click({},h.cx);await h.flush();
+  for(const line of status.trimEnd().split('\n')) assert(texts(h.render()).includes(line));
+  error=true;
+  elements(h.render()).find(n=>n.idValue==='settings-refresh').handlers.on_click({},h.cx);await h.flush();
+  assert(texts(h.render()).includes('error: unavailable'));
+  assert(texts(h.render()).includes('  t3,unknown,dark,failed: hc_timeout'),'last successful theme snapshot survives errors');
+  h.api.exec=async()=>({code:0,stdout:'profiles[0]{name,applied}:\n'});
+  h.mod.settingsTab='windows';await h.mod.readSettings('windows',h.cx);
+  assert(texts(h.render()).includes('No profiles available.'));
+});
+
+test('project Models edits only project pins in its recorded checkout and keeps estate data separate',async()=>{
+  const h=load('vega-sidebar');h.setProps({projectConfig:'project-a',tab:'models'});
+  h.state.set('vega.badges',[row()]);
+  const cell={host:'puck',seat:'herdr-agents',lane:'codex',tier:'budget',allowed:['gpt-6-luna']};
+  h.api.exec=async(bin,args,opts)=>{
+    h.calls.push(['exec',bin,[...args],opts]);
+    return {code:0,stdout:args[1]==='hosts'?JSON.stringify({rows:[cell]}):'project: project-a\nmodel: gpt-6-luna\nsource: project (proteus)\nexpires: never\n'};
+  };
+  await h.mod.readModels(h.cx);
+  let nodes=elements(h.render());
+  assert(nodes.some(n=>n.idValue==='project-tab-models'));
+  assert(nodes.some(n=>n.idValue==='models-group-Project overrides'));
+  assert(!nodes.some(n=>n.idValue==='models-group-Default'||n.idValue==='models-group-puck'));
+  assert.equal(h.state.get('vega.models'),undefined);
+  assert(h.state.has('vega.models.project-a'));
+  await h.mod.changeModel(cell,false,'gpt-6-luna',h.cx);
+  await h.mod.changeModel(cell,false,null,h.cx);
+  const pins=h.calls.filter(c=>c[0]==='exec'&&c[2][1]==='pin');
+  assert(pins.every(c=>c[3].cwd==='/repo with spaces'));
+  assert(pins.every(c=>!c[2].includes('--host')&&!c[2].includes('--default')));
+  assert(pins.some(c=>JSON.stringify(c[2])==='["lanista","pin","codex","--tier","budget","--set","gpt-6-luna","--until","never"]'));
+  assert(pins.some(c=>JSON.stringify(c[2])==='["lanista","pin","codex","--tier","budget","--clear"]'));
+  h.state.set('vega.badges',[]);await h.mod.readModels(h.cx);
+  assert(texts(h.render()).includes('Project checkout unavailable.'));
+});
+
+test('context and overview read beads in the registry checkout, not the drifted terminal cwd',async()=>{
+  const uac={address:'t6p',state:'live',cwd:'/other/repo',labels:{'vega.role':'uac','vega.project-id':'project-a'}};
+  const h=load('vega');h.state.set('vega.badges',[{...row(),checkout:'/repo'}]);
+  h.mod.ctx={project:'project-a',uac,term:uac,kind:''};
+  await h.mod.readContext(h.cx);
+  const bd=h.calls.find(c=>c[0]==='exec'&&c[1]==='bd');assert.equal(bd[3].cwd,'/repo');
+  h.state.set('vega.badges',[]);h.calls.length=0;await h.mod.readContext(h.cx);
+  assert.equal(h.calls.find(c=>c[0]==='exec'&&c[1]==='bd')[3].cwd,'/other/repo','without a badge row the terminal cwd remains');
+  const s=load('vega-sidebar');s.api.terminals=()=>[uac];s.setProps({uac:'t6p',projectConfig:'project-a'});
+  s.state.set('vega.badges',[{...row(),checkout:'/repo'}]);
+  await s.mod.readOverview(s.cx);
+  for(const c of s.calls.filter(c=>c[0]==='exec'))assert.equal(c[3].cwd,'/repo');
+  assert(s.calls.some(c=>c[0]==='exec'&&c[1]==='bd'));
+});
+
+test('done is blue and kept by the Active filter only while unread (turn past herdr.seen), like the tab bar',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);
+  const all=h.api.terminals();
+  all.push(
+    {address:'t5',state:'live',parent:'puck/t1',status:'done',turn:3,labels:{'herdr.seen':'3'}},
+    {address:'t6',state:'live',parent:'puck/t1',status:'done',turn:4,labels:{'herdr.seen':'3'}},
+    {address:'t8',state:'live',parent:'puck/t1',status:'done',turn:2},
+  );
+  h.api.terminals=()=>all;
+  h.mod.init({},h.cx);h.state.set('vega.hide-inactive',true);
+  const ids=elements(h.render()).map(n=>n.idValue);
+  for(const id of ['sub-t6','sub-t8']) assert(ids.includes(id),`${id}: unread done stays`);
+  assert(!ids.includes('sub-t5'),'seen done hides like idle');
+  // A top-level agent whose done was seen reads as idle too.
+  all.find(t=>t.address==='t3').turn=5;all.find(t=>t.address==='t3').labels['herdr.seen']='5';
+  const agents=h.api.agents();agents[2].status='done';h.api.agents=()=>agents;
+  assert(!elements(h.render()).map(n=>n.idValue).includes('ag-t3'),'seen top-level done hides');
+  all.find(t=>t.address==='t3').turn=6;
+  assert(elements(h.render()).map(n=>n.idValue).includes('ag-t3'),'new turn makes it unread again');
+});
+
+test('headless done is a filled grey dot in child, top-level and rail rows without changing Active or navigation',()=>{
+  const h=load('vega-sidebar');projectFixture(h);
+  const all=h.api.terminals(),agents=h.api.agents().filter(a=>a.address!=='t4');
+  for(const address of ['t2','t3']) {
+    const term=all.find(t=>t.address===address);
+    term.labels['vega.mode']='headless';term.turn=4;term.labels['herdr.seen']='3';
+    term.parent=address==='t2'?'puck/t1':'t4';
+    agents.find(a=>a.address===address).status='done';
+  }
+  // An unlisted child uses its terminal status, rather than agents().
+  all.push({address:'puck/t5',state:'live',parent:'puck/t1',status:'done',labels:{'vega.mode':'headless'}});
+  h.api.terminals=()=>all;h.api.agents=()=>agents;
+  h.api.theme=()=>({done:'blue',dim:'grey',idle:'idle-grey'});
+  h.mod.init({},h.cx);h.state.set('vega.hide-inactive',true);
+  function dot(tree,id) {
+    const row=elements(tree).find(n=>n.idValue===id);assert(row,id);
+    assert(elements(row).some(n=>n.bgValue==='grey'),`${id}: filled grey`);
+    assert(!elements(row).some(n=>n.bgValue==='blue'),`${id}: no blue news`);
+  }
+  let tree=h.render();
+  for(const id of ['sub-t2','sub-puck/t5','ag-t3'])dot(tree,id);
+  assert.equal(h.mod.topStatus(agents.find(a=>a.address==='t3')),'done');
+  assert.deepEqual(Array.from(h.calls.filter(c=>c[0]==='order').at(-1)[1]),['puck/t1','t2','t3']);
+  h.api.layout=()=>({id:'sidebar',size:{px:76}});
+  tree=h.render();for(const id of ['ag-t2','ag-puck/t5','ag-t3'])dot(tree,id);
+});
+
+test('handed-done colour requires a live parent and excludes headed sessions and UACs; other looks stay unchanged',()=>{
+  const h=load('vega-sidebar'),t={done:'blue',dim:'grey',idle:'idle-grey',working:'amber',blocked:'red'};
+  const parent={address:'puck/t1',state:'live'};
+  const child={address:'t2',parent:parent.address,labels:{'vega.mode':'headless'}};
+  h.mod.vegaTerminals=new Map([[parent.address,parent],[child.address,child]]);
+  const dot=()=>h.mod.status(t,{address:child.address,status:'done'},true);
+  assert.equal(dot().bgValue,'grey');
+  for(const mode of ['headed',undefined]) {
+    child.labels['vega.mode']=mode;assert.equal(dot().bgValue,'blue');
+  }
+  child.labels['vega.mode']='headless';
+  for(const role of ['uac','uber']) {
+    child.labels['vega.role']=role;assert.equal(dot().bgValue,'blue');
+  }
+  delete child.labels['vega.role'];
+  parent.state='exited';assert.equal(dot().bgValue,'blue');
+  h.mod.vegaTerminals.delete(parent.address);assert.equal(dot().bgValue,'blue');
+  h.mod.vegaTerminals.set(parent.address,{...parent,state:'live'});
+  const idle=h.mod.status(t,{address:child.address,status:'idle'},true);
+  assert.equal(idle.border_colorValue,'idle-grey');assert(!Object.hasOwn(idle,'bgValue'));
+  const working=h.mod.status(t,{address:child.address,status:'working'},true);
+  assert.equal(working.bgValue,'amber');assert(!Object.hasOwn(working,'spinValue'));
+  const blocked=h.mod.status(t,{address:child.address,status:'blocked'},true);
+  assert.deepEqual(blocked.items,['!']);assert.equal(blocked.text_colorValue,'red');
+});
+
+test('profile window terminals never enter sidebar agent, plain or child rows',()=>{
+  const h=load('vega-sidebar');
+  h.mod.init({},h.cx);
+  const regular={address:'t1',state:'live',foreground:{},labels:{'vega.project-id':'repo','vega.role':'uac'}};
+  const status={address:'ganymede/t2',state:'live',parent:'t1',foreground:{},labels:{'vega.window':'status','vega.project-id':'repo'}};
+  h.api.terminals=()=>[regular,status];
+  h.api.agents=()=>[{address:'t1',status:'working'}, {address:'ganymede/t2',status:'working'}];
+  h.render();
+  assert(!h.mod.vegaTerminals.has('ganymede/t2'));
+  assert(!h.mod.plainTerminals.some(t=>t.address==='ganymede/t2'));
+  assert(!h.mod.listed.has('ganymede/t2'));
+  assert.deepEqual(Array.from(vm.runInContext('visibleTerminals()',h.api),t=>t.address),['t1']);
+  assert(!h.calls.filter(c=>c[0]==='order').flatMap(c=>c[1]).includes('ganymede/t2'));
+});
+
+test('profile tab bar clicks and keyboard navigate layout groups without touching core tabs', async () => {
+  // Load the small local helper into the same fake host as the view.
+  const helper = fs.readFileSync(new URL('../config/herdr-app/mods/vega-window-tabs/navigation.js', import.meta.url), 'utf8').replaceAll('export function', 'function');
+  const h = load('vega-window-tabs');
+  vm.runInContext(helper, h.api);
+  const stack = {id:'profile:tabs', active:'proteus', children:[{id:'proteus'}, {id:'ganymede'}, {id:'tokens'}]};
+  h.api.layout = () => ({id:'root', children:[stack]});
+  h.api.run = (command, args) => {
+    h.calls.push(['run',command,args]);
+    assert.equal(command,'layout.select');
+    assert.equal(args.stack,'profile:tabs');
+    stack.active=args.child;
+  };
+  h.mod.init({},h.cx);
+  const key = async command => {
+    assert.equal(h.commands.length,1);
+    h.commands.shift()(command);
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  await key('prev'); assert.equal(stack.active,'tokens');
+  await key('next'); assert.equal(stack.active,'proteus');
+  await key('select-2'); assert.equal(stack.active,'ganymede');
+  await key('select-9'); assert.equal(stack.active,'ganymede');
+  const bar=h.render();
+  assert.equal(bar.items.length,3);
+  bar.items[0].items[2].handlers.on_mouse_up({},h.cx); assert.equal(stack.active,'tokens');
+  assert.equal(bar.items[0].items[2].items[0].items[0],'tokens');
+  stack.children=[];
+  await key('next'); assert.equal(stack.active,'tokens');
+});
+
+test('profile tabs rename inline, reorder, close and choose a machine through argv', async () => {
+  const h = load('vega-window-tabs', {allowFocus:true});
+  vm.runInContext(fs.readFileSync(new URL('../config/herdr-app/mods/vega-window-tabs/navigation.js', import.meta.url),'utf8').replaceAll('export function','function'), h.api);
+  h.setProps({profile:'status', titles:{a:'Alpha'}});
+  h.api.layout=()=>({id:'profile:tabs',active:'a',children:[{id:'a'},{id:'b'}]});
+  h.mod.init({},h.cx);
+  let tabs=h.render().items[0].items;
+  assert.equal(tabs[0].items[0].handlers.on_click,undefined,'passive title must not create a nested click hit target');
+  tabs[0].handlers.on_mouse_down({click_count:2},h.cx);
+  assert.equal(h.mod.input.value(),'Alpha');
+  h.mod.input.set_value('My tab');
+  h.mod.input.handlers.submit({},h.cx); await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec' && JSON.stringify(c[2])===JSON.stringify(['window','rename','status','a','My tab'])));
+  tabs=h.render().items[0].items;
+  tabs[0].handlers.on_mouse_down({},h.cx);
+  tabs[1].handlers.on_mouse_up({},h.cx); await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec' && JSON.stringify(c[2])===JSON.stringify(['window','move','status','a','2'])));
+  tabs[0].items[1].handlers.on_click({},h.cx); await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec' && c[2][1]==='close'));
+  h.render().items[1].handlers.on_click({},h.cx);
+  assert.equal(h.calls.find(c=>c[0]==='open')[1].props.mode,'add');
+  const picker=load('vega-window-tabs');
+  picker.setProps({profile:'status',mode:'add',overlay:'picker'});
+  picker.api.machines=()=>[{name:null},{name:'remote'},{name:'temporary',temporary:true}];
+  picker.mod.init({},picker.cx);
+  const choices=picker.render().items[1].items;
+  assert.equal(choices.length,2);
+  choices[1].handlers.on_click({},picker.cx); await picker.flush();
+  assert(picker.calls.some(c=>c[0]==='exec' && JSON.stringify(c[2])===JSON.stringify(['window','add','status','--machine','remote'])));
+  assert(picker.calls.some(c=>c[0]==='close' && c[1]==='picker'));
+});
+
+test('profile config dialog displays a diff, promotes to the build checkout (picker fallback) and reports failures', async () => {
+  const h=load('vega-window-tabs');
+  h.setProps({profile:'status',mode:'config',overlay:'config'});
+  h.api.exec=async (_bin,args)=>{h.calls.push(['exec',args]);return {code:0,stdout:JSON.stringify({diff:'--- repo\n+++ effective\n@@ -1 +1 @@\n-title = "Old"\n+title = "New"\n'})};};
+  h.api.pickFolder=async ()=>'/checkout with spaces';
+  h.mod.init({},h.cx); await h.flush();
+  assert.equal(h.mod.rows.length,3);
+  assert.equal(h.mod.rows[1].kind,'-');
+  assert.equal(h.mod.rows[2].text,'title = "New"');
+  assert(elements(h.render()).some(n=>n.idValue==='changes-diff'),'stock virtualized diff viewport');
+  h.render().items[2].items[0].handlers.on_click({},h.cx); await h.flush(); await h.flush();
+  assert(h.calls.some(c=>JSON.stringify(c[1])===JSON.stringify(['window','promote','status'])),'saves to the build checkout first');
+  assert(!h.calls.some(c=>c[1]?.includes('--repo')),'no folder picker when the checkout is known');
+  const ok=h.api.exec;
+  h.api.exec=async (_bin,args)=>{h.calls.push(['exec',args]);return args.includes('--repo')?{code:0,stdout:''}:{code:1,stdout:'error: no vega checkout known; pass --repo <checkout>'};};
+  h.render().items[2].items[0].handlers.on_click({},h.cx); await h.flush(); await h.flush(); await h.flush();
+  assert(h.calls.some(c=>JSON.stringify(c[1])===JSON.stringify(['window','promote','status','--repo','/checkout with spaces'])),'picker fallback');
+  h.api.exec=ok;
+  h.api.exec=async ()=>({code:1,stdout:'error: profile busy'});
+  h.render().items[2].items[1].handlers.on_click({},h.cx); await h.flush();
+  assert(h.mod.error.includes('profile busy'));
+  assert.equal(h.mod.busy,false);
+});
+
+test('stock profile tab gestures use full order, survive renders and cancel on the bar', async () => {
+  const h=load('vega-window-tabs');
+  const stack={id:'profile:tabs',active:'a',children:[{id:'a'},{id:'b'},{id:'c'}]};
+  h.setProps({profile:'status',order:['a','missing','b','c']});
+  h.api.layout=()=>stack;
+  h.mod.init({},h.cx);
+  let bar=h.render();
+  bar.items[0].items[0].handlers.on_mouse_down({click_count:1},h.cx);
+  assert.equal(h.mod.editing,null,'single press is selection/drag, not rename');
+  bar=h.render();
+  bar.items[0].items[2].handlers.on_mouse_up({},h.cx);
+  bar.handlers.on_mouse_up({},h.cx);
+  await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec' && JSON.stringify(c[2])===JSON.stringify(['window','move','status','a','4'])));
+  bar.items[0].items[2].handlers.on_mouse_down({},h.cx);
+  bar.items[0].items[0].handlers.on_mouse_up({},h.cx); await h.flush();
+  assert(h.calls.some(c=>c[0]==='exec' && JSON.stringify(c[2])===JSON.stringify(['window','move','status','c','1'])));
+  const moves=h.calls.filter(c=>c[0]==='exec').length;
+  bar.items[0].items[0].handlers.on_mouse_down({},h.cx);
+  bar.handlers.on_mouse_up({},h.cx);
+  bar.items[0].items[1].handlers.on_mouse_up({},h.cx); await h.flush();
+  assert.equal(h.calls.filter(c=>c[0]==='exec').length,moves,'release on background cancels drag');
+  assert.equal(h.calls.at(-1)[1],'layout.select');
+  assert(h.calls.some(c=>c[0]==='scroll' && c[1]===0));
+  stack.children=[];
+  assert(elements(h.render()).some(n=>n.idValue==='tab-new'));
+  assert(elements(h.render()).some(n=>n.idValue==='config'));
+});
+
+test('profile bar keeps stock window controls and reads program icons from slot terminals', () => {
+  const h=load('vega-window-tabs');
+  h.api.window=()=>({buttons:true,platform:'windows',maximized:true});
+  h.api.layout=()=>({id:'profile:tabs',active:'a',children:[{id:'a',children:[{content:{terminal:'remote/t7'}}]}]});
+  h.api.terminals=()=>[{address:'remote/t7',program:{name:'Shell',icon:'shell.svg',tint:true}}];
+  h.mod.init({},h.cx);
+  const nodes=elements(h.render());
+  for(const id of ['minimize','maximize','close-window']) nodes.find(n=>n.idValue===id).handlers.on_click({},h.cx);
+  assert.deepEqual(h.calls.filter(c=>c[0]==='run').map(c=>c[1]),['window.minimize','window.maximize','window.close']);
+  assert.equal(nodes.find(n=>n.idValue==='tab-a').items.length,3,'icon, title, active close');
+});
+
+test('stock diff rows number hunks and config reset refreshes to a definitive empty state', async () => {
+  const h=load('vega-window-tabs');
+  const rows=h.api.diffRows(['@@ -3,2 +7,2 @@','-old','+new',' context','@@ -20 +30 @@','+\tvalue']);
+  assert.deepEqual(Array.from(rows,r=>r.number),[undefined,3,7,8,undefined,30]);
+  assert.equal(rows[5].text,'    value');
+  h.setProps({profile:'status',mode:'config'});
+  let changed=true;
+  h.api.exec=async (_bin,args)=>{
+    if(args[1]==='reset') changed=false;
+    return {code:0,stdout:JSON.stringify({diff:changed?'@@ -1 +1 @@\n-old\n+new\n':''})};
+  };
+  h.mod.init({},h.cx); await h.flush();
+  assert.equal(h.mod.rows.length,3);
+  elements(h.render()).find(n=>n.idValue==='reset').handlers.on_click({},h.cx);
+  await h.flush(); await h.flush();
+  assert.equal(h.mod.rows.length,0);
+  assert(elements(h.render()).some(n=>n.items.includes('No local changes')));
+});
+
+
+test('services attributes by machine and ancestry before cwd, with UAC project grouping',()=>{
+  const h=load('vega-services');
+  const attribute=vm.runInContext('attribute',h.api);
+  const spaces=[{id:'ganymede/s1',name:'UAC'},{id:'ganymede/s2',name:'Worktree'}];
+  const terms=[{address:'ganymede/t1',state:'live',pid:10,labels:{'herdr.space':'s1','vega.role':'uac','vega.project-id':'spellkave'},foreground:{cwd:'/repo'}},
+    {address:'ganymede/t2',state:'live',pid:20,labels:{'herdr.space':'s2'},foreground:{cwd:'/repo/wt'}},
+    {address:'t3',state:'live',pid:30,labels:{'herdr.space':'s1'}}];
+  const snapshot={home:'/home/me',parents:{100:10},cwds:{100:'/repo/wt',200:'/repo/wt/src',300:'/outside'},
+    listeners:[100,200,300].map(pid=>({pid,port:5187,host:'127.0.0.1',name:'node'}))};
+  const rows=attribute(snapshot,'ganymede',terms,spaces,[]);
+  assert.equal(rows.length,2); assert.equal(rows[0].space,'ganymede/s1');
+  assert.equal(rows[0].project,'spellkave'); assert.equal(rows[1].space,'ganymede/s2');
+  assert.equal(attribute(snapshot,null,terms,spaces,[]).length,0);
+  terms.push({...terms[1],address:'ganymede/t4',labels:{'herdr.space':'s1'}});
+  assert.equal(attribute(snapshot,'ganymede',terms,spaces,[]).length,1,'ambiguous cwd omitted');
+});
+
+test('services owns forward lifecycle and refuses puck and unknown targets',async()=>{
+  const h=load('vega-services');
+  // Avoid initialization reads; every host call below is fake.
+  Object.assign(h.mod,{rows:[],errors:[],forwards:new Map(),pending:new Set(),owner:'test',next:0,targets:new Map([['ganymede','ganymede'],['puck','puck']]),helper:'/temp/helper.py'});
+  const row={key:'service',machine:'ganymede',port:5187,host:'127.0.0.1'};
+  h.api.exec=async(...args)=>{h.calls.push(args);return {code:0,stdout:'{"local":40518}'};};
+  h.mod.toggle(row,h.cx);h.mod.toggle(row,h.cx);await h.flush();
+  assert.equal(h.mod.forwards.get(row.key).local,40518); assert.equal(h.calls.length,1);
+  assert.deepEqual(Array.from(h.calls[0][1]).slice(1),['start','test','1','ganymede','127.0.0.1','5187']);
+  h.mod.toggle(row,h.cx);await h.flush();assert.equal(h.mod.forwards.size,0);
+  h.mod.toggle({...row,machine:'puck'},h.cx);await h.flush();assert.equal(h.calls.length,2);
+  h.mod.targets.set('ganymede','unknown');h.mod.toggle(row,h.cx);await h.flush();assert.equal(h.calls.length,2);
+  await h.mod.close();assert.equal(h.calls.at(-1)[1][1],'close');
+  h.mod.toggle(row,h.cx);await h.flush();assert.equal(h.calls.length,3);
+});
+
+test('registered bundle forwards all ports in one action and stops its one master',async()=>{
+  const h=load('vega-services');
+  Object.assign(h.mod,{rows:[],errors:[],forwards:new Map(),pending:new Set(),owner:'test',next:0,targets:new Map([['ganymede','ganymede']])});
+  const row={key:'bundle',machine:'ganymede',port:5320,host:'127.0.0.1',registered:true,also_forward:[8367]};
+  h.mod.call=async(action,args)=>{h.calls.push([action,Array.from(args)]);return {local:5320};};
+  h.mod.toggle(row,h.cx);await h.flush();
+  assert.deepEqual(h.calls[0],['start',['1','ganymede','127.0.0.1','5320','same','8367']]);
+  const dependency={...row,key:'world',port:8367,also_forward:[]};
+  assert.equal(h.mod.forwardFor(dependency).local,8367,'separate registered dependency shows its bundled forward');
+  h.mod.toggle(dependency,h.cx);await h.flush();
+  assert.deepEqual(h.calls[1],['stop',['1']]);assert.equal(h.mod.forwards.size,0);
+});
+
+test('services refresh renders fake snapshots and opens the forwarded URL',async()=>{
+  const h=load('vega-services');
+  let scans=0;
+  h.api.appHome=()=>'/temporary-home/herdr-app';
+  h.api.readTextFile=async()=> 'fake script';
+  h.api.hc=async()=>({code:0,stdout:JSON.stringify({machines:[{name:'ganymede',target:'ganymede'},{name:'puck',target:'puck'},{name:'io',target:'io',via:['ssh']}]})});
+  h.api.spaces=()=>[{id:'ganymede/s1',name:'Spire',machine:'ganymede'}];
+  h.api.terminals=()=>[{address:'ganymede/t1',state:'live',pid:10,labels:{'herdr.space':'s1','vega.project-id':'spellkave','vega.role':'uac'}}];
+  h.api.focused=()=>({terminal:'ganymede/t1',space:'ganymede/s1'});
+  h.api.window=()=>({platform:'macos'});
+  h.api.exec=async(...args)=>{
+    h.calls.push(args);
+    if(args[1][0]==='-c') { scans++; return {code:0,stdout:JSON.stringify({listeners:[{pid:100,port:5187,name:'spire',host:'127.0.0.1',scheme:'http'}],parents:{100:10},cwds:{},home:'/temporary-home'})}; }
+    if(args[1][1]==='status') return {code:0,stdout:'{"alive":true}'};
+    return {code:0,stdout:'{"local":40518}'};
+  };
+  h.mod.init({},h.cx);await h.flush();
+  assert.equal(scans,1);assert.equal(h.mod.rows[0].project,'spellkave');
+  assert.equal(h.mod.targets.has('io'),false,'command transport cannot forward');
+  const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
+  const row=h.mod.rows[0];
+  nodes(h.render()).find(n=>n.idValue===`address-${row.key}`).handlers.on_click({},h.cx);await h.flush();
+  assert.equal(h.calls.at(-1)[0],'open-url');assert.equal(h.calls.at(-1)[1],'http://127.0.0.1:40518');
+  h.mod.refresh(h.cx);await h.flush();assert.equal(scans,2);assert.equal(h.mod.forwards.size,1);
+  h.api.exec=async(...args)=>({code:0,stdout:args[1][0]==='-c'?'{"listeners":[],"parents":{},"cwds":{}}':'{"alive":true}'});
+  h.mod.refresh(h.cx);await h.flush();assert(h.mod.rows[0].gone);h.render();
+  h.api.exec=async()=>({code:0,stdout:'{"alive":false}'});
+  h.api.spaces=()=>[];h.mod.refresh(h.cx);await h.flush();assert.equal(h.mod.forwards.size,0);
+  h.render();
+});
+
+test('services follows project focus across machines; only a live focused uber sees all',()=>{
+  const h=load('vega-services');
+  const term=(address,space,project,role,parent)=>({address,state:'live',parent,labels:{'herdr.space':space,'vega.project-id':project,'vega.role':role}});
+  const terms=[term('t1','s1','org/a','uac'),term('ganymede/t1','s1','org/a','uac'),
+    term('t2','s2','org/b','uac'),term('t3','s1','stale','sentinel'),
+    term('t4','s4',null,'sentinel','t1'),term('uber','su','org/a','uber')];
+  let focus={terminal:'t1',space:'s1'};
+  h.api.terminals=()=>terms;h.api.focused=()=>focus;
+  Object.assign(h.mod,{errors:[],forwards:new Map(),pending:new Set(),targets:new Map(),rows:[
+    {key:'a-local',project:'org/a',space:'s1',host:'127.0.0.1',port:80},
+    {key:'a-remote',project:'org/a',space:'ganymede/s1',machine:'ganymede',host:'127.0.0.1',port:80},
+    {key:'b',project:'org/b',space:'s2',host:'127.0.0.1',port:80},
+    {key:'other',project:'Other spaces',space:'s3',host:'127.0.0.1',port:80}]});
+  const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
+  const shown=()=>nodes(h.render()).filter(n=>typeof n.idValue==='string'&&n.idValue.startsWith('address-')).map(n=>n.idValue);
+  assert.deepEqual(shown(),['address-a-local','address-a-remote']);
+  focus={terminal:'t2',space:'s2'};assert.deepEqual(shown(),['address-b']);
+  focus={terminal:'t3',space:'s1'};assert.equal(shown().length,2,'UAC space wins stale sentinel project');
+  focus={terminal:'t4',space:'s4'};assert.equal(shown().length,2,'unlabelled child inherits ancestor');
+  focus={space:'ganymede/s1'};assert.equal(shown().length,2,'space context while panel has focus');
+  focus=null;assert.equal(shown().length,0);
+  focus={terminal:'uber'};assert.equal(shown().length,4);
+  terms.at(-1).state='exited';assert.equal(shown().length,0,'stale uber cannot enable estate view');
+  const selected=vm.runInContext('selectedProject',h.api);
+  terms.push(term('t5','s5','else/a','uac'),{address:'legacy',state:'live',labels:{'vega.project':'a'}});
+  assert.equal(selected({terminal:'legacy'},terms).project,null,'ambiguous short project stays unresolved');
+  terms.at(-1).labels['vega.project']='b';
+  assert.equal(selected({terminal:'legacy'},terms).project,'org/b');
+  assert.equal(h.calls.length,0,'render does not execute, focus, notify or start timers');
+});
+
+test('services URL clicks await one forward, preserve HTTPS path, copy puck and non-web addresses',async()=>{
+  const h=load('vega-services');
+  Object.assign(h.mod,{errors:[],forwards:new Map(),pending:new Set(),next:0,targets:new Map([['ganymede','ganymede'],['puck','puck']])});
+  const remote={key:'r',machine:'ganymede',host:'::1',port:8443,url:'https://[::1]:8443/path?q=1#part'};
+  let finish;
+  h.mod.call=async(action,args)=>{h.calls.push([action,args]);return new Promise(resolve=>{finish=resolve;});};
+  h.mod.activate(remote,h.cx);h.mod.activate(remote,h.cx);
+  assert.equal(h.calls.length,1);assert.equal(h.calls[0][0],'start');
+  assert(!h.calls.some(c=>c[0]==='open-url'));
+  finish({local:40518});await h.flush();
+  assert.equal(h.calls.at(-1)[1],'https://127.0.0.1:40518/path?q=1#part');
+  h.mod.activate(remote,h.cx);await h.flush();assert.equal(h.calls.filter(c=>c[0]==='start').length,1,'reuse does not stop or restart');
+  const local={...remote,key:'local',machine:null,url:'http://[::1]:8443/'};
+  h.mod.activate(local,h.cx);assert.deepEqual(h.calls.at(-1),['open-url',local.url]);
+  for(const row of [{...remote,machine:'puck'}, {...remote,machine:'unknown'},
+    {...remote,url:null,scheme:'tcp'}, {...local,url:null,address:'/tmp/service.sock'}]) {
+    const before=h.calls.length;
+    h.mod.activate(row,h.cx);await h.flush();
+    assert.equal(h.calls.length,before+2);
+    assert.equal(h.calls[before][0],'clipboard');
+    assert.equal(h.calls[before+1][0],'toast');
+    assert.equal(h.calls[before+1][1].timeout,1800);
+  }
+  h.mod.call=async()=>{throw new Error('SSH unavailable');};
+  const before=h.calls.length;h.mod.activate({...remote,key:'failure'},h.cx);await h.flush();
+  assert.equal(h.calls.length,before);assert.match(h.mod.errors[0],/SSH unavailable/);
+  let complete;
+  h.mod.call=async action=>action==='start'?new Promise(resolve=>{complete=resolve;}):{};
+  h.mod.activate({...remote,key:'closing'},h.cx);await h.mod.close();complete({local:40519});await h.flush();
+  assert.equal(h.calls.length,before,'closing an in-flight click never opens');
+  assert.equal(h.mod.forwards.has('closing'),false);
+});
+
+test('registered 5320/8367 survive failed attribution and PID restart with correct forward state',()=>{
+  const h=load('vega-services');
+  const attribute=vm.runInContext('attribute',h.api);
+  const snapshot={parents:{},cwds:{},listeners:[
+    {pid:31560,port:5320,host:'127.0.0.1',name:'node',registered:true,title:'Classic app (local Elven Mini)',scheme:'http'},
+    {pid:20931,port:8367,host:'127.0.0.1',name:'node',registered:true,title:'Classic world node',scheme:'tcp'}]};
+  const rows=attribute(snapshot,'ganymede',[],[],[]);
+  assert.equal(rows.length,2);
+  Object.assign(h.mod,{rows,errors:[],forwards:new Map(),pending:new Set(),targets:new Map([['ganymede','ganymede']])});
+  let text=JSON.stringify(h.render());
+  assert(text.includes('Classic app (local Elven Mini) :5320'));
+  assert(text.includes('Classic world node :8367'));
+  assert(text.includes('Running · ganymede')); assert(!text.includes('Stop"'));
+  h.mod.forwards.set(rows[0].key,{local:40518});
+  snapshot.listeners[0].pid=999;
+  h.mod.rows=attribute(snapshot,'ganymede',[],[],[]);
+  assert.equal(h.mod.rows[0].key,rows[0].key);
+  text=JSON.stringify(h.render());
+  assert(text.includes('Forwarded · ganymede')); assert(text.includes('Local forward → ganymede:5320'));
+  assert(text.includes('http://127.0.0.1:40518')); assert(!text.includes('stopped'));
+  h.mod.rows[1].gone=true;
+  text=JSON.stringify(h.render());
+  assert(text.includes('Stopped · ganymede'));
+  h.mod.forwards.clear();
+  assert(!JSON.stringify(h.render()).includes('Stop"'));
+});
+
+test('services displays registered metadata and toggles hidden agent ports without rescanning',()=>{
+  const h=load('vega-services');
+  const attribute=vm.runInContext('attribute',h.api);
+  const terms=[{address:'t1',state:'live',pid:10,labels:{'herdr.space':'s1','vega.project-id':'spellkave','vega.role':'uac'}}];
+  const spaces=[{id:'s1',name:'Spire'}];
+  const snapshot={home:'/temp',parents:{100:10,101:10,102:10},cwds:{},listeners:[
+    {pid:100,port:5187,host:'127.0.0.1',name:'node',title:'Spire',description:'Evidence browser',url:'https://127.0.0.1:5187/path?q=a#hash',agent:true},
+    {pid:101,port:5000,host:'127.0.0.1',name:'codex',agent:true},
+    {pid:102,port:8080,host:'127.0.0.1',name:'vite',agent:false}]};
+  Object.assign(h.mod,{rows:attribute(snapshot,null,terms,spaces,[]),errors:[],forwards:new Map(),pending:new Set(),targets:new Map(),showAgentPorts:false});
+  h.api.terminals=()=>terms;
+  h.api.focused=()=>({terminal:'t1',space:'s1'});
+  const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
+  let text=JSON.stringify(h.render());
+  assert(text.includes('Spire :5187')); assert(text.includes('Evidence browser'));
+  assert(text.includes('https://127.0.0.1:5187/path?q=a#hash'));
+  assert(text.includes('vite :8080')); assert(!text.includes('codex :5000'));
+  const toggle=nodes(h.render()).find(n=>n.idValue==='agent-ports');
+  toggle.handlers.on_click({},h.cx);
+  assert.equal(h.mod.showAgentPorts,true);
+  assert(JSON.stringify(h.render()).includes('codex :5000'));
+  assert.equal(h.calls.length,0,'filter changes do not scan or forward');
+  toggle.handlers.on_click({},h.cx);
+  assert(!JSON.stringify(h.render()).includes('codex :5000'));
 });

@@ -1,4 +1,4 @@
-//! Units against a temp HOME with fake herdr, chezmoi and vega-skills.
+//! Units against a temp HOME with fake chezmoi and vega-skills.
 
 use super::*;
 use std::os::unix::fs::symlink;
@@ -10,14 +10,15 @@ fn script(d: &Path, name: &str, body: &str) -> PathBuf {
     bin
 }
 
-/// A HOME with claude, codex and pi set up, no chezmoi, a passing herdr.
+/// A HOME with claude, codex and pi set up, no chezmoi, no herdr-app.
 fn setup() -> (tempfile::TempDir, Ctx) {
     let d = tempfile::tempdir().unwrap();
     let home = d.path().join("home");
     for dir in [".claude", ".codex", ".pi/agent", ".config"] {
         fs::create_dir_all(home.join(dir)).unwrap();
     }
-    let herdr = herdr::tests::fake_herdr(d.path());
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    script(&home.join(".local/bin"), "dcg", "echo 0.16.0");
     let skills = script(
         d.path(),
         "vega-skills",
@@ -36,7 +37,6 @@ fn setup() -> (tempfile::TempDir, Ctx) {
     let ctx = Ctx {
         env: Env::at(&home),
         chezmoi: d.path().join("no-chezmoi").into_os_string(),
-        herdr: herdr.into_os_string(),
         herdr_app: d.path().join("no-herdr-app").into_os_string(),
         mux: PathBuf::from("/opt/vega/bin/vega-mux"),
         skills: skills.into_os_string(),
@@ -129,15 +129,17 @@ fn select_takes_units_and_groups_in_order() {
     let s = |n: &[&str]| select(&n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
     assert_eq!(s(&[]).unwrap().len(), Unit::ALL.len());
     assert_eq!(
-        s(&["hooks", "herdr", "claude.hooks"]).unwrap(),
+        s(&["hooks", "claude.hooks"]).unwrap(),
         [
-            Unit::Herdr,
             Unit::ClaudeHooks,
+            Unit::ClaudeDcg,
             Unit::CodexHooks,
-            Unit::PiPrefix
+            Unit::PiPrefix,
+            Unit::PiDcg
         ]
     );
-    assert!(s(&["nope"]).unwrap_err().contains("known: herdr"));
+    assert!(s(&["herdr"]).is_err());
+    assert!(s(&["nope"]).unwrap_err().contains("known: dcg.config"));
     assert!(
         GROUPS[1].1.iter().all(|u| !u.personal()),
         "hooks are not personal"
@@ -146,7 +148,9 @@ fn select_takes_units_and_groups_in_order() {
 
 #[test]
 fn fresh_home_gets_everything_then_nothing_changes() {
-    let (_d, ctx) = setup();
+    let (d, mut ctx) = setup();
+    // Profile homes now include a navigation mod; validate only through a fake.
+    ctx.herdr_app = fake_app(d.path());
     fs::write(
         ctx.env.home.join(".pi/agent/settings.json"),
         "{\"theme\": \"x\"}",
@@ -154,7 +158,6 @@ fn fresh_home_gets_everything_then_nothing_changes() {
     .unwrap();
     let all = apply_all(&ctx);
     for u in [
-        Unit::Herdr,
         Unit::ClaudeMd,
         Unit::CodexMd,
         Unit::PiMd,
@@ -187,7 +190,9 @@ fn fresh_home_gets_everything_then_nothing_changes() {
     assert!(ctx.env.home.join(".claude/output-styles/ELI5.md").is_file());
     let settings: Value = serde_json::from_str(&read(&ctx, ".claude/settings.json")).unwrap();
     assert_eq!(settings["outputStyle"], "Caveman ELI5");
-    assert!(settings.get("hooks").is_none());
+    assert!(merge::is_dcg_command(
+        &settings["hooks"]["PreToolUse"][0]["hooks"][0]
+    ));
     let s: Value = serde_json::from_str(&read(
         &ctx,
         ".local/share/vega/claude-marketplace/plugins/vega-hooks/hooks/hooks.json",
@@ -366,7 +371,9 @@ fn settings_merge_keeps_tool_state_and_local_seeds() {
     );
     let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(v["outputStyle"], "Concise");
-    assert!(v.get("hooks").is_none());
+    assert!(merge::is_dcg_command(
+        &v["hooks"]["PreToolUse"][0]["hooks"][0]
+    ));
     assert_eq!(v["enabledPlugins"]["vega-hooks@vega-local"], true);
     // A file that does not parse stays untouched.
     fs::write(&path, "not json").unwrap();
@@ -457,62 +464,6 @@ fn skills_report_missing_warn_on_overlap_and_sync() {
 }
 
 #[test]
-fn herdr_rejected_keeps_the_old_file() {
-    let (_d, ctx) = setup();
-    let local = sources::local_dir(&ctx.env).join("herdr");
-    fs::create_dir_all(&local).unwrap();
-    fs::write(local.join("config.toml"), "BAD = 1\n").unwrap();
-    let path = herdr::path(&ctx.env);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, "old = true\n").unwrap();
-    assert_eq!(
-        apply(&ctx, Unit::Herdr, &BTreeSet::new()),
-        Outcome::Rejected(vec!["bad key BAD".into()])
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), "old = true\n");
-    assert!(!backup_path(&path).exists());
-    // Without herdr: skipped, nothing written.
-    let mut ctx = ctx;
-    ctx.herdr = "/nonexistent/herdr".into();
-    fs::remove_file(local.join("config.toml")).unwrap();
-    assert_eq!(
-        apply(&ctx, Unit::Herdr, &BTreeSet::new()),
-        Outcome::Skipped("herdr not installed".into())
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), "old = true\n");
-}
-
-#[test]
-fn herdr_written_with_backup_and_reload() {
-    let (d, ctx) = setup();
-    let path = herdr::path(&ctx.env);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, "[ui]\nagent_panel_sort = \"recent\"\n").unwrap();
-    let p = plan(&ctx, Unit::Herdr).unwrap();
-    assert_eq!(
-        p.notes,
-        ["kept: ui.agent_panel_sort = recent (herdr owns it)"]
-    );
-    let out = apply(&ctx, Unit::Herdr, &BTreeSet::new());
-    assert_eq!(
-        out,
-        Outcome::Written(vec![path.display().to_string(), "reload ok".into()])
-    );
-    assert!(fs::read_to_string(&path)
-        .unwrap()
-        .contains("agent_panel_sort = \"recent\""));
-    assert_eq!(
-        fs::read_to_string(backup_path(&path)).unwrap(),
-        "[ui]\nagent_panel_sort = \"recent\"\n"
-    );
-    assert_eq!(
-        fs::read_to_string(d.path().join("calls")).unwrap(),
-        "config check\nserver reload-config\n"
-    );
-    assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 2);
-}
-
-#[test]
 fn evidence_attributes_repair_and_source_change_without_values_and_refreshes_backup() {
     let (_d, ctx) = setup();
     let src = sources::init(&ctx.env, "claude/settings.json").unwrap();
@@ -527,16 +478,28 @@ fn evidence_attributes_repair_and_source_change_without_values_and_refreshes_bac
     let (out, first) = apply_report(&ctx, Unit::ClaudeSettings, &BTreeSet::new());
     assert_eq!(out.kind(), "written");
     assert_eq!(fs::read_to_string(backup_path(&target)).unwrap(), before);
-    assert_eq!(first["writes"][0]["keys"][0]["key"], "/outputStyle");
-    assert_eq!(first["writes"][0]["keys"][0]["operation"], "changed");
-    assert_eq!(first["writes"][0]["keys"][0]["source_changed"], true);
+    let first_key = first["writes"][0]["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "/outputStyle")
+        .unwrap();
+    assert_eq!(first_key["key"], "/outputStyle");
+    assert_eq!(first_key["operation"], "changed");
+    assert_eq!(first_key["source_changed"], true);
     let repaired = r#"{"env":{"TOKEN":"USER_SECRET"}}"#;
     fs::write(&target, repaired).unwrap();
     let (_, second) = apply_report(&ctx, Unit::ClaudeSettings, &BTreeSet::new());
     assert_eq!(fs::read_to_string(backup_path(&target)).unwrap(), repaired);
-    assert_eq!(second["writes"][0]["keys"][0]["operation"], "added");
-    assert_eq!(second["writes"][0]["keys"][0]["reason"], "missing_key");
-    assert_eq!(second["writes"][0]["keys"][0]["source_changed"], false);
+    let second_key = second["writes"][0]["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["key"] == "/outputStyle")
+        .unwrap();
+    assert_eq!(second_key["operation"], "added");
+    assert_eq!(second_key["reason"], "missing_key");
+    assert_eq!(second_key["source_changed"], false);
     assert!(second["at_unix_ms"].as_u64().unwrap() >= first["at_unix_ms"].as_u64().unwrap());
     let text = fs::read_to_string(evidence::path(&ctx.env)).unwrap();
     let events: Vec<Value> = serde_json::from_str(&text).unwrap();
@@ -797,6 +760,11 @@ fn herdr_app_units_skip_write_seed_and_reject() {
         Unit::HerdrAppKeys,
         Unit::HerdrAppSettings,
         Unit::HerdrAppThemes,
+        Unit::HerdrAppProfiles,
+        Unit::HerdrAppWindowTabs,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
     ] {
         assert!(
             matches!(outcome(&all, u), Outcome::Skipped(r) if r.contains("herdr-app")),
@@ -1022,8 +990,29 @@ fn app_layout_selects_once_via_supported_command_and_rejects_false_success() {
         Unit::HerdrAppMods,
         Unit::HerdrAppSidebar,
         Unit::HerdrAppInbox,
+        Unit::HerdrAppWindowTabs,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
     ] {
         assert_eq!(apply(&ctx, unit, &managed).kind(), "written");
+    }
+    assert_eq!(
+        fs::read_to_string(home.join("mods/vega-sidebar/pin.svg")).unwrap(),
+        sources::default("herdr-app/mods/vega-sidebar/pin.svg").unwrap()
+    );
+    for file in [
+        "main.js",
+        "mod.json",
+        "navigation.js",
+        "tabs.js",
+        "diff.js",
+        "changes.svg",
+    ] {
+        assert_eq!(
+            fs::read_to_string(home.join("mods/vega-window-tabs").join(file)).unwrap(),
+            sources::default(&format!("herdr-app/mods/vega-window-tabs/{file}")).unwrap()
+        );
     }
     fs::write(home.join("offline"), "").unwrap();
     assert!(matches!(
@@ -1072,6 +1061,10 @@ fn app_selected_layout_update_reverifies_and_restores_on_false_success() {
         Unit::HerdrAppMods,
         Unit::HerdrAppSidebar,
         Unit::HerdrAppInbox,
+        Unit::HerdrAppWindowTabs,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
     ] {
         assert_eq!(apply(&ctx, unit, &managed).kind(), "written");
     }
@@ -1161,6 +1154,10 @@ fn app_layout_drift_and_unit_dependency_order_are_visible() {
     let selected = select(&["herdr-app".into()]).unwrap();
     let index = |u| selected.iter().position(|v| *v == u).unwrap();
     assert!(index(Unit::HerdrAppMods) < index(Unit::HerdrAppLayouts));
+    assert!(index(Unit::HerdrAppWindowTabs) < index(Unit::HerdrAppSidebar));
+    assert!(index(Unit::HerdrAppTabs) < index(Unit::HerdrAppLayouts));
+    assert!(index(Unit::HerdrAppPane) < index(Unit::HerdrAppLayouts));
+    assert!(index(Unit::HerdrAppServices) < index(Unit::HerdrAppLayouts));
     assert!(index(Unit::HerdrAppLayouts) < index(Unit::HerdrAppSettings));
 }
 
@@ -1176,6 +1173,10 @@ fn app_first_layout_apply_retries_fresh_mod_discovery() {
         Unit::HerdrAppMods,
         Unit::HerdrAppSidebar,
         Unit::HerdrAppInbox,
+        Unit::HerdrAppWindowTabs,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
     ] {
         assert_eq!(apply(&ctx, unit, &managed).kind(), "written");
     }
@@ -1200,6 +1201,10 @@ fn app_layout_mod_discovery_retry_is_bounded_and_rolls_back() {
         Unit::HerdrAppMods,
         Unit::HerdrAppSidebar,
         Unit::HerdrAppInbox,
+        Unit::HerdrAppWindowTabs,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
     ] {
         assert_eq!(apply(&ctx, unit, &managed).kind(), "written");
     }
@@ -1212,4 +1217,176 @@ fn app_layout_mod_discovery_retry_is_bounded_and_rolls_back() {
     assert!(started.elapsed() < std::time::Duration::from_secs(15));
     assert!(!home.join("layouts/vega.json").exists());
     assert!(!home.join("selected").exists());
+}
+
+#[test]
+fn dcg_hooks_preserve_mixed_entries_and_pi_source_is_managed() {
+    let (_d, ctx) = setup();
+    let original = serde_json::json!({"hooks": {"PreToolUse": [{"matcher":"Bash", "hooks":[
+        {"type":"command","command":"/old/dcg"},
+        {"type":"command","command":"other-guard"}
+    ]}, {"matcher":"Read", "hooks":[]}]}, "other":true});
+    for (unit, rel) in [
+        (Unit::ClaudeSettings, ".claude/settings.json"),
+        (Unit::CodexHooks, ".codex/hooks.json"),
+    ] {
+        fs::write(ctx.env.home.join(rel), original.to_string()).unwrap();
+        assert_eq!(apply(&ctx, unit, &BTreeSet::new()).kind(), "written");
+        let value: Value = serde_json::from_str(&read(&ctx, rel)).unwrap();
+        assert_eq!(value["other"], true);
+        let entries = value["hooks"]["PreToolUse"].as_array().unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e["matcher"] == "Read" && e["hooks"].as_array().unwrap().is_empty()));
+        assert!(entries
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "other-guard"));
+        assert_eq!(
+            entries
+                .iter()
+                .flat_map(|e| e["hooks"].as_array().unwrap())
+                .filter(|h| merge::is_dcg_command(h))
+                .count(),
+            1
+        );
+        assert_eq!(apply(&ctx, unit, &BTreeSet::new()), Outcome::Unchanged);
+        // A canonical hook alongside a stale duplicate must still be repaired.
+        let mut duplicate = value.clone();
+        duplicate["hooks"]["PreToolUse"].as_array_mut().unwrap().push(
+            serde_json::json!({"matcher":"Bash", "hooks":[{"type":"command","command":"/stale/dcg"}]}));
+        fs::write(ctx.env.home.join(rel), duplicate.to_string()).unwrap();
+        assert_eq!(apply(&ctx, unit, &BTreeSet::new()).kind(), "written");
+        let repaired: Value = serde_json::from_str(&read(&ctx, rel)).unwrap();
+        assert_eq!(repaired, value);
+    }
+    assert_eq!(apply(&ctx, Unit::PiDcg, &BTreeSet::new()).kind(), "written");
+    assert_eq!(
+        read(&ctx, ".pi/agent/extensions/dcg-guard.ts"),
+        sources::default("pi/extensions/dcg-guard.ts").unwrap()
+    );
+    let local = sources::init(&ctx.env, "pi/extensions/dcg-guard.ts").unwrap();
+    fs::write(local, "// local guard\n").unwrap();
+    assert_eq!(apply(&ctx, Unit::PiDcg, &BTreeSet::new()).kind(), "written");
+    assert_eq!(
+        read(&ctx, ".pi/agent/extensions/dcg-guard.ts"),
+        "// local guard\n"
+    );
+}
+
+#[test]
+fn dcg_guard_units_wait_for_the_pinned_binary() {
+    for present in [false, true] {
+        let (_d, ctx) = setup();
+        let binary = ctx.env.home.join(".local/bin/dcg");
+        if present {
+            // A present file without execute permission is not an installed guard.
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o644)).unwrap();
+        } else {
+            fs::remove_file(&binary).unwrap();
+        }
+        assert!(!dcg_installed(&ctx.env));
+        // Unavailable guards must not even read a broken local hook source.
+        let local = sources::init(&ctx.env, "dcg/hook.json").unwrap();
+        fs::write(local, "invalid JSON").unwrap();
+        for (unit, rel) in [
+            (Unit::ClaudeSettings, ".claude/settings.json"),
+            (Unit::CodexHooks, ".codex/hooks.json"),
+        ] {
+            let p = plan(&ctx, unit).unwrap();
+            assert!(p.notes.iter().any(|n| n == DCG_NOT_INSTALLED));
+            assert!(!p.sources.iter().any(|s| s.rel == "dcg/hook.json"));
+            assert_eq!(apply(&ctx, unit, &BTreeSet::new()).kind(), "written");
+            let value: Value = serde_json::from_str(&read(&ctx, rel)).unwrap();
+            let dcg_commands = value["hooks"]["PreToolUse"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e["hooks"].as_array())
+                .flatten()
+                .filter(|h| merge::is_dcg_command(h))
+                .count();
+            assert_eq!(dcg_commands, 0);
+            if unit == Unit::ClaudeSettings {
+                assert_eq!(value["outputStyle"], "Caveman ELI5");
+            } else {
+                assert_eq!(
+                    value["hooks"]["PreToolUse"][0]["matcher"],
+                    merge::CODEX_TOOL
+                );
+            }
+        }
+        let p = plan(&ctx, Unit::PiDcg).unwrap();
+        assert_eq!(p.skip.as_deref(), Some(DCG_NOT_INSTALLED));
+        assert!(p.files.is_empty());
+        assert_eq!(
+            apply(&ctx, Unit::PiDcg, &BTreeSet::new()),
+            Outcome::Skipped(DCG_NOT_INSTALLED.into())
+        );
+        assert!(!ctx
+            .env
+            .home
+            .join(".pi/agent/extensions/dcg-guard.ts")
+            .exists());
+    }
+}
+
+#[test]
+fn removing_dcg_cleans_up_only_managed_guards_and_retains_backups() {
+    let (_d, ctx) = setup();
+    let settings = ctx.env.home.join(".claude/settings.json");
+    fs::write(&settings, r#"{"outputStyle":"keep local preference","hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"other-guard"}]}]}}"#).unwrap();
+    let units = [Unit::ClaudeDcg, Unit::CodexHooks, Unit::PiDcg];
+    for unit in units {
+        assert_eq!(apply(&ctx, unit, &BTreeSet::new()).kind(), "written");
+    }
+    let settings_with_hook = read(&ctx, ".claude/settings.json");
+    let value: Value = serde_json::from_str(&settings_with_hook).unwrap();
+    assert_eq!(value["outputStyle"], "keep local preference");
+    let extension = ctx.env.home.join(".pi/agent/extensions/dcg-guard.ts");
+    let original = fs::read_to_string(&extension).unwrap();
+    fs::remove_file(ctx.env.home.join(".local/bin/dcg")).unwrap();
+    for unit in units {
+        let (outcome, event) = apply_report(&ctx, unit, &BTreeSet::new());
+        assert_eq!(outcome.kind(), "written");
+        if unit == Unit::PiDcg {
+            assert_eq!(event["writes"][0]["operation"], "removed");
+            assert_eq!(event["writes"][0]["after"], "absent");
+        }
+    }
+    assert!(!extension.exists());
+    assert_eq!(
+        fs::read_to_string(backup_path(&extension)).unwrap(),
+        original
+    );
+    assert_eq!(
+        read(&ctx, ".claude/settings.json.vega-bak"),
+        settings_with_hook
+    );
+    let value: Value = serde_json::from_str(&read(&ctx, ".claude/settings.json")).unwrap();
+    assert_eq!(value["outputStyle"], "keep local preference");
+    assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "other-guard"
+    );
+    let value: Value = serde_json::from_str(&read(&ctx, ".codex/hooks.json")).unwrap();
+    assert_eq!(value["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        value["hooks"]["PreToolUse"][0]["matcher"],
+        merge::CODEX_TOOL
+    );
+    // Cleanup is idempotent, and a user-owned extension is never deleted.
+    assert_eq!(
+        apply(&ctx, Unit::PiDcg, &BTreeSet::new()),
+        Outcome::Skipped(DCG_NOT_INSTALLED.into())
+    );
+    fs::write(&extension, "// user-owned guard\n").unwrap();
+    assert_eq!(
+        apply(&ctx, Unit::PiDcg, &BTreeSet::new()),
+        Outcome::Skipped(DCG_NOT_INSTALLED.into())
+    );
+    assert_eq!(
+        fs::read_to_string(&extension).unwrap(),
+        "// user-owned guard\n"
+    );
 }

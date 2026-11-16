@@ -13,14 +13,32 @@ all other outcomes mean `unknown`. Only state transitions are logged, without co
 
 The worker keeps `{state, since, at}` in `keychain-local.json` under vegad's state directory
 (`$XDG_STATE_HOME/vega`, default `~/.local/state/vega`). `since` changes only when the state changes
-and survives daemon restarts. The registry reconcile publishes that value as `<host>.keychain`,
+and survives daemon restarts. The registry reconcile publishes that value as `<host>.status.keychain`,
 like `<host>.theme`; non-macOS hosts never publish a keychain entry. The normal host registry ACL
-covers it. Restricted inbox-only hosts do not reconcile/publish this entry.
+covers it. Restricted inbox-only hosts do not reconcile or write the registry. Instead, vegad sends
+`vega.cmd.<control>.keychain.<host>` on a state change and every 60 seconds, independently of theme
+fetches. The destination is `control` in theme.toml (default proteus). Failures are logged once per
+state transition while the local probe continues.
+
+The private receiving vegad takes the sender from the broker-authenticated command subject and
+accepts only inbox-only senders. Payloads must be JSON objects of at most 256 bytes, containing
+exactly `{state, since, at}`: state is locked/unlocked/unknown, timestamps are positive integers,
+`since <= at`, and `at` is at most 180 seconds old or 30 seconds in the future. Arrays, duplicate
+fields and extra fields are rejected. A fresh JetStream publish/ack writes only the derived
+`<sender>.status.keychain` key, without forwarding any caller headers. Replies must be inside the
+sender's `_INBOX_<sender>.>` prefix; arbitrary reply subjects are rejected without publishing.
+Rejections are logged by the command dispatcher, without payloads.
+This reply-prefix check applies to every command kind and to quarantine, before handler
+execution, registry writes, peer delivery or note storage. Missing or foreign reply subjects
+receive no reply: even a denial response could launder the receiver's `allow_responses`
+permission into another inbox, registry key or JetStream API. Supported clients already use
+host-specific inbox prefixes; no rendered authorization change is needed.
 
 After a successful reconcile vegad atomically writes `keychains.json` in the same directory:
 `{at, local, rows: [{host, state, since, at}]}`. This is a small local projection of the registry
-view, used by the app mod without per-host `hc exec` calls. Hosts with stale beats or samples
-older than 180 seconds remain in the projection as `unknown`; the app also ages out a snapshot
+view, used by the app mod without per-host `hc exec` calls. Samples use their own `at` and do not
+require a host beat (inbox-only hosts have none). Samples older than 180 seconds remain in the
+projection as `unknown`; the app also ages out a snapshot
 older than 180 seconds when vegad or the broker stops. Cache write errors do not fail reconciliation.
 
 Only the UI offers unlock, in a dedicated hc terminal after the Slayer presses Enter. Neither
@@ -153,7 +171,7 @@ What herdr 0.9.3 offers and what we use:
 |---|---|
 | `events.subscribe` (socket, NDJSON stream) | Yes: `pane.agent_status_changed`, `pane.closed`, `pane.exited`, `pane.created`. One stream per vegad. On `events_lost`, resubscribe and resync with `session.snapshot`. |
 | `pane.report_metadata` (`tokens`, `ttl_ms`, `source`) | Yes: a mail-count token per agent pane for the sidebar. Needs a sidebar row template that shows the token; verify. |
-| `notification.show` | Yes, through `vega_herdr::notes::notify`: the toast plus a note for the board list (Notifications). Draft and lost-draft notices today. |
+| `notification.show` | Yes, through `vega_herdr::notes::notify`: the toast plus a note for the inbox list (Notifications). Draft and lost-draft notices today. |
 | `agent.prompt` / `pane.send_text` | Yes, the one way to reach the agent: the pointer line. |
 | plugin `[[startup]]` | Yes: `relay start` starts vegad detached if it does not run, then exits. The hook stays one-shot; vegad is not its child (see Lifecycle). |
 | plugin `[[events]] on = ...` | No: it spawns a process per event; the stream in vegad is cheaper and keeps state. |
@@ -178,7 +196,7 @@ The socket client uses socket2 for a portable connect deadline on Unix sockets.
 
 ## Lifecycle (vega-lhc.54)
 
-vegad needs starting, not supervising. herdr, the real-home herdr-app and the board can start it;
+vegad needs starting, not supervising. herdr and the real-home herdr-app can start it;
 it upgrades itself in place. No login job starts it (amendment vega-0h4c.42; the LaunchAgent and
 systemd unit of vega-0h4c.25 are gone, and a corp Mac without GUI login could not load one). The
 app host owns startup, like the hc core: the herdr-app vega mod runs `vega-post relay start`
@@ -189,8 +207,7 @@ machine: at start, when a machine turns connected, then every five minutes. The 
 it takes the lock. A failed start retries after one minute; the status line shows
 `hc <machine> vegad start failed` after three failures in a row, and nothing blocks the UI.
 The lock arbitrates simultaneous starts. `relay stop` on a machine holds at most five minutes
-while the app host runs; on the app host itself it holds until the next app start, herdr hook or
-board start.
+while the app host runs; on the app host itself it holds until the next app start, herdr hook or explicit relay start.
 
 `relay install` pins `vegad.env`, links the herdr TUI hook and starts vegad. It writes no login
 job and removes `vega.vegad-start.plist` / `vega-vegad-start.service` left by an earlier install
@@ -220,8 +237,6 @@ plugin pane is no host either: a PTY, closed by the user, gone after a server re
   must stop any app/core explicitly started for a probe. There is no login job.
 - herdr: plugin `vega.vegad` (written and linked by `relay install`) runs `vega-post relay start`
   as its `[[startup]]` hook, at every server start and again on every live handoff.
-- The board: it shows vegad's state (running, pid, version, binary current or stale) and `V`
-  starts it.
 - By hand: `vega post relay start`.
 - Not as a side effect of other commands: a `vega post send` that starts a daemon hides where it
   runs and with which env. `vega mux send` already falls back to a direct paste.
@@ -266,8 +281,8 @@ still-installed unit see the same process. The new image reads the handoff only 
 own and it is younger than 60 s, then deletes it. Connections (NATS, herdr) are made fresh, with a
 mail rescan as at any start. Agent statuses come back with the first snapshot; the wake memory is
 already on disk. If exec fails (a broken binary), vegad logs it and keeps running the old image
-until the file changes again; a binary that execs but then crashes leaves no vegad, which the board
-shows as stopped (`V` starts it). `cargo install` replaces by rename (new inode); an in-place copy
+until the file changes again; a binary that execs but then crashes leaves no vegad, which `vega post relay status`
+shows as stopped (`vega post relay start` starts it). `cargo install` replaces by rename (new inode); an in-place copy
 changes size or mtime. On macOS the first launch of a new file takes a few seconds (seen: 5 s).
 
 **Migration.** `relay install` (the user runs it once per host): stops and removes the launchd
@@ -341,11 +356,42 @@ identity and stay off.
 - Local delivery: tool mail for a pane on this host (today only the upgrade proposal) is typed as one line,
   `[<tool>] <text>` with the lines joined by ` | ` (a multi-line paste can stay staged in Claude's input),
   when the agent is `idle`/`done`, behind the draft guard. A closed pane drops its mail.
-- A probe connects off the loop, bounded by 10 s, with backoff: after 2 s, then doubling up to every 60 s.
+- A probe connects off the loop, bounded by 60 s, with backoff: after 2 s, then doubling up to every 60 s.
   Once a broker answers, vegad switches to the broker loop and hands it the delivery and supervision state
-  plus undelivered tool mail (published as mail then).
+  plus undelivered tool mail (published as mail then, or delivered locally on inbox-only hosts).
 - A configured broker that is unreachable is noted for the human (below).
 - `--once` still needs a broker.
+
+### Slow broker acknowledgements (vega-0h4c.65)
+
+Titan's HDD can pause the broker for 2–11 s; that delay is accepted. Shared post connection and
+request setup, JetStream contexts (including registry bucket/stream lookup), inbox fetch/show,
+and both archive stall waits use `vega_registry::BROKER_WAIT` (60 s). `cmd` defaults to 60 s;
+an explicit `--timeout` still controls its answer deadline. Inbox fetches use NATS `no_wait`
+without a server expiry and a 60 s client bound, so a partial batch returns promptly too.
+
+`send` and `done` keep the same headers and `Nats-Msg-Id` through retries. Publication has a
+60 s total budget, including queueing, ack waits and 250 ms retry delays; each attempt gets at
+most 20 s, leaving room to retry an ack that was lost after storage. Ack timeouts, broken reply
+pipes and transient broker errors retry with one stderr line per retry. Missing streams,
+message-size errors and sequence/id precondition failures retain their immediate error contract.
+JetStream's default two-minute deduplication window covers the whole publication budget. The
+connect retry window and each setup/read operation have their own 60 s limit; this is not a
+60 s deadline for the entire multi-step command. Background history spooling still bounds each
+publish to 5 s and retains failed receipts for a later round; it does not decide broker health.
+
+Vegad uses the same 60 s call limit and disconnected grace. Ten-second connection pings remain,
+so a dead TCP peer is noticed in about 30 s, followed by a bounded grace period before local
+mode. This tolerates a 10 s pause without an outage note or repeated reconnect setup, while a
+sustained outage still switches to local mode within roughly 1–2 minutes after disconnect is
+observed. Registry rounds retain their 30 s outer limit and background catalog rounds their
+120 s bound. The longer broker wait can delay one broker loop step; it cannot hang it forever.
+
+Tests discard the first publish ack after storing mail in a local JetStream, then verify the
+retry returns sequence 1 with the duplicate flag and exactly one stored message. Another case
+delays an ack for 6 s (past the old default). The outage integration test stops its own broker
+process for 11 s, verifies a waiting archive read succeeds and the relay stays connected, then
+checks genuine outage detection and recovery as before.
 
 ### Broker outage (vega-lhc.205)
 
@@ -354,18 +400,18 @@ labels, no badges. Cause: async-nats bounds a request's answer, not its queueing
 stops reading its command channel (2048 slots); each timed-out count stayed queued there, and once the
 channel was full the next broker call waited forever, taking the single-threaded loop with it. So:
 
-- Every broker call in the broker loop is bounded (`outage::CALL`, 10 s; a registry round 30 s): setup,
+- Every broker call in the broker loop is bounded (`outage::CALL`, 60 s; a registry round 30 s): setup,
   the rescan, each pane's count, bounces, tool mail, command and quarantine replies. The catalog thread's
   rounds are bounded too (120 s).
 - While the client is not `Connected`, the loop makes no broker call: counts, registry, bounces and tool
   mail wait (mail candidates stay pending). The herdr-side work (sidebar metadata, badges, attention,
   wakes, herdr events, the upgrade check, theme) runs on.
-- A broker away for `outage::LOST_AFTER` (10 s) ends the broker loop. The clock starts when the loop
+- A broker away for `outage::LOST_AFTER` (60 s) ends the broker loop. The clock starts when the loop
   next sees the client disconnected. A registry round or bounce in flight is cut short within 0.5 s of
   the disconnect (`while_up`) and the count loop stops at the next pane; any other call in flight (one
-  count, a tool mail, a setup step) ends within `outage::CALL` (10 s). So the switch comes 10 s after the
-  disconnect at best and 20.5 s at worst. vegad logs once
-  `broker: lost (<url> unreachable for 10 s); switching to local mode` and runs local mode with its
+  count, a tool mail, a setup step) ends within `outage::CALL` (60 s). So the switch comes 60 s after the
+  disconnect at best and about 120 s at worst. vegad logs once
+  `broker: lost (<url> unreachable for 60 s); switching to local mode` and runs local mode with its
   state. A broker lost during setup (stream or subscription right after the connect) goes the same way.
   Only a completed setup ends the outage: it writes `connected`, clears the note and resets the probe
   backoff, so a broker that accepts connections but fails the setup keeps the one note and is probed
@@ -395,7 +441,7 @@ channel was full the next broker call waited forever, taking the single-threaded
 ## Security
 
 - Each host writes only its own KV keys and its own sender subjects (as today for mail).
-- deimos is inbox-only (user decision). Cross-host replies use quarantine (Slayer decision
+- puck is inbox-only (user decision). Cross-host replies use quarantine (Slayer decision
   2026-10-12, vega-lhc.83); same-host messages use local herdr delivery (vega-lhc.248).
 
 ### Quarantine (inbox-only replies)
@@ -403,25 +449,30 @@ channel was full the next broker call waited forever, taking the single-threaded
 An inbox-only host may message its own agents through herdr. Cross-host replies require an
 operator pair grant to reach an agent; otherwise they become human notices:
 
-- Broker: `auth-config --inbox-only deimos --quarantine deimos` lets deimos publish only
-  `vega.quarantine.*.*.deimos` (still no `vega.inbox.*`); every other host may subscribe
+- Broker: `auth-config --inbox-only puck --quarantine puck` lets puck publish only
+  `vega.quarantine.*.*.puck` (still no `vega.inbox.*`); every other host may subscribe
   `vega.quarantine.<self>.>` and answers through its existing `allow_responses`. No stream, no
   provisioning.
 - Local send (vega-lhc.248): on a host in the inbox-only list (`VEGA_POST_INBOX_ONLY`, else
-  `$XDG_CONFIG_HOME/vega/inbox-only`, else `deimos` and `puck`), same-host `vega post send` and `done`
+  `$XDG_CONFIG_HOME/vega/inbox-only`, else `puck`), same-host `vega post send` and `done`
   deliver direct herdr prompts with local reply tokens and parent/child supervision. No broker
   access, pair grant or inbox archive is involved. `--uac` resolves open local v2 UAC claims,
   including IDs, aliases and `.`; remote UAC enumeration and `--uber` remain unavailable.
   `vega mux` lists local agents. `--now` also uses this direct local path.
+- Relay tool mail: hygiene, CI, beads sync and upstream upgrade proposals use `deliver_local`
+  even while connected to the broker. They never publish to this host's inbox: the body is typed
+  as one line (capped at 1200 characters) when the pane is free, behind local mode's draft guard. Failed
+  delivery waits for another pass; `bad_pane` is dropped. Pending mail survives broker/local
+  transitions and self-exec. Uber asks and digest generation are skipped without registry rights.
 - Cross-host send: `vega post send --host <other-host> <pane>` and cross-host `done` make a core NATS
   request to `vega.quarantine.<to>.<pane>.<self>` (at most 4 KiB). The target's vegad writes a note
-  (kind `quarantine`, title `deimos (quarantine) to <pane>: ...`, toast plus `vega post notes` and the
-  board) and answers `stored`. Without a live pair grant it never enters delivery or an ask's
+  (kind `quarantine`, title `puck (quarantine) to <pane>: ...`, toast plus `vega post notes` and the
+  inbox) and answers `stored`. Without a live pair grant it never enters delivery or an ask's
   fan-in. No vegad there: `no_responder`, nothing stored. `ask` from such a host is refused.
 - Operator pair grant (vega-lhc.237): on the **receiving** vegad host run
-  `vega uac grant deimos:w15W:p2 proteus:w3V:p1 --expires 2h`. Expiry is mandatory
+  `vega uac grant puck:w15W:p2 proteus:w3V:p1 --expires 2h`. Expiry is mandatory
   (positive integer with `s`, `m`, `h` or `d`); one literal pair per grant, no wildcards.
-  `vega uac revoke deimos:w15W:p2 proteus:w3V:p1` revokes it idempotently; `vega uac grants`
+  `vega uac revoke puck:w15W:p2 proteus:w3V:p1` revokes it idempotently; `vega uac grants`
   and the `vega uac` home view list live, expired and revoked pairs with Unix timestamps.
   Grants live in `$XDG_STATE_HOME/vega/mail-grants` (default `~/.local/state/vega/mail-grants`),
   one atomic JSON file per pair, read for each request: no restart. Use vegad's HOME and
@@ -586,7 +637,7 @@ reported, waiting and held children do not inflate that set.
    `uac claim` and `adopt --machine` across machines; sidebar metadata; the herdr startup hook.
 
 Live on titan after the Slayer applies the regenerated auth config (commands + registry rights,
-`--cmd-grant deimos=vega.cmd.proteus.open.deimos`) and runs `vega post provision registry`; until
+`--cmd-grant puck=vega.cmd.proteus.open.puck`) and runs `vega post provision registry`; until
 then every vegad logs "commands: not served" and "registry: off" and keeps mail and local
 supervision running.
 
@@ -646,7 +697,16 @@ without a fresh beat (90 s) proves nothing; a remote child counts as gone only o
 reconciled 40 s after our record. Inbox-only hosts get no registry rights (decision vega-nic.1), except
 single keys granted read-only with `auth-config --registry-read <host>=<key>` (vega-lhc.90): one
 last-by-subject direct get each, no stream info, put or watch. Such a host's vegad runs no reconcile;
-it reads only `<control>.theme` (theme.md).
+it reads only `<control>.theme` (theme.md). Keychain reporting is the explicit command exception
+(Slayer 2026-11-10, vega-oiwq.1): add `--cmd-grant puck=vega.cmd.proteus.keychain.puck` to titan's
+existing auth-config arguments, keeping puck in `--inbox-only`. This also grants only the named
+private recipient publish on `$KV.VEGA_REGISTRY.puck.status.keychain`; other private hosts receive
+no extra write right. No inbox-only host gets KV publish, stream info, new reads or watch rights.
+Never grant an inbox-only host even one KV subject: NATS authorizes subjects rather than headers,
+and `Nats-Rollup: all` on any allowed key can erase the shared bucket. The relay reconstructs the
+write, ignoring hostile Rollup, KV-Operation and TTL headers. Readers accept only the known
+keychain status key in an inbox-only host's status namespace; unknown status keys are ignored.
+Regenerating and applying titan's authorization is a separate Slayer step.
 
 ## Reachability (vega-lhc.129)
 
@@ -673,7 +733,7 @@ machines ganymede saved) for "proteus is offline". Who is reachable is vega post
   When a pane closes, vegad asks the broker how many of its mails are unread and confirms herdr no
   longer lists it (a restarting herdr may report every pane gone), then mails each sender of the
   unread ones once, as `tool vega-post` without a reply path, with the same hint. Mail from the user
-  without a pane (the board) becomes a note on this host; tool mail is not bounced. In local mode
+  without a pane (the inbox) becomes a note on this host; tool mail is not bounced. In local mode
   (no broker) bounces wait for the broker (Broker outage, above).
 - **By role**: `vega post send --uac <project> "<text>"` reads beats, agents and UAC registrations
   of every host (one read) and mails the one live UAC: a registration on a fresh host whose pane its
@@ -710,7 +770,7 @@ neither is available. These are relay observations, not broker counts: expired
 metadata cannot prove an empty inbox. Use `vega post log --pane <pane>` on the
 owning host to inspect broker read status without acknowledging mail.
 herdr renders `$name` tokens
-only where the sidebar rows name them. Snippet for `~/.config/herdr/config.toml` (rendered from `herdr/config.toml` by `vega config`, [config.md](config.md)):
+only where the sidebar rows name them. Snippet for `~/.config/herdr/config.toml` (host-managed on legacy herdr hosts; vega no longer renders this file):
 
 ```toml
 [ui.sidebar.agents]
@@ -793,18 +853,18 @@ Request handling remains on the existing dispatch path pending a separate extrac
 ## Notifications
 
 herdr keeps one toast and no history, so vega keeps its own (vega-pqr). The model is macOS: the
-herdr toast is the banner, `vega board`'s Inbox (`N`) the list, the UAC pane's name the badge.
+herdr toast is the banner, the herdr-app inbox's Inbox (`N`) the list, the UAC pane's name the badge.
 
 - Writer: `vega_herdr::notes::notify` shows the toast and writes a note to this host's store
   (`$XDG_STATE_HOME/vega/notes/<id>.json`, id = Unix ms; 7 days, at most 200, except open asks). vegad uses it for
   draft and lost-draft notices; other events can follow.
 - Store: local state is the truth, as for agents. vegad reconciles the notes into the registry as
   `<host>.note.<id>` and deletes pruned ones; no auth change, each host writes only its keys. An
-  inbox-only host (deimos) has no registry rights: its notes stay in the local store, which
+  inbox-only host (puck) has no registry rights: its notes stay in the local store, which
   `vega post notes` reads the same way.
 - Read state: per viewing host, a watermark per source host (last id read, last id cleared) in
   `notes/seen.json`, published as `<viewer>.notes.seen.<source>`. `vega post notes read|clear`
-  moves it; the board runs `read` for what it showed when the list opens, `clear` on `c`.
+  moves it; the herdr-app inbox invokes these commands for read/clear actions.
 - Badge: vegad counts this host's unread notes plus the other hosts' unread ones (the registry read
   fetches only the bodies of notes above the viewer's watermark) and shows them as the email badge on
   the UAC pane (see Badges). vegad redraws at once when the notes directory changes, so opening the
@@ -830,7 +890,7 @@ The UAC pane's sidebar name (`--display-agent`) is `<atom> UAC` plus a badge per
 this order, one space after every symbol, e.g. `\u{F0768} UAC \u{F01EE} 1 \u{F05D1} 2 \u{F256} 3`. The
 symbols come from `[symbols]` in `~/.config/vega/theme.toml` ([theme-symbols.md](theme-symbols.md):
 set `nerd` by default or `emoji`, `☢️ UAC 🔔 1 🗳️ 2 ✋ 3`, plus per-topic overrides).
-`vega_herdr::theme` reads them, `vega_herdr::badges` formats the label; the board uses both. vegad
+`vega_herdr::theme` reads them, `vega_herdr::badges` formats the label; the inbox consumes the saved badge data. vegad
 re-reads the file on every label refresh and logs its mistakes once per change. With the label it
 reports the sidebar tokens `$uac`, `$notes`, `$decisions` and `$waiting` (a zero badge cleared), which
 a herdr `[ui.sidebar.agents]` row colours from `[symbols.colors]` ([theme-symbols.md](theme-symbols.md),
@@ -840,7 +900,7 @@ Colours and herdr sidebar tokens).
 |---|---|---|---|
 | UAC marker | md atom U+F0768 | ☢️ U+2622 U+FE0F | - |
 | notes | md email U+F01EE | 🔔 U+1F514 | unread, unresolved notes of every host for the project; host-level ones on the vega UAC (Notifications) |
-| decisions | md scale_balance U+F05D1 | 🗳️ U+1F5F3 U+FE0F | open `slayer-decision` children of the project's one open `uac-tracker` epic, as `vega board`'s decisions view counts them |
+| decisions | md scale_balance U+F05D1 | 🗳️ U+1F5F3 U+FE0F | open `slayer-decision` children of the project's one open `uac-tracker` epic, as the herdr-app inbox's decisions view counts them |
 | waiting | fa hand_paper_o U+F256 | ✋ U+270B | this host's headed sentinels of the project whose attention is asking, silent or input: the rows `vega uac` marks `for the user` |
 
 - Decisions: one `bd list --label-any uac-tracker,slayer-decision --json` per project, with the bd and
@@ -849,9 +909,7 @@ Colours and herdr sidebar tokens).
   last count.
 - Waiting: local panes only (vegad knows remote panes' mode and attention only through their host).
 - vegad saves each project's counts to `$XDG_STATE_HOME/vega/badges/v2/<hex(ProjectId)>.json` every 15 s;
-  `vega board` reads them for its top bar (stale after 60 s: no badges while vegad is down).
-- Without a UAC pane on the host, the open board panes (terminal title `vega-board-*`) get
-  `vega board` plus the badges of their project.
+  the herdr-app inbox reads them for its top bar (stale after 60 s: no badges while vegad is down).
 
 ## CI watch
 
@@ -864,7 +922,7 @@ sentinel. See [ci-watch.md](ci-watch.md).
 A separate thread on the configured polling host (default proteus) runs pdc every 15 min.
 It reads committed service mappings from locally known projects, resolves their UACs through
 the registry on any host, and sends incident/status mail plus four-hour reminders. Unmapped
-services, duplicate ownership or no live UAC produce durable board inbox notes. Failures log
+services, duplicate ownership or no live UAC produce durable inbox notes. Failures log
 once without stopping vegad; state survives restarts and delivery is at-least-once. See
 [pagerduty.md](pagerduty.md) for host selection, config and agent rights.
 

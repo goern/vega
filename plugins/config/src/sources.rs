@@ -14,8 +14,7 @@ macro_rules! default {
 }
 
 /// Every embedded default: (path relative to `config/`, text).
-pub const DEFAULTS: [(&str, &str); 28] = [
-    default!("herdr/config.toml"),
+pub const DEFAULTS: [(&str, &str); 63] = [
     default!("instructions/role.md"),
     default!("instructions/interaction.md"),
     default!("instructions/reasoning.md"),
@@ -31,22 +30,57 @@ pub const DEFAULTS: [(&str, &str); 28] = [
     // Read by vega_herdr::capacity (window scopes), not rendered to a target.
     default!("capacity/windows.toml"),
     default!("dcg/config.toml"),
+    default!("dcg/hook.json"),
+    default!("pi/extensions/dcg-guard.ts"),
     default!("dcg/packs/oc.yaml"),
     default!("herdr-app/mods/vega/main.js"),
     default!("herdr-app/mods/vega/mod.json"),
     default!("herdr-app/mods/vega/lock.svg"),
     default!("herdr-app/mods/vega-sidebar/main.js"),
     default!("herdr-app/mods/vega-sidebar/mod.json"),
+    default!("herdr-app/mods/vega-sidebar/pin.svg"),
     default!("herdr-app/mods/vega-inbox/main.js"),
     default!("herdr-app/mods/vega-inbox/mod.json"),
+    default!("herdr-app/mods/vega-tabs/UPSTREAM.md"),
+    default!("herdr-app/mods/vega-tabs/main.js"),
+    default!("herdr-app/mods/vega-tabs/mod.json"),
+    default!("herdr-app/mods/vega-tabs/win-close.svg"),
+    default!("herdr-app/mods/vega-tabs/win-max.svg"),
+    default!("herdr-app/mods/vega-tabs/win-min.svg"),
+    default!("herdr-app/mods/vega-tabs/win-restore.svg"),
+    default!("herdr-app/mods/vega-services/main.js"),
+    default!("herdr-app/mods/vega-services/model.js"),
+    default!("herdr-app/mods/vega-services/helper.py"),
+    default!("herdr-app/mods/vega-services/mod.json"),
+    default!("herdr-app/mods/vega-services/UPSTREAM.md"),
+    default!("herdr-app/mods/vega-pane/UPSTREAM.md"),
+    default!("herdr-app/mods/vega-pane/close.svg"),
+    default!("herdr-app/mods/vega-pane/main.js"),
+    default!("herdr-app/mods/vega-pane/mod.json"),
+    default!("herdr-app/mods/vega-pane/split-down.svg"),
+    default!("herdr-app/mods/vega-pane/split-right.svg"),
+    default!("herdr-app/mods/vega-pane/unzoom.svg"),
+    default!("herdr-app/mods/vega-pane/zoom.svg"),
     default!("herdr-app/layouts/vega.json"),
+    default!("herdr-app/layouts/status.json"),
+    default!("herdr-app/mods/vega-window-tabs/main.js"),
+    default!("herdr-app/mods/vega-window-tabs/navigation.js"),
+    default!("herdr-app/mods/vega-window-tabs/mod.json"),
+    default!("herdr-app/mods/vega-window-tabs/tabs.js"),
+    default!("herdr-app/mods/vega-window-tabs/diff.js"),
+    default!("herdr-app/mods/vega-window-tabs/UPSTREAM.md"),
+    default!("herdr-app/mods/vega-window-tabs/changes.svg"),
+    default!("herdr-app/mods/vega-window-tabs/win-min.svg"),
+    default!("herdr-app/mods/vega-window-tabs/win-max.svg"),
+    default!("herdr-app/mods/vega-window-tabs/win-close.svg"),
+    default!("herdr-app/mods/vega-window-tabs/win-restore.svg"),
+    default!("herdr-app/profiles/status.toml"),
     default!("herdr-app/keys.json"),
     default!("herdr-app/settings.json"),
     default!("herdr-app/themes/catppuccin-latte.json"),
     default!("herdr-app/themes/catppuccin-mocha.json"),
 ];
 
-pub const HERDR: &str = DEFAULTS[0].1;
 pub const STYLES_DIR: &str = "claude/output-styles";
 
 /// Claude's and pi's instruction parts.
@@ -126,7 +160,11 @@ pub fn packs(env: &Env) -> Result<Vec<(String, Source)>, String> {
     directory(env, "dcg/packs", &[".yaml", ".yml"])
 }
 
-fn directory(env: &Env, dir: &str, extensions: &[&str]) -> Result<Vec<(String, Source)>, String> {
+pub(crate) fn directory(
+    env: &Env,
+    dir: &str,
+    extensions: &[&str],
+) -> Result<Vec<(String, Source)>, String> {
     let prefix = format!("{dir}/");
     let mut names: Vec<String> = DEFAULTS
         .iter()
@@ -214,16 +252,20 @@ mod tests {
     fn every_repo_source_is_embedded() {
         let embedded: BTreeSet<String> = DEFAULTS.iter().map(|(r, _)| r.to_string()).collect();
         for dir in [
-            "herdr",
             "instructions",
             "claude/output-styles",
             "agentsview",
             "capacity",
             "dcg/packs",
+            "pi/extensions",
             "herdr-app/themes",
             "herdr-app/mods/vega",
             "herdr-app/mods/vega-sidebar",
             "herdr-app/mods/vega-inbox",
+            "herdr-app/mods/vega-window-tabs",
+            "herdr-app/mods/vega-tabs",
+            "herdr-app/mods/vega-pane",
+            "herdr-app/mods/vega-services",
             "herdr-app/layouts",
         ] {
             for f in repo_files(dir) {

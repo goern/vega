@@ -1,4 +1,4 @@
-//! `vega config`: vega owns the coding agents', herdr's and dcg's config
+//! `vega config`: vega owns the coding agents', herdr-app's and dcg's config
 //! (docs/design/config.md, vega-lhc.107).
 //!
 //! A [`Unit`] is one target file (or a few of one kind) with one ownership
@@ -10,11 +10,12 @@
 mod claude_plugin;
 pub mod evidence;
 pub mod fleet;
-pub mod herdr;
 pub mod herdr_app;
 pub mod infra;
 pub mod merge;
+pub mod profiles;
 pub mod sources;
+pub mod window_overlay;
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -34,7 +35,6 @@ use sources::{Origin, Source};
 pub struct Ctx {
     pub env: Env,
     pub chezmoi: OsString,
-    pub herdr: OsString,
     /// The `herdr-app` that lists its commands.
     pub herdr_app: OsString,
     /// The `vega-mux` the hooks run.
@@ -46,14 +46,13 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    /// This user's context: the installed sibling binaries, chezmoi and herdr from PATH.
+    /// This user's context: the installed sibling binaries, chezmoi and herdr-app from PATH.
     pub fn from_env() -> Option<Ctx> {
         let env = Env::from_env()?;
         Some(Ctx {
             mux: installed(&env.home, "vega-mux"),
             skills: installed(&env.home, "vega-skills").into_os_string(),
             chezmoi: OsString::from("chezmoi"),
-            herdr: OsString::from("herdr"),
             herdr_app: OsString::from("herdr-app"),
             claude: installed(&env.home, "claude").into_os_string(),
             env,
@@ -73,7 +72,6 @@ fn installed(home: &Path, name: &str) -> PathBuf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
-    Herdr,
     DcgConfig,
     DcgPacks,
     ClaudeMd,
@@ -81,9 +79,11 @@ pub enum Unit {
     PiMd,
     ClaudeStyles,
     ClaudeSettings,
+    ClaudeDcg,
     ClaudeHooks,
     CodexHooks,
     PiPrefix,
+    PiDcg,
     Skills,
     Agentsview,
     HerdrAppKeys,
@@ -92,12 +92,16 @@ pub enum Unit {
     HerdrAppMods,
     HerdrAppSidebar,
     HerdrAppInbox,
+    HerdrAppWindowTabs,
+    HerdrAppTabs,
+    HerdrAppPane,
+    HerdrAppServices,
     HerdrAppLayouts,
+    HerdrAppProfiles,
 }
 
 impl Unit {
-    pub const ALL: [Unit; 20] = [
-        Unit::Herdr,
+    pub const ALL: [Unit; 26] = [
         Unit::DcgConfig,
         Unit::DcgPacks,
         Unit::ClaudeMd,
@@ -106,8 +110,10 @@ impl Unit {
         Unit::ClaudeStyles,
         Unit::ClaudeSettings,
         Unit::ClaudeHooks,
+        Unit::ClaudeDcg,
         Unit::CodexHooks,
         Unit::PiPrefix,
+        Unit::PiDcg,
         Unit::Skills,
         Unit::Agentsview,
         Unit::HerdrAppKeys,
@@ -116,15 +122,19 @@ impl Unit {
         Unit::HerdrAppThemes,
         // Install overlay and sidebar before the status mod can open them.
         Unit::HerdrAppInbox,
+        Unit::HerdrAppWindowTabs,
         Unit::HerdrAppSidebar,
         Unit::HerdrAppMods,
+        Unit::HerdrAppTabs,
+        Unit::HerdrAppPane,
+        Unit::HerdrAppServices,
         Unit::HerdrAppLayouts,
+        Unit::HerdrAppProfiles,
         Unit::HerdrAppSettings,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
-            Unit::Herdr => "herdr",
             Unit::DcgConfig => "dcg.config",
             Unit::DcgPacks => "dcg.packs",
             Unit::ClaudeMd => "claude.md",
@@ -132,9 +142,11 @@ impl Unit {
             Unit::PiMd => "pi.md",
             Unit::ClaudeStyles => "claude.styles",
             Unit::ClaudeSettings => "claude.settings",
+            Unit::ClaudeDcg => "claude.dcg",
             Unit::ClaudeHooks => "claude.hooks",
             Unit::CodexHooks => "codex.hooks",
             Unit::PiPrefix => "pi.prefix",
+            Unit::PiDcg => "pi.dcg",
             Unit::Skills => "skills",
             Unit::Agentsview => "agentsview",
             Unit::HerdrAppKeys => "herdr-app.keys",
@@ -143,14 +155,18 @@ impl Unit {
             Unit::HerdrAppMods => "herdr-app.mods",
             Unit::HerdrAppSidebar => "herdr-app.vega-sidebar",
             Unit::HerdrAppInbox => "herdr-app.vega-inbox",
+            Unit::HerdrAppWindowTabs => "herdr-app.vega-window-tabs",
+            Unit::HerdrAppTabs => "herdr-app.vega-tabs",
+            Unit::HerdrAppPane => "herdr-app.vega-pane",
+            Unit::HerdrAppServices => "herdr-app.vega-services",
             Unit::HerdrAppLayouts => "herdr-app.layouts",
+            Unit::HerdrAppProfiles => "herdr-app.profiles",
         }
     }
 
     /// The target, for display.
     pub fn target(self) -> &'static str {
         match self {
-            Unit::Herdr => "~/.config/herdr/config.toml",
             Unit::DcgConfig => "~/.config/dcg/config.toml",
             Unit::DcgPacks => "~/.config/dcg/packs/",
             Unit::ClaudeMd => "~/.claude/CLAUDE.md",
@@ -158,9 +174,11 @@ impl Unit {
             Unit::PiMd => "~/.pi/agent/AGENTS.md",
             Unit::ClaudeStyles => "~/.claude/output-styles/",
             Unit::ClaudeSettings => "~/.claude/settings.json",
+            Unit::ClaudeDcg => "~/.claude/settings.json",
             Unit::ClaudeHooks => "~/.local/share/vega/claude-marketplace/, ~/.claude/settings.json",
             Unit::CodexHooks => "~/.codex/hooks.json",
             Unit::PiPrefix => "~/.pi/agent/settings.json",
+            Unit::PiDcg => "~/.pi/agent/extensions/dcg-guard.ts",
             Unit::Skills => "~/.agents/skills/, ~/.claude/skills/",
             Unit::Agentsview => "*/skills/agentsview-finding-history/LOCAL-SETUP.md",
             Unit::HerdrAppKeys => "~/.config/herdr-app/keys.json",
@@ -169,20 +187,34 @@ impl Unit {
             Unit::HerdrAppMods => "~/.config/herdr-app/mods/vega/",
             Unit::HerdrAppSidebar => "~/.config/herdr-app/mods/vega-sidebar/",
             Unit::HerdrAppInbox => "~/.config/herdr-app/mods/vega-inbox/",
+            Unit::HerdrAppWindowTabs => "~/.config/herdr-app/mods/vega-window-tabs/",
+            Unit::HerdrAppTabs => "~/.config/herdr-app/mods/vega-tabs/",
+            Unit::HerdrAppPane => "~/.config/herdr-app/mods/vega-pane/",
+            Unit::HerdrAppServices => "~/.config/herdr-app/mods/vega-services/",
             Unit::HerdrAppLayouts => "~/.config/herdr-app/layouts/vega.json",
+            Unit::HerdrAppProfiles => "~/.config/herdr-app-<name>/",
         }
     }
 
     pub fn ownership(self) -> &'static str {
         match self {
-            Unit::Herdr => "whole file, herdr keys kept",
             Unit::ClaudeMd | Unit::CodexMd | Unit::PiMd | Unit::Agentsview => "whole file",
-            Unit::DcgConfig | Unit::HerdrAppKeys | Unit::HerdrAppLayouts => "whole file",
-            Unit::HerdrAppMods | Unit::HerdrAppSidebar | Unit::HerdrAppInbox => "whole folder",
+            Unit::DcgConfig
+            | Unit::PiDcg
+            | Unit::HerdrAppKeys
+            | Unit::HerdrAppLayouts
+            | Unit::HerdrAppProfiles => "whole file",
+            Unit::HerdrAppMods
+            | Unit::HerdrAppSidebar
+            | Unit::HerdrAppInbox
+            | Unit::HerdrAppWindowTabs
+            | Unit::HerdrAppTabs
+            | Unit::HerdrAppServices
+            | Unit::HerdrAppPane => "whole folder",
             Unit::DcgPacks | Unit::ClaudeStyles | Unit::HerdrAppThemes => "whole file each",
             Unit::ClaudeSettings | Unit::HerdrAppSettings => "seeded keys",
             Unit::ClaudeHooks => "plugin + legacy hook migration",
-            Unit::CodexHooks | Unit::PiPrefix => "key-merge",
+            Unit::ClaudeDcg | Unit::CodexHooks | Unit::PiPrefix => "key-merge",
             Unit::Skills => "library",
         }
     }
@@ -205,7 +237,12 @@ impl Unit {
                 | Unit::HerdrAppMods
                 | Unit::HerdrAppSidebar
                 | Unit::HerdrAppInbox
+                | Unit::HerdrAppWindowTabs
+                | Unit::HerdrAppTabs
+                | Unit::HerdrAppServices
+                | Unit::HerdrAppPane
                 | Unit::HerdrAppLayouts
+                | Unit::HerdrAppProfiles
         )
     }
 }
@@ -215,7 +252,13 @@ pub const GROUPS: [(&str, &[Unit]); 3] = [
     ("instructions", &[Unit::ClaudeMd, Unit::CodexMd, Unit::PiMd]),
     (
         "hooks",
-        &[Unit::ClaudeHooks, Unit::CodexHooks, Unit::PiPrefix],
+        &[
+            Unit::ClaudeHooks,
+            Unit::ClaudeDcg,
+            Unit::CodexHooks,
+            Unit::PiPrefix,
+            Unit::PiDcg,
+        ],
     ),
     (
         "herdr-app",
@@ -226,7 +269,12 @@ pub const GROUPS: [(&str, &[Unit]); 3] = [
             Unit::HerdrAppMods,
             Unit::HerdrAppSidebar,
             Unit::HerdrAppInbox,
+            Unit::HerdrAppWindowTabs,
+            Unit::HerdrAppTabs,
+            Unit::HerdrAppPane,
+            Unit::HerdrAppServices,
             Unit::HerdrAppLayouts,
+            Unit::HerdrAppProfiles,
         ],
     ),
 ];
@@ -269,10 +317,15 @@ pub struct FilePlan {
     pub text: String,
     /// Key-merge targets are written through a symlink, whole files are not.
     pub follow: bool,
+    /// Remove a managed whole file, preserving its backup.
+    pub remove: bool,
 }
 
 impl FilePlan {
     pub fn changed(&self) -> bool {
+        if self.remove {
+            return self.live.is_some() || self.link;
+        }
         (self.link && !self.follow) || self.live.as_deref() != Some(self.text.as_str())
     }
 }
@@ -325,6 +378,7 @@ fn whole(path: PathBuf, text: String) -> Result<FilePlan, String> {
         link,
         text,
         follow: false,
+        remove: false,
     })
 }
 
@@ -359,6 +413,7 @@ fn json_plan<T>(
             link,
             text,
             follow: true,
+            remove: false,
         },
         out,
     )))
@@ -465,28 +520,6 @@ pub fn plan(ctx: &Ctx, unit: Unit) -> Result<Plan, String> {
             }
             Ok(plan)
         }
-        Unit::Herdr => {
-            let path = herdr::path(env);
-            let src = sources::get(env, "herdr/config.toml")?;
-            let (live, link) = read_live(&path)?;
-            let r = herdr::render(&src.text, &herdr::symbols(env), live.as_deref())?;
-            Ok(Plan {
-                notes: r
-                    .kept
-                    .iter()
-                    .map(|(k, v)| format!("kept: {k} = {v} (herdr owns it)"))
-                    .collect(),
-                files: vec![FilePlan {
-                    path,
-                    live,
-                    link,
-                    text: r.text,
-                    follow: false,
-                }],
-                sources: vec![src],
-                ..Plan::default()
-            })
-        }
         Unit::ClaudeMd => instructions(env, ".claude", "CLAUDE.md", &sources::CLAUDE_PARTS),
         Unit::CodexMd => instructions(env, ".codex", "AGENTS.md", &sources::CODEX_PARTS),
         Unit::PiMd => instructions(env, ".pi/agent", "AGENTS.md", &sources::CLAUDE_PARTS),
@@ -514,16 +547,88 @@ pub fn plan(ctx: &Ctx, unit: Unit) -> Result<Plan, String> {
             )
         }
         Unit::ClaudeHooks => claude_plugin::plan(ctx),
+        Unit::ClaudeDcg => {
+            if let Some(p) = need_dir(env, ".claude") {
+                return Ok(p);
+            }
+            let src = dcg_hook(env, "claude")?;
+            let file = json_plan(home.join(".claude/settings.json"), src.is_some(), |v| {
+                update_dcg_hook(env, v, src.as_ref())
+            })?;
+            let Some((f, _)) = file else {
+                return Ok(Plan::skip(DCG_NOT_INSTALLED));
+            };
+            if src.is_none() && !f.changed() {
+                return Ok(Plan::skip(DCG_NOT_INSTALLED));
+            }
+            Ok(Plan {
+                files: vec![f],
+                notes: if src.is_none() {
+                    vec![DCG_NOT_INSTALLED.into()]
+                } else {
+                    vec![]
+                },
+                sources: src.into_iter().collect(),
+                ..Plan::default()
+            })
+        }
         Unit::CodexHooks => {
             if let Some(p) = need_dir(env, ".codex") {
                 return Ok(p);
             }
+            let src = dcg_hook(env, "codex")?;
             let (f, _) = json_plan(home.join(".codex/hooks.json"), true, |v| {
-                merge::codex_hooks(v, &mux)
+                merge::codex_hooks(v, &mux)?;
+                update_dcg_hook(env, v, src.as_ref())?;
+                Ok(())
             })?
             .expect("created when missing");
             Ok(Plan {
                 files: vec![f],
+                notes: if src.is_none() {
+                    vec![DCG_NOT_INSTALLED.into()]
+                } else {
+                    vec![]
+                },
+                sources: src.into_iter().collect(),
+                ..Plan::default()
+            })
+        }
+        Unit::PiDcg => {
+            if let Some(p) = need_dir(env, ".pi/agent") {
+                return Ok(p);
+            }
+            if !dcg_installed(env) {
+                let path = home.join(".pi/agent/extensions/dcg-guard.ts");
+                let (live, link) = read_live(&path)?;
+                let owned = live.as_ref().is_some_and(|text| {
+                    text.starts_with("// Managed by vega config (pi.dcg);")
+                        || sources::get(env, "pi/extensions/dcg-guard.ts")
+                            .is_ok_and(|s| s.text == *text)
+                });
+                if owned {
+                    return Ok(Plan {
+                        files: vec![FilePlan {
+                            path,
+                            live,
+                            link,
+                            text: String::new(),
+                            follow: false,
+                            remove: true,
+                        }],
+                        notes: vec![DCG_NOT_INSTALLED.into()],
+                        ..Plan::default()
+                    });
+                }
+                return Ok(Plan::skip(DCG_NOT_INSTALLED));
+            }
+            let src = sources::get(env, "pi/extensions/dcg-guard.ts")?;
+            Ok(Plan {
+                files: vec![whole(
+                    home.join(".pi/agent/extensions/dcg-guard.ts"),
+                    src.text.clone(),
+                )?],
+                sources: vec![src],
                 ..Plan::default()
             })
         }
@@ -584,9 +689,14 @@ pub fn plan(ctx: &Ctx, unit: Unit) -> Result<Plan, String> {
             plan.sources.push(src);
             Ok(plan)
         }
+        Unit::HerdrAppProfiles => profiles::plan(ctx),
         Unit::HerdrAppMods
         | Unit::HerdrAppSidebar
         | Unit::HerdrAppInbox
+        | Unit::HerdrAppWindowTabs
+        | Unit::HerdrAppTabs
+        | Unit::HerdrAppServices
+        | Unit::HerdrAppPane
         | Unit::HerdrAppLayouts => herdr_app::plan(ctx, unit),
         Unit::HerdrAppKeys => {
             if let Some(p) = need_herdr_app(env) {
@@ -630,8 +740,58 @@ pub fn plan(ctx: &Ctx, unit: Unit) -> Result<Plan, String> {
     }
 }
 
-/// A seeded-keys plan: the top-level keys of the source `rel`, set in `path`
-/// when missing or when their source value changed since the last apply.
+const DCG_NOT_INSTALLED: &str = "dcg not installed (scripts/install-dcg.py)";
+
+fn dcg_installed(env: &Env) -> bool {
+    env.home
+        .join(".local/bin/dcg")
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+fn update_dcg_hook(
+    env: &Env,
+    root: &mut Value,
+    source: Option<&sources::Source>,
+) -> Result<bool, String> {
+    match source {
+        Some(src) => merge::dcg_hook(
+            root,
+            serde_json::from_str(&src.text).map_err(|e| e.to_string())?,
+        ),
+        None => Ok(merge::remove_dcg_hook(
+            root,
+            &env.home.join(".local/bin/dcg"),
+        )),
+    }
+}
+
+/// Shared, locally overridable PreToolUse entry, only when its pinned binary exists.
+fn dcg_hook(env: &Env, agent: &str) -> Result<Option<sources::Source>, String> {
+    if !dcg_installed(env) {
+        return Ok(None);
+    }
+    let mut src = sources::get(env, "dcg/hook.json")?;
+    let path = env.home.join(".local/bin/dcg").display().to_string();
+    let command = if path.contains([' ', '\'']) {
+        format!("'{}'", path.replace('\'', "'\"'\"'"))
+    } else {
+        path
+    };
+    src.text = src
+        .text
+        .replace("\"@DCG@\"", &serde_json::to_string(&command).unwrap());
+    let entries: Value =
+        serde_json::from_str(&src.text).map_err(|e| format!("{}: {e}", src.rel))?;
+    let entry = entries
+        .get(agent)
+        .filter(|v| v.is_object())
+        .ok_or_else(|| format!("{}: missing {agent} hook entry", src.rel))?;
+    src.text = serde_json::to_string(entry).unwrap();
+    Ok(Some(src))
+}
+
+/// A seeded-keys plan, plus the separately owned dcg hook in Claude settings.
 fn seeded(env: &Env, unit: Unit, rel: &str, path: PathBuf) -> Result<Plan, String> {
     let src = sources::get(env, rel)?;
     let seeds = match serde_json::from_str::<Value>(&src.text) {
@@ -639,10 +799,21 @@ fn seeded(env: &Env, unit: Unit, rel: &str, path: PathBuf) -> Result<Plan, Strin
         _ => return Err(format!("{}: not a JSON object", src.rel)),
     };
     let last = last_seeds(env, unit);
-    let (f, s) =
-        json_plan(path, true, |v| merge::seed(v, &seeds, &last))?.expect("created when missing");
+    let hook = if unit == Unit::ClaudeSettings {
+        dcg_hook(env, "claude")?
+    } else {
+        None
+    };
+    let (f, s) = json_plan(path, true, |v| {
+        let result = merge::seed(v, &seeds, &last)?;
+        if unit == Unit::ClaudeSettings {
+            update_dcg_hook(env, v, hook.as_ref())?;
+        }
+        Ok(result)
+    })?
+    .expect("created when missing");
     let live: Option<Value> = f.live.as_deref().and_then(|t| serde_json::from_str(t).ok());
-    let notes = s
+    let mut notes: Vec<String> = s
         .local
         .iter()
         .map(|k| {
@@ -653,10 +824,13 @@ fn seeded(env: &Env, unit: Unit, rel: &str, path: PathBuf) -> Result<Plan, Strin
             )
         })
         .collect();
+    if unit == Unit::ClaudeSettings && hook.is_none() {
+        notes.push(DCG_NOT_INSTALLED.into());
+    }
     Ok(Plan {
         files: vec![f],
         notes,
-        sources: vec![src],
+        sources: std::iter::once(src).chain(hook).collect(),
         seeds: Some(seeds),
         ..Plan::default()
     })
@@ -780,7 +954,7 @@ pub enum Outcome {
     /// chezmoi manages these targets: nothing written.
     Managed(Vec<PathBuf>),
     Skipped(String),
-    /// `herdr config check` rejected the rendered config: its issues.
+    /// Validation rejected the rendered config: its issues.
     Rejected(Vec<String>),
     Failed(String),
 }
@@ -826,6 +1000,9 @@ fn write(f: &FilePlan) -> Result<(), String> {
     if let Some(old) = &f.live {
         let bak = backup_path(&path);
         fs::write(&bak, old).map_err(|e| format!("{}: {e}", bak.display()))?;
+    }
+    if f.remove {
+        return fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()));
     }
     let mode = fs::symlink_metadata(&path)
         .ok()
@@ -890,9 +1067,19 @@ fn apply_inner(
     }
     if matches!(
         unit,
-        Unit::HerdrAppMods | Unit::HerdrAppSidebar | Unit::HerdrAppInbox | Unit::HerdrAppLayouts
+        Unit::HerdrAppMods
+            | Unit::HerdrAppSidebar
+            | Unit::HerdrAppInbox
+            | Unit::HerdrAppWindowTabs
+            | Unit::HerdrAppTabs
+            | Unit::HerdrAppServices
+            | Unit::HerdrAppPane
+            | Unit::HerdrAppLayouts
     ) {
         return herdr_app::apply(ctx, unit, &plan, evidence);
+    }
+    if unit == Unit::HerdrAppProfiles {
+        return profiles::apply(ctx, &plan, evidence);
     }
     if unit == Unit::ClaudeHooks {
         return claude_plugin::apply(ctx, &plan, evidence);
@@ -910,14 +1097,6 @@ fn apply_inner(
             Ok(()) => Outcome::Unchanged,
             Err(e) => Outcome::Failed(e),
         };
-    }
-    if unit == Unit::Herdr {
-        match herdr::check(&changed[0].path, &changed[0].text, &ctx.herdr) {
-            Err(e) => return Outcome::Failed(e),
-            Ok(herdr::Check::NoHerdr) => return Outcome::Skipped("herdr not installed".into()),
-            Ok(herdr::Check::Rejected(lines)) => return Outcome::Rejected(lines),
-            Ok(herdr::Check::Ok) => {}
-        }
     }
     let problems = match unit {
         Unit::HerdrAppKeys => match herdr_app::commands(&ctx.herdr_app) {
@@ -967,12 +1146,6 @@ fn apply_inner(
     }
     if let Err(e) = record() {
         return Outcome::Failed(e);
-    }
-    if unit == Unit::Herdr {
-        done.push(match herdr::reload(&ctx.herdr) {
-            Ok(()) => "reload ok".into(),
-            Err(e) => format!("reload: {e} (herdr reads the file on its next start)"),
-        });
     }
     Outcome::Written(done)
 }

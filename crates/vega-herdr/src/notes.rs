@@ -1,12 +1,12 @@
 //! Notifications vega sent the human, kept after herdr's toast is gone
 //! (herdr has one toast slot and no history). Like macOS: the toast is the
-//! banner, `vega board` (N) the list, the UAC pane's email badge
+//! banner, the inbox the list, the UAC pane's email badge
 //! (crate::badges; docs/design/vegad.md, Notifications).
 //!
 //! This host's notes live in `$XDG_STATE_HOME/vega/notes/<id>.json`; vegad
 //! reconciles them into the registry as `<host>.note.<id>` (local state is
 //! the truth, as for agents and links), so a host without registry rights
-//! (deimos) keeps them here only. Ids are Unix milliseconds, unique per host,
+//! (puck) keeps them here only. Ids are Unix milliseconds, unique per host,
 //! so the newest is the largest. What this host's viewer has read or cleared
 //! is a watermark per source host in `notes/seen.json`.
 //!
@@ -351,7 +351,7 @@ pub fn toast(title: &str, body: &str) -> Result<(), crate::Failure> {
 }
 
 /// A notification for the human: herdr's toast (one slot, gone when the
-/// next arrives) plus a note in this host's store for the board's list.
+/// next arrives) plus a note in this host's store for the inbox's list.
 /// Host-level: the vega UAC's badge counts it (see `notify_project`).
 pub fn notify(kind: &str, pane: Option<&str>, title: &str, body: &str) {
     notify_project(kind, pane, None, None, title, body)

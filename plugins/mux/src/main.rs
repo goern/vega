@@ -7,6 +7,8 @@ mod dialog;
 mod hc_spawn;
 mod hook;
 mod next;
+mod remote_mode;
+mod remote_spawn;
 mod reopen;
 mod tier;
 mod transcript;
@@ -68,6 +70,9 @@ const SKILL: &str = include_str!("../SKILL.md");
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Persist remote spawn metadata on the pane host (internal JSON protocol)
+    #[command(hide = true)]
+    RecordSpawn { payload: String },
     /// Apply this machine's existing repository trust before a remote hc launch (JSON)
     #[command(
         hide = true,
@@ -78,6 +83,10 @@ enum Cmd {
         kind: String,
         #[arg(long)]
         cwd: String,
+        #[arg(long)]
+        worktree: Option<String>,
+        #[arg(long, requires = "worktree")]
+        base: Option<String>,
     },
     /// Agent hooks: question routing, shadow state and config installation
     #[command(hide = true)]
@@ -170,6 +179,9 @@ enum Cmd {
         /// The new mode; omit it to print the current one
         #[arg(value_enum)]
         mode: Option<ModeArg>,
+        /// Print the versioned mode result as JSON
+        #[arg(long, hide = true)]
+        json: bool,
     },
     /// Focus the agent that has waited longest for you (done or blocked), on any host
     #[command(
@@ -196,11 +208,12 @@ enum Cmd {
         /// Child: pane id (e.g. hc:t1w, w4C:p1) or its recorded agent name
         target: String,
     },
-    /// Respawn a closed agent in its recorded cwd, resuming its session
+    /// Resume a lost agent in its kept terminal, or respawn a closed one
     #[command(after_help = include_str!("../help/reopen.md"))]
     Reopen {
-        /// Recorded pane id or unique agent name
-        target: String,
+        /// Recorded pane ids or unique agent names
+        #[arg(required = true)]
+        targets: Vec<String>,
     },
     /// Start an agent in the caller's terminal world, without approval prompts
     #[command(
@@ -378,9 +391,19 @@ fn main() -> ExitCode {
     {
         let _ = vega_herdr::hc::own_terminal();
     }
+    let mode_json = matches!(
+        cli.cmd,
+        Some(Cmd::Mode { json: true, .. } | Cmd::RecordSpawn { .. })
+    );
     let result = match cli.cmd {
         None => home(cli.all),
-        Some(Cmd::Prepare { kind, cwd }) => {
+        Some(Cmd::RecordSpawn { payload }) => remote_spawn::receive(&payload),
+        Some(Cmd::Prepare {
+            kind,
+            cwd,
+            worktree,
+            base,
+        }) => {
             if machine().is_some() || !Path::new(&cwd).is_absolute() {
                 Err(Failure::new(
                     "usage",
@@ -388,11 +411,14 @@ fn main() -> ExitCode {
                     "run prepare on the target machine with --cwd /absolute/path",
                 ))
             } else {
-                println!(
-                    "{}",
-                    serde_json::json!({"schema":1,"trust":trust::apply(&kind, &cwd)})
-                );
-                Ok(())
+                let tree = worktree
+                    .as_ref()
+                    .map(|branch| worktree::hc_worktree(&cwd, branch, base.as_deref()))
+                    .transpose();
+                tree.map(|tree| {
+                    let (cwd, how) = tree.unwrap_or((cwd, String::new()));
+                    println!("{}", serde_json::json!({"schema":1,"trust":trust::apply(&kind, &cwd),"cwd":cwd,"how":how}));
+                })
             }
         }
         Some(Cmd::Hook {
@@ -444,9 +470,9 @@ fn main() -> ExitCode {
         }
         Some(Cmd::Close { target }) => close(&target),
         Some(Cmd::Dismiss { target }) => dismiss(&target),
-        Some(Cmd::Reopen { target }) => reopen::run(&target),
+        Some(Cmd::Reopen { targets }) => reopen::run_all(&targets),
         Some(Cmd::Next { status }) => next::run(&status),
-        Some(Cmd::Mode { target, mode }) => set_mode(&target, mode),
+        Some(Cmd::Mode { target, mode, json }) => set_mode(&target, mode, json),
         Some(Cmd::Spawn {
             name,
             kind,
@@ -488,7 +514,11 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(f) => {
-            print_failure(&f);
+            if mode_json {
+                vega_herdr::print_failure_json(&f);
+            } else {
+                print_failure(&f);
+            }
             ExitCode::from(if f.code == "usage" { 2 } else { 1 })
         }
     }
@@ -521,13 +551,6 @@ fn validate(cmd: &Cmd) -> Option<Failure> {
             "usage",
             "--worktree branch is empty",
             "pass a branch name, e.g. --worktree fix-login",
-        )),
-        Cmd::Spawn {
-            worktree: Some(_), ..
-        } if machine().is_some() => Some(Failure::new(
-            "usage",
-            "--worktree works only on this machine",
-            "spawn with --cwd <existing checkout> on that machine, or drop --machine",
         )),
         Cmd::Spawn {
             kind: Some(kind),
@@ -687,14 +710,19 @@ fn close(target: &str) -> Result<(), Failure> {
         .count();
     let what = closing(&ws, others);
     // Pane ids are per machine: on another machine nothing is ours.
+    // A caller outside herdr (an hc terminal) owns no herdr pane: nothing to guard.
     if machine().is_none() {
-        let me = me()?;
-        if me.pane == pane || (what == Closing::Workspace && me.workspace == ws_id) {
-            return Err(Failure::new(
-                "usage",
-                format!("{target} is your own pane or workspace"),
-                "close another agent; run `vega mux` to list them",
-            ));
+        match me() {
+            Ok(me) if me.pane == pane || (what == Closing::Workspace && me.workspace == ws_id) => {
+                return Err(Failure::new(
+                    "usage",
+                    format!("{target} is your own pane or workspace"),
+                    "close another agent; run `vega mux` to list them",
+                ));
+            }
+            Ok(_) => {}
+            Err(f) if f.code == "not_in_herdr" => {}
+            Err(f) => return Err(f),
         }
     }
     reopen::snapshot(&a);
@@ -720,22 +748,40 @@ fn close(target: &str) -> Result<(), Failure> {
 
 /// `vega mux mode <target> [headless|headed]`: records the mode for the
 /// agent that runs in the pane now; without a mode prints it.
-fn set_mode(target: &str, mode: Option<ModeArg>) -> Result<(), Failure> {
+fn set_mode(target: &str, mode: Option<ModeArg>, json: bool) -> Result<(), Failure> {
+    if let Some(result) = remote_mode::run(target, mode)? {
+        return print_mode_result(&result, json);
+    }
     let a = backend::agent(target)?["result"]["agent"].clone();
     let pane = str_of(&a, "pane_id");
+    // A name lookup can resolve to a qualified hc address as well.
+    if let Some(result) = remote_mode::run(pane, mode)? {
+        return print_mode_result(&result, json);
+    }
     let (name, mode) = agent_mode(&a, mode)?;
-    let name = name.as_str();
-    let parent = parent_of(pane, name);
-    println!("mode: {} ({pane} {})", mode.as_str(), cell(name));
-    match (parent, mode) {
+    let parent = parent_of(pane, &name);
+    let questions = match (parent, mode) {
         (None, _) => {
-            println!("note: no parent recorded: the hook leaves its dialogs alone in either mode")
+            "note: no parent recorded: the hook leaves its dialogs alone in either mode".into()
         }
-        (Some(p), Mode::Headless) => println!(
+        (Some(p), Mode::Headless) => format!(
             "questions: to its parent {} (ask-parent hook)",
             p.label(&vega_herdr::state::post_host())
         ),
-        (Some(_), Mode::Headed) => println!("questions: stay in its pane (the user answers)"),
+        (Some(_), Mode::Headed) => "questions: stay in its pane (the user answers)".into(),
+    };
+    let result = serde_json::json!({
+        "schema": 1, "mode": mode.as_str(),
+        "output": format!("mode: {} ({pane} {})\n{questions}\n", mode.as_str(), cell(&name)),
+    });
+    print_mode_result(&result, json)
+}
+
+fn print_mode_result(result: &Value, json: bool) -> Result<(), Failure> {
+    if json {
+        println!("{result}");
+    } else {
+        print!("{}", result["output"].as_str().unwrap_or_default());
     }
     Ok(())
 }
@@ -755,7 +801,13 @@ fn agent_mode(a: &Value, requested: Option<ModeArg>) -> Result<(String, Mode), F
             ModeArg::Headless => Mode::Headless,
             ModeArg::Headed => Mode::Headed,
         };
-        save_mode(machine(), pane, &name, m);
+        vega_herdr::state::save_mode_checked(machine(), pane, &name, m).map_err(|e| {
+            Failure::new(
+                "mode_write_failed",
+                format!("cannot save mode for {pane}: {e}"),
+                "check the pane host's state directory permissions and retry the mode command",
+            )
+        })?;
     }
     let mode = mode_of(machine(), pane, &name);
     Ok((name, mode))
@@ -1475,6 +1527,13 @@ fn spawn_inner(
     tier: Option<&str>,
     reopening: Option<&vega_herdr::state::SpawnRecord>,
 ) -> Result<String, Failure> {
+    if machine().is_some() && matches!(place, Place::Worktree { .. }) {
+        return Err(Failure::new(
+            "usage",
+            "remote worktrees require hc",
+            "use --backend hc with --machine, or pass --cwd for an existing checkout",
+        ));
+    }
     if machine().is_some() && matches!(place, Place::At(At::Split)) {
         return Err(Failure::new(
             "usage",
@@ -1690,6 +1749,7 @@ fn spawn_inner(
             extra: extra.to_vec(),
             tier: tier.map(String::from),
             model: selection.model.clone(),
+            ..Default::default()
         });
     lineage.pane = pane.clone();
     let saved = reopen::save_best_effort(&lineage);
@@ -1721,9 +1781,14 @@ fn spawn_inner(
         brief: text.to_string(),
         no_parent,
     });
+    if let Some(host) = machine() {
+        // Keep the prompt until delivery is confirmed, including startup dialogs.
+        lineage.started_ms = Some(vega_herdr::notes::now_ms());
+        remote_spawn::save(host, &lineage, prompt)?;
+    }
     if let Err(f) = started {
         // For the user: `io:w1:p2` on another machine, so selecting it in
-        // herdr (vega open) jumps there.
+        // herdr jumps there.
         let at = qualify(machine(), &pane);
         // The agent never started, or exited at once: keep its last words,
         // then close our pane.
@@ -1854,6 +1919,9 @@ fn spawn_inner(
     // Some harnesses publish their session only after the first prompt.
     reopen::capture(&mut lineage);
     reopen::save_best_effort(&lineage);
+    if let Some(host) = machine() {
+        remote_spawn::save(host, &lineage, None)?;
+    }
     Ok(pane)
 }
 

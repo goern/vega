@@ -588,7 +588,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
     success(post_as(
         &home,
         url,
-        "deimos",
+        "puck",
         &["identity", "mappings", "--output", "mappings.json"],
     ));
     assert_eq!(
@@ -611,7 +611,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
         let failed = post_as(
             &home,
             url,
-            "deimos",
+            "puck",
             &["identity", "mappings", "--output", output],
         );
         assert_eq!(failed.status.code(), Some(1));
@@ -635,7 +635,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
     let failed = post_as(
         &home,
         url,
-        "deimos",
+        "puck",
         &["identity", "mappings", "--output", "mappings.json"],
     );
     assert_eq!(failed.status.code(), Some(1));
@@ -658,7 +658,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
     success(post_as(
         &home,
         url,
-        "deimos",
+        "puck",
         &["identity", "mappings", "--output", "mappings.json"],
     ));
     assert_eq!(fs::read(state.join("existing.json")).unwrap(), original);
@@ -670,7 +670,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
     let failed = post_as(
         &home,
         url,
-        "deimos",
+        "puck",
         &[
             "identity",
             "mappings",
@@ -691,7 +691,7 @@ fn inbox_mappings_need_no_broker_and_reject_exports_into_live_state() {
     success(post_as(
         &home,
         url,
-        "deimos",
+        "puck",
         &["identity", "mappings", "--output", "suffix.cutover-tmp"],
     ));
     assert_eq!(

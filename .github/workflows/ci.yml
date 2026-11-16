@@ -66,3 +66,4 @@ jobs:
           sh scripts/vegad-refresh.test.sh
           sh scripts/readmes.test.sh
           sh scripts/inline-md.test.sh
+          python3 scripts/rustc-wrapper.test.py
