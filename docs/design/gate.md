@@ -40,7 +40,10 @@ Rust, on `crates/vega-shim` like `gh`: resolves the real git (skipping its own d
   block work; the line makes it visible.
 - **`VEGA_GATE=skip`:** stderr `vega gate: skipped (VEGA_GATE=skip), recorded as <bead>` and a gate bead with
   verdict `skipped` (who: `BEADS_ACTOR`, pane, host; optional `VEGA_GATE_REASON`). Any agent may skip;
-  the skip is visible to the UAC in `vega gate log` and in beads on every host.
+  the skip is visible to the UAC in `vega gate log` and in beads on every host. `vega uac land` accepts
+  `VEGA_GATE=skip` only with a non-empty `VEGA_GATE_REASON`, and only from the project's registered UAC
+  (its authority check runs first); the landing receipt's gate line reads `skipped (VEGA_GATE=skip) by
+  <actor>: <reason>`, and the landing's push records the `skipped` beads through this shim (vega-sw7k).
 - **Refuses reviewer pushes:** exit 1, `vega gate: a gate reviewer does not push`, when `VEGA_GATE_ROLE=reviewer`
   or the cwd is inside a gate clone (`~/.cache/vega/gate/clones/`). The path check needs no env plumbing;
   the env also catches `git -C <other repo> push`.
@@ -142,7 +145,14 @@ The shim calls it (and an agent may, to review before handing work back). Steps:
      commit rule), so the agent that wrote a merged branch is excluded too, not only the one that pushes it.
    Exclude every known author model across all harnesses. If any evidence names a harness without a
    certain model (a bare trailer, missing or ambiguous session log), exclude that whole harness; another
-   known-model entry does not clear the uncertainty.
+   known-model entry does not clear the uncertainty. Exception (vega-v20k): a pushing pane whose model the
+   gate cannot find is settled by an `Assisted-by: <kind>:<model>` trailer of the same kind, which is
+   authoritative for the author kind; a bare trailer still makes its harness uncertain.
+   **The trailer is enforced on a push's own commits:** in run segments (section 3), every `Assisted-by`
+   trailer must name a model, and the pushing pane's kind must appear as `<kind>:<model>` in at least
+   one of them. Otherwise `start` refuses (exit 1, no bead, no reviewer) with the commits to reword.
+   Branch and merge segments hold others' merged work (sentinel branches, upstream merges) that cannot
+   be reworded; they are not checked, and their bare trailers keep excluding the harness.
 2. **Reviewer.** Try candidates from other harnesses first, preserving configured order within each
    group, then candidates from author harnesses with a different known model. A harness with uncertain
    author-model evidence remains excluded. The first eligible candidate must have provider capacity:
@@ -174,7 +184,11 @@ The shim calls it (and an agent may, to review before handing work back). Steps:
    (verified `vega mux spawn --help`: claude `--dangerously-skip-permissions`, codex `--no-daemon
    --dangerously-bypass-approvals-and-sandbox`, pi `--approve`). Model args: claude `--model <id>`, codex
    `-m <id>`, pi `--provider <p> --model <id>`. `VEGA_GATE_ROLE=reviewer` is set with `vega mux spawn
-   --env K=V` (build step 2).
+   --env K=V` (build step 2), and so is `MISE_IGNORED_CONFIG_PATHS=<clone>` (appended to an inherited
+   value): mise then skips the clone's config, which is the branch's and untrusted, instead of asking to
+   trust it, a prompt a pi reviewer hung on (vega-r36c; mise matches path prefixes, checked with mise
+   2026.11.8). A reviewer therefore gets no mise tools or tasks from the clone. The user may still trust
+   `~/.cache/vega/gate/clones` by hand; the gate never trusts it.
    **A spawn that brings up no pane falls through** to the next eligible candidate (stderr `vega gate:
    reviewer <spec> did not start (<cause>); trying the next candidate`); its beads close `spawn-failed`.
    The cause is the spawn's own `error{code,message,hint}` row (for example `timeout,"... last output: zsh:
@@ -302,6 +316,7 @@ closed bead with `verdict=pass`. Only a pass lets the push through; `fail` beads
 | Reviewer idle without ever taking its prompt (no prompt in its session log), or at a dialog | `vega gate` and the running line say `stuck` or `blocked` with `vega mux show <pane>` for TUI or `hc read <terminal>` for hc; the timeout still applies |
 | Push again or `vega gate start`, new head, review running | lock the old review, mark its beads `superseded`, revoke its state, close the old pane and start a fresh reviewer bound to the new head/generation. Include unchanged running segments; never re-point a reviewer by mail. A stale verdict cannot apply to the new generation |
 | Reviewer dies (pane gone) or silent past `timeout` | on the next push: bead `abandoned`, cleanup, start a new review with the next candidate. A second abandon for the same key fails open (infrastructure, spike input 7) |
+| A push's own commit has `Assisted-by` without a model, or none names the pane's kind with one | refused at once: exit 1 with the commits to reword; no bead, no reviewer (section 4, step 1) |
 | Target ref missing locally | uses `<remote>/HEAD`; none either: fail open |
 | Reviewer pushes | refused (section 1) |
 

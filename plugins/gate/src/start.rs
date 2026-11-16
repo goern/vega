@@ -30,6 +30,8 @@ pub enum Outcome {
     FailOpen(String),
     /// The reviewer could not start: the push fails once with this.
     Failed(String),
+    /// The author must fix the change first (its trailers); no review starts.
+    Refused(String),
 }
 
 /// The pass state of every segment of a plan.
@@ -423,8 +425,10 @@ pub fn start_from(
     let mut skip_reviewers: Vec<(String, String)> = Vec::new();
 
     let mut author = author::from_trailers(dir, &plan.segments)?;
-    if let Some((k, m)) = author::from_pane() {
-        author.add(Some(k), m);
+    let pane = author::from_pane();
+    let pane_kind = pane.as_ref().map(|(k, _)| k.clone());
+    if let Some((k, m)) = pane {
+        author.add_pane(k, m);
     }
     let identity = terminal::own()?;
     let author_pane = identity.map(|(_, pane)| pane).unwrap_or_default();
@@ -510,6 +514,14 @@ pub fn start_from(
         return Ok(Outcome::FailOpen(format!(
             "no terminal, push not reviewed, recorded as {}",
             ids.join(", ")
+        )));
+    }
+
+    let problems = author::trailer_problems(dir, &missing, pane_kind.as_deref())?;
+    if !problems.is_empty() {
+        return Ok(Outcome::Refused(format!(
+            "{}; reword to Assisted-by: <kind>:<model> (e.g. claude:claude-opus-5-5), then push again",
+            problems.join("; ")
         )));
     }
 
@@ -818,6 +830,25 @@ fn make_clone(dir: &Path, clone: &Path, head: &str) -> Result<(), String> {
     git(clone, &["checkout", "-q", "--detach", head]).map(|_| ())
 }
 
+/// `MISE_IGNORED_CONFIG_PATHS=<clone>` (after any inherited entries): mise
+/// skips the clone's config instead of prompting to trust it, which hung a
+/// TUI reviewer (vega-r36c). The config is the branch's, so it must not run;
+/// mise matches path prefixes, so the whole clone is covered.
+pub fn mise_ignore(clone: &Path, inherited: Option<&str>) -> String {
+    let clone = clone.to_string_lossy();
+    match inherited.filter(|v| !v.is_empty()) {
+        Some(v) => format!("MISE_IGNORED_CONFIG_PATHS={v}:{clone}"),
+        None => format!("MISE_IGNORED_CONFIG_PATHS={clone}"),
+    }
+}
+
+fn mise_ignore_env(clone: &Path) -> String {
+    mise_ignore(
+        clone,
+        std::env::var("MISE_IGNORED_CONFIG_PATHS").ok().as_deref(),
+    )
+}
+
 /// The one call that starts a reviewer agent. `vega mux spawn --env` sets
 /// `VEGA_GATE_ROLE=reviewer` on the pane through herdr, so the agent's tool
 /// shells see it and the git shim refuses their pushes.
@@ -842,6 +873,8 @@ pub fn spawn_args(
         &prompt_file.to_string_lossy(),
         "--env",
         "VEGA_GATE_ROLE=reviewer",
+        "--env",
+        &mise_ignore_env(clone),
         // The verdict reports; a parent record would make the author's
         // relay treat the reviewer as its sentinel (vega uac, done mails).
         "--no-parent",
@@ -889,6 +922,7 @@ pub fn hc_spawn_args(
         "--".into(),
         "env".into(),
         "VEGA_GATE_ROLE=reviewer".into(),
+        mise_ignore_env(clone),
         kind.into(),
     ]);
     args.extend(
@@ -1318,7 +1352,75 @@ mod tests {
         assert!(
             s.starts_with("mux spawn gate-x --kind codex --at tab --cwd /c --prompt-file /p.md")
         );
-        assert!(s.contains("--env VEGA_GATE_ROLE=reviewer --no-parent -- -m gpt"));
+        assert!(s.contains("--env VEGA_GATE_ROLE=reviewer --env MISE_IGNORED_CONFIG_PATHS="));
+        assert!(s.contains("/c --no-parent -- -m gpt"), "{s}");
+        let hc = hc_spawn_args("gate-r", "r", "pi", Path::new("/clone"), "task", &[], None);
+        assert!(hc
+            .iter()
+            .any(|a| a.starts_with("MISE_IGNORED_CONFIG_PATHS=") && a.ends_with("/clone")));
+    }
+
+    /// The real mise skips an untrusted clone config instead of refusing
+    /// (or prompting on a TTY). Skipped where mise is not installed.
+    #[test]
+    fn mise_skips_an_untrusted_clone_config() {
+        let Ok(mise) = which("mise") else {
+            eprintln!("mise not on PATH; skipped");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let clone = tmp.path().join("clones").join("abc");
+        fs::create_dir_all(&clone).unwrap();
+        fs::write(
+            clone.join("mise.toml"),
+            "[env]\nGATE_PROBE = \"{{ exec(command='echo ran') }}\"\n",
+        )
+        .unwrap();
+        let env = |ignore: bool| {
+            let mut c = Command::new(&mise);
+            c.arg("env").current_dir(&clone).stdin(Stdio::null());
+            c.env_remove("MISE_IGNORED_CONFIG_PATHS");
+            if ignore {
+                let kv = mise_ignore(&clone, None);
+                let (k, v) = kv.split_once('=').unwrap();
+                c.env(k, v);
+            }
+            c.output().unwrap()
+        };
+        let untrusted = env(false);
+        let text = String::from_utf8_lossy(&untrusted.stderr);
+        assert!(
+            !untrusted.status.success() && text.contains("not trusted"),
+            "{text}"
+        );
+        let ignored = env(true);
+        assert!(
+            ignored.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ignored.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&ignored.stdout).contains("GATE_PROBE"));
+    }
+
+    fn which(bin: &str) -> Result<PathBuf, ()> {
+        std::env::split_paths(&std::env::var_os("PATH").ok_or(())?)
+            .map(|d| d.join(bin))
+            .find(|p| p.is_file())
+            .ok_or(())
+    }
+
+    #[test]
+    fn mise_ignores_the_clone_after_inherited_paths() {
+        let c = Path::new("/h/.cache/vega/gate/clones/abc");
+        assert_eq!(
+            mise_ignore(c, None),
+            "MISE_IGNORED_CONFIG_PATHS=/h/.cache/vega/gate/clones/abc"
+        );
+        assert_eq!(mise_ignore(c, Some("")), mise_ignore(c, None));
+        assert_eq!(
+            mise_ignore(c, Some("/x:/y")),
+            "MISE_IGNORED_CONFIG_PATHS=/x:/y:/h/.cache/vega/gate/clones/abc"
+        );
     }
 
     #[test]

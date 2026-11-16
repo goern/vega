@@ -319,6 +319,7 @@ pub fn decide(args: &[String], cwd: &Path) -> Result<Decision, String> {
         match start::start_from(&dir, pl, config, &d.branch, l)? {
             Outcome::Passed => {}
             Outcome::FailOpen(m) => notes.push(m),
+            Outcome::Refused(m) => blocks.push(m),
             Outcome::Running(m) | Outcome::Failed(m) => {
                 blocks.push(m);
                 if !missing.is_empty() {

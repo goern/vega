@@ -133,6 +133,7 @@ struct Fake {
     removed: bool,
     calls: Vec<String>,
     history: Vec<(String, Value)>,
+    vars: Vec<(&'static str, &'static str)>,
 }
 impl Fake {
     fn call(&mut self, phase: &str) -> Result<()> {
@@ -151,6 +152,12 @@ impl Fake {
 impl Services for Fake {
     fn history(&mut self, kind: &str, data: Value) {
         self.history.push((kind.into(), data));
+    }
+    fn var(&mut self, key: &str) -> Option<String> {
+        self.vars
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.to_string())
     }
     fn authority(&mut self, dir: &Path, _: &str) -> Result<()> {
         if let Some(expected) = &self.expected_repo {
@@ -1075,4 +1082,48 @@ fn history_links_failed_check_resume_and_completed_inspection() {
             "close"
         ]
     );
+}
+
+#[test]
+fn a_uac_skip_needs_a_reason_and_shows_in_the_receipt() {
+    let mut f = Fixture::new("no-ff");
+    let mut svc = Fake {
+        vars: vec![("VEGA_GATE", "skip")],
+        ..Fake::default()
+    };
+    let e = f.run(&mut svc).unwrap_err();
+    assert!(
+        e.message.contains("needs VEGA_GATE_REASON"),
+        "{}",
+        e.message
+    );
+    assert!(!svc.calls.contains(&"gate".to_string()));
+
+    let mut f = Fixture::new("no-ff");
+    let mut svc = Fake {
+        vars: vec![
+            ("VEGA_GATE", "skip"),
+            ("VEGA_GATE_REASON", "  gate down  "),
+            ("BEADS_ACTOR", "h/uac"),
+        ],
+        ..Fake::default()
+    };
+    f.run(&mut svc).unwrap();
+    assert!(!svc.calls.contains(&"gate".to_string()));
+    assert_eq!(f.r.gate, "skipped (VEGA_GATE=skip) by h/uac: gate down");
+    assert_eq!(read(&f.receipt).unwrap().gate, f.r.gate);
+
+    // Only the registered UAC lands: authority runs before the skip.
+    let mut f = Fixture::new("no-ff");
+    let mut svc = Fake {
+        vars: vec![("VEGA_GATE", "skip"), ("VEGA_GATE_REASON", "why")],
+        fail: "authority".into(),
+        ..Fake::default()
+    };
+    assert!(f
+        .run(&mut svc)
+        .unwrap_err()
+        .message
+        .contains("injected authority"));
+    assert_eq!(f.r.gate, "");
 }

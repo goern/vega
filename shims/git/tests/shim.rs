@@ -81,8 +81,44 @@ fn remote_head(work: &Path, branch: &str) -> Option<String> {
 fn gated(tmp: &Path) -> PathBuf {
     let work = repo(tmp);
     git(&work, &["checkout", "-q", "-b", "feat"]);
-    commit(&work, "src/a.rs", "fn a() { 1 }\n", "a1");
+    commit(
+        &work,
+        "src/a.rs",
+        "fn a() { 1 }\n",
+        "a1\n\nAssisted-by: claude:claude-opus-5-5",
+    );
     work
+}
+
+#[test]
+fn a_push_whose_own_commits_lack_a_trailer_model_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = gated(tmp.path());
+    let bare = commit(
+        &work,
+        "src/a.rs",
+        "fn a() { 2 }\n",
+        "a2\n\nAssisted-by: claude",
+    );
+    let o = shim(
+        &work,
+        tmp.path(),
+        &[("HERDR_PANE_ID", "w1:p1")],
+        &["push", "-q", "origin", "feat"],
+    );
+    let e = stderr(&o);
+    assert_eq!(o.status.code(), Some(1), "{e}");
+    assert!(
+        e.contains(&format!(
+            "commit {}: Assisted-by: claude names no model",
+            &bare[..7]
+        )),
+        "{e}"
+    );
+    assert!(e.contains("reword to Assisted-by: <kind>:<model>"), "{e}");
+    assert!(!log(tmp.path(), "vega").contains("mux spawn"));
+    assert!(!log(tmp.path(), "bd").contains("create"));
+    assert_eq!(remote_head(&work, "feat"), None);
 }
 
 #[test]

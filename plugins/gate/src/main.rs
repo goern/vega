@@ -232,6 +232,7 @@ fn start_cmd(target: Option<&str>) -> Result<(), Failure> {
         Outcome::Running(m) => println!("result: {m}"),
         Outcome::FailOpen(m) => println!("result: not reviewed: {m}"),
         Outcome::Failed(m) => return Err(Failure::new("spawn", m, "check the reviewer harness is installed and the terminal backend is up; then vega gate start")),
+        Outcome::Refused(m) => return Err(Failure::new("trailer", m, "vega's commit rule: every agent commit carries Assisted-by: <kind>:<model>; then vega gate start")),
     }
     Ok(())
 }

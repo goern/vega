@@ -462,7 +462,8 @@ impl Services for Live {
                     }
                     vega_gate::start::Outcome::Running(m)
                     | vega_gate::start::Outcome::FailOpen(m)
-                    | vega_gate::start::Outcome::Failed(m) => {
+                    | vega_gate::start::Outcome::Failed(m)
+                    | vega_gate::start::Outcome::Refused(m) => {
                         return Err(Fault::new(format!("gate pending: {m}")))
                     }
                 }

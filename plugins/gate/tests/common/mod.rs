@@ -61,10 +61,18 @@ pub fn write(dir: &Path, file: &str, body: &str) {
     fs::write(p, body).unwrap();
 }
 
+/// Commits as the fake herdr's author pane (claude): a message without an
+/// `Assisted-by` trailer gets `claude:claude-opus-5-5`, as vega's commit rule
+/// asks and the gate enforces on a push's own commits.
 pub fn commit(dir: &Path, file: &str, body: &str, msg: &str) -> String {
     write(dir, file, body);
     git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-q", "-m", msg]);
+    let msg = if msg.contains("Assisted-by:") {
+        msg.to_string()
+    } else {
+        format!("{msg}\n\nAssisted-by: claude:claude-opus-5-5")
+    };
+    git(dir, &["commit", "-q", "-m", &msg]);
     git(dir, &["rev-parse", "HEAD"])
 }
 

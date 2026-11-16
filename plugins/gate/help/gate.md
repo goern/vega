@@ -23,7 +23,9 @@ Config: .vega/gate.toml at the target; no file, no gate. Beads repos only.
 Records: one bead per segment review, label gate, external ref gate:<key>.
 
 git push in agent sessions (the git shim) checks a pass per segment; none:
-it runs `start` and fails the push (exit 1). VEGA_GATE=skip skips visibly
+it runs `start` and fails the push (exit 1). The push's own commits need
+Assisted-by: <kind>:<model>; a trailer without a model refuses it.
+VEGA_GATE=skip skips visibly
 (VEGA_GATE_REASON=<why> is recorded); a gate error lets the push through
 with one stderr line.
 

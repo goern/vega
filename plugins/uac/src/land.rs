@@ -218,6 +218,9 @@ trait Services {
     fn history(&mut self, kind: &str, data: Value) {
         vega_herdr::history::emit(kind, data);
     }
+    fn var(&mut self, key: &str) -> Option<String> {
+        env::var(key).ok()
+    }
     fn authority(&mut self, dir: &Path, target: &str) -> Result<()>;
     fn completed(&mut self, dir: &Path, r: &Receipt) -> Result<()>;
     fn validate(&mut self, dir: &Path, r: &Receipt) -> Result<()>;
@@ -385,7 +388,7 @@ fn begin(dir: &Path, a: &Args, svc: &mut impl Services) -> Result<Receipt> {
         ));
     }
     let (summary, sentinel) = svc.evidence(dir, &a.bead, &branch, &head)?;
-    let gate = svc.gate(dir, &before, &head, false)?;
+    let gate = gate(svc, dir, &before, &head, false)?;
     let assisted_by = svc.assisted_by()?;
     Ok(Receipt {
         bead: a.bead.clone(),
@@ -405,6 +408,43 @@ fn begin(dir: &Path, a: &Args, svc: &mut impl Services) -> Result<Receipt> {
         phase: "merge".into(),
         failure: None,
     })
+}
+/// `VEGA_GATE=skip` lands without gate coverage only with a
+/// `VEGA_GATE_REASON`; the receipt's gate line shows the skip, actor and
+/// reason (vega-sw7k). Callers run `authority` first, so the actor is this
+/// project's registered UAC. The landing's own push carries the env, so the
+/// git shim records the usual `skipped` gate beads.
+fn gate_skip(svc: &mut impl Services) -> Result<Option<String>> {
+    if svc.var("VEGA_GATE").as_deref() != Some("skip") {
+        return Ok(None);
+    }
+    let reason = svc
+        .var("VEGA_GATE_REASON")
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .ok_or_else(|| {
+            Fault::new("VEGA_GATE=skip needs VEGA_GATE_REASON=<why> to land without gate coverage")
+        })?;
+    let actor = svc
+        .var("BEADS_ACTOR")
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "UAC".into());
+    Ok(Some(format!(
+        "skipped (VEGA_GATE=skip) by {actor}: {reason}"
+    )))
+}
+/// The gate line of a receipt: a UAC skip, else the gate's own verdict.
+fn gate(
+    svc: &mut impl Services,
+    dir: &Path,
+    target: &str,
+    head: &str,
+    start: bool,
+) -> Result<String> {
+    match gate_skip(svc)? {
+        Some(skipped) => Ok(skipped),
+        None => svc.gate(dir, target, head, start),
+    }
 }
 fn fetch_target(dir: &Path, p: &Policy) -> Result<String> {
     git(
@@ -620,7 +660,8 @@ fn step_inner(
     trace.next("gate", r);
     r.phase = "gate".into();
     save(path, r)?;
-    r.gate = svc.gate(dir, &r.before, r.integrated.as_ref().unwrap(), true)?;
+    let integrated = r.integrated_head()?.to_string();
+    r.gate = gate(svc, dir, &r.before, &integrated, true)?;
     current(dir, r)?;
     trace.next("push", r);
     r.phase = "push".into();
