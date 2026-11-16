@@ -3,6 +3,24 @@ use super::*;
 use vega_herdr::hc::{hc_local, own_terminal, Terminal};
 use vega_herdr::state::SpawnRecord;
 
+/// A local `--cwd` as an absolute, existing directory: `~` expanded, a relative
+/// path taken from the caller's cwd.
+fn resolve_cwd(cwd: &str, home: &str) -> Result<String, Failure> {
+    let expanded = expand_home(cwd, home);
+    let abs = env::current_dir().unwrap_or_default().join(&expanded);
+    if !abs.is_dir() {
+        return Err(Failure::new(
+            "cwd_not_found",
+            format!(
+                "--cwd {cwd} is not an existing directory ({})",
+                abs.display()
+            ),
+            "pass an existing directory; a relative one is taken from the current directory",
+        ));
+    }
+    Ok(abs.display().to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     name: &str,
@@ -70,7 +88,7 @@ pub fn spawn(
     let mut cwd =
         cwd.unwrap_or_else(|| env::current_dir().unwrap_or_default().display().to_string());
     if machine().is_none() {
-        cwd = expand_home(&cwd, &env::var("HOME").unwrap_or_default());
+        cwd = resolve_cwd(&cwd, &env::var("HOME").unwrap_or_default())?;
     }
     let selection = tier::select(kind, tier, extra, Some(&cwd))?;
     // Space IDs belong to the local app; they do not identify remote spaces.
@@ -633,6 +651,28 @@ mod tests {
                 "claude",
                 "--x"
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_cwd_makes_relative_paths_absolute() {
+        let abs = resolve_cwd(".", "/h").unwrap();
+        assert!(Path::new(&abs).is_absolute() && Path::new(&abs).is_dir());
+        assert_eq!(resolve_cwd("/", "/h").unwrap(), "/");
+        let rel = resolve_cwd("plugins", "/h");
+        assert!(rel.is_err() || Path::new(&rel.unwrap()).is_absolute());
+    }
+
+    #[test]
+    fn resolve_cwd_rejects_a_missing_directory() {
+        assert_eq!(
+            resolve_cwd("no/such/dir-xyz", "/h").unwrap_err().code,
+            "cwd_not_found"
         );
     }
 }

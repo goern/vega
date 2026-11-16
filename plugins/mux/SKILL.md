@@ -22,7 +22,7 @@ Help: `--help`.
   Tiers: flagship design; balanced implementation; budget mechanical.
   Lanista resolves pins; explicit `-m`/`--model` after `--` or `--no-parent` needs no tier.
   `vega post done` wakes the parent. Inbox-only targets ask the user.
-- `--worktree <branch> --base <ref>` uses worktrunk and a TUI workspace or local app space;
+- `--worktree <branch> --base <ref>` uses worktrunk (plain `git worktree add` on hc without wt or its config) and a TUI workspace or local app space;
   without a local app, or with `--machine`, hc starts a tab in the worktree instead.
   hc explicit split/workspace placement is unsupported; use tabs or worktrees.
 - `vega mux close <target>` closes the agent; then `wt remove <branch>`.
