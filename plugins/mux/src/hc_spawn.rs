@@ -230,11 +230,12 @@ pub fn spawn(
         .collect();
     let launcher = machine().is_none().then(toolbox_launcher).flatten();
     if let Some(p) = prompt {
-        args.push(if no_parent && own.is_none() {
+        let text = if no_parent && own.is_none() {
             p.into()
         } else {
             backend::body(p, handoff(no_parent, mode).0, machine().is_some())?
-        });
+        };
+        args.extend(vega_herdr::launch::prompt_args(kind, &text));
     }
     let args = match &launcher {
         Some(l) => toolbox_argv(l, &launch_env, args),
