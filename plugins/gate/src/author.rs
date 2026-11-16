@@ -19,6 +19,8 @@ pub struct Author {
     pub models: BTreeSet<String>,
     /// A missing model in any evidence excludes that entire harness.
     pub uncertain_kinds: BTreeSet<String>,
+    /// Kinds some evidence names with a model.
+    pub certain_kinds: BTreeSet<String>,
 }
 
 impl Author {
@@ -27,9 +29,23 @@ impl Author {
         let model = model.filter(|m| !m.is_empty());
         if model.is_none() {
             self.uncertain_kinds.extend(kind.clone());
+        } else {
+            self.certain_kinds.extend(kind.clone());
         }
         self.kinds.extend(kind);
         self.models.extend(model);
+    }
+
+    /// The pushing pane's evidence. Its model comes from a session log the
+    /// gate may not find; an `Assisted-by: <kind>:<model>` trailer of the
+    /// same kind is authoritative then, so the pane alone makes no harness
+    /// uncertain (vega-v20k). Bare trailers still do.
+    pub fn add_pane(&mut self, kind: String, model: Option<String>) {
+        if model.as_deref().is_none_or(str::is_empty) && self.certain_kinds.contains(&kind) {
+            self.kinds.insert(kind);
+            return;
+        }
+        self.add(Some(kind), model);
     }
 
     pub fn excludes(&self, kind: &str, model: &str) -> bool {
@@ -166,6 +182,57 @@ pub fn from_trailers(dir: &Path, segments: &[Segment]) -> Result<Author, String>
     Ok(a)
 }
 
+/// The pusher's own commits (run segments) must carry `Assisted-by:
+/// <kind>:<model>`: a trailer without a model, or no trailer naming the
+/// pushing pane's kind with a model, is refused (vega-v20k). Branch and
+/// merge segments hold others' merged work and are not checked; their bare
+/// trailers keep excluding the harness. Returns one line per problem.
+pub fn trailer_problems(
+    dir: &Path,
+    segments: &[&Segment],
+    pane_kind: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut problems = Vec::new();
+    let mut certain = BTreeSet::new();
+    let mut runs = Vec::new();
+    for s in segments {
+        if !matches!(s.kind, Kind::Run { .. }) {
+            continue;
+        }
+        runs.push(s.label());
+        let out = git(
+            dir,
+            &[
+                "log",
+                "--format=%h%x1f%(trailers:key=Assisted-by,valueonly,separator=%x1f)",
+                &format!("{}..{}", s.from, s.to),
+            ],
+        )?;
+        for line in out.lines() {
+            let mut parts = line.split('\x1f');
+            let sha = parts.next().unwrap_or_default();
+            for v in parts.map(str::trim).filter(|v| !v.is_empty()) {
+                match parse_trailer(v) {
+                    (Some(k), Some(_)) => {
+                        certain.insert(k);
+                    }
+                    (Some(_), None) => {
+                        problems.push(format!("commit {sha}: Assisted-by: {v} names no model"))
+                    }
+                    (None, _) => {}
+                }
+            }
+        }
+    }
+    if let Some(k) = pane_kind.filter(|k| !runs.is_empty() && !certain.contains(*k)) {
+        problems.push(format!(
+            "no Assisted-by: {k}:<model> trailer in {}",
+            runs.join(", ")
+        ));
+    }
+    Ok(problems)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +289,23 @@ mod tests {
         a.add(Some("codex".into()), None);
         a.add(Some("codex".into()), Some("gpt-6.1-sol".into()));
         assert!(a.excludes("codex", "gpt-5.6-luna"));
+    }
+
+    #[test]
+    fn a_trailer_model_settles_a_pane_without_one() {
+        let mut a = Author::default();
+        a.add(Some("claude".into()), Some("claude-opus-5-5".into()));
+        a.add_pane("claude".into(), None);
+        assert!(a.uncertain_kinds.is_empty());
+        assert!(!a.excludes("claude", "claude-sonnet-5-5"));
+        assert!(a.excludes("claude", "claude-opus-5-5"));
+        // Without such a trailer the pane's kind stays uncertain.
+        let mut b = Author::default();
+        b.add_pane("claude".into(), None);
+        assert!(b.excludes("claude", "claude-sonnet-5-5"));
+        // A bare trailer is still uncertain, whatever else is known.
+        let mut c = a.clone();
+        c.add(Some("claude".into()), None);
+        assert!(c.excludes("claude", "claude-sonnet-5-5"));
     }
 }

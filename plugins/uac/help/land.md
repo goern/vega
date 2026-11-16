@@ -28,6 +28,8 @@ When configured, the source gate must pass before a receipt is created. If cover
 run `vega gate start` in the source worktree, wait for its verdict, then repeat
 `vega uac land BEAD --branch BRANCH` (with the original flags). After integration, a
 pending gate starts review and returns exit 1; use --resume after its verdict.
+VEGA_GATE=skip lands without coverage only with VEGA_GATE_REASON=<why>; the
+receipt's gate line shows the skip, actor and reason.
 Resume re-observes reality and never repeats a completed merge. Interrupted install
 is uncertain: inspect effects, then --resume --retry-install explicitly retries
 it, or --resume --install-done attests it completed. These flags apply only to an

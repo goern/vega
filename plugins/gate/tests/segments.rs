@@ -196,3 +196,49 @@ fn changes_outside_the_paths_need_no_review() {
     assert!(p.segments.is_empty());
     assert_eq!(p.empty, 1);
 }
+
+#[test]
+fn only_a_pushs_own_commits_must_name_a_trailer_model() {
+    use vega_gate::author::trailer_problems;
+    let tmp = tempfile::tempdir().unwrap();
+    let work = repo(tmp.path());
+    // Merged work from others with a bare trailer is not checked.
+    git(&work, &["checkout", "-q", "-b", "upstream"]);
+    commit(&work, "src/u.rs", "fn u() {}\n", "u1\n\nAssisted-by: codex");
+    git(&work, &["checkout", "-q", "main"]);
+    commit(&work, "src/c.rs", "fn c() {}\n", "own");
+    git(
+        &work,
+        &["merge", "-q", "--no-ff", "-m", "Merge upstream", "upstream"],
+    );
+    let p = plan_at(&work, "origin/main", "main");
+    assert_eq!(kinds(&p), vec!["run", "branch"]);
+    let segs: Vec<_> = p.segments.iter().collect();
+    assert!(trailer_problems(&work, &segs, Some("claude"))
+        .unwrap()
+        .is_empty());
+    // A run needs the pane's kind with a model.
+    let e = trailer_problems(&work, &segs, Some("codex")).unwrap();
+    assert_eq!(e.len(), 1);
+    assert!(
+        e[0].starts_with("no Assisted-by: codex:<model> trailer in direct "),
+        "{e:?}"
+    );
+    // An own commit with a bare trailer is refused, whatever the pane.
+    let bare = commit(
+        &work,
+        "src/c.rs",
+        "fn c() { 1 }\n",
+        "x\n\nAssisted-by: Claude Opus 5.5",
+    );
+    let p = plan_at(&work, "origin/main", "main");
+    let segs: Vec<_> = p.segments.iter().collect();
+    let e = trailer_problems(&work, &segs, None).unwrap();
+    assert_eq!(
+        e,
+        vec![format!(
+            "commit {}: Assisted-by: Claude Opus 5.5 names no model",
+            &bare[..7]
+        )]
+    );
+}

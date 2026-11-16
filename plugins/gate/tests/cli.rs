@@ -100,7 +100,12 @@ fn start_spawns_a_non_author_reviewer_in_a_clone() {
         "{spawn}"
     );
     assert!(
-        spawn.contains("--env VEGA_GATE_ROLE=reviewer --no-parent -- -m m-codex"),
+        spawn.contains("--env VEGA_GATE_ROLE=reviewer --env MISE_IGNORED_CONFIG_PATHS="),
+        "{spawn}"
+    );
+    // mise skips the clone's (the branch's) config instead of a trust prompt.
+    assert!(
+        spawn.contains("/cache/vega/gate/clones/") && spawn.contains(" --no-parent -- -m m-codex"),
         "{spawn}"
     );
 
@@ -243,12 +248,12 @@ fn new_head_replaces_the_reviewer_and_refuses_its_unread_stale_verdict() {
         )
         .unwrap();
     }
-    // A new bare codex trailer makes the running codex reviewer ineligible.
+    // A codex trailer with the running reviewer's model makes it ineligible.
     common::commit(
         &work,
         "src/a.rs",
         "fn a() { 3 }\n",
-        "fix\n\nAssisted-by: codex",
+        "fix\n\nAssisted-by: claude:claude-opus-5-5\nAssisted-by: codex:m-codex",
     );
     let third = run(&work, tmp.path(), &env, &["start"]);
     assert!(third.status.success(), "{}", out(&third));
@@ -508,7 +513,7 @@ fn a_failed_spawn_falls_through_and_the_last_one_shows_its_cause() {
     // records one abandon.
     let tmp = tempfile::tempdir().unwrap();
     let work = feature(tmp.path());
-    for k in ["codex", "pi"] {
+    for k in ["codex", "pi", "claude"] {
         fs::write(tmp.path().join(format!("spawn-fail-{k}")), "").unwrap();
     }
     let o = run(&work, tmp.path(), &[("HERDR_PANE_ID", "w1:p1")], &["start"]);
@@ -519,7 +524,10 @@ fn a_failed_spawn_falls_through_and_the_last_one_shows_its_cause() {
         "{s}"
     );
     assert!(s.contains("command not found: pi"), "{s}");
-    assert!(s.contains("claude: author kind (model uncertain)"), "{s}");
+    // The pane (claude, no session log) is settled by the claude:claude-opus-5-5
+    // trailer: claude with another model reviews as the last resort (vega-v20k).
+    assert!(s.contains("command not found: claude"), "{s}");
+    assert!(!s.contains("model uncertain"), "{s}");
     let creates = log(tmp.path(), "bd")
         .lines()
         .filter(|l| l.starts_with("create") && l.contains("\"verdict\":\"abandoned\""))
@@ -539,7 +547,16 @@ fn hc_start_launches_visible_detached_reviewer_and_keeps_backend() {
         spawn.contains("--no-parent --outlive-parent --name gate-"),
         "{spawn}"
     );
-    assert!(spawn.contains("--label herdr.space=space-1 -- env VEGA_GATE_ROLE=reviewer codex --no-daemon --dangerously-bypass-approvals-and-sandbox"), "{spawn}");
+    assert!(
+        spawn.contains(
+            "--label herdr.space=space-1 -- env VEGA_GATE_ROLE=reviewer MISE_IGNORED_CONFIG_PATHS="
+        ),
+        "{spawn}"
+    );
+    assert!(
+        spawn.contains(" codex --no-daemon --dangerously-bypass-approvals-and-sandbox"),
+        "{spawn}"
+    );
     assert!(spawn.contains("--label vega.role=gate-reviewer --label vega.review="));
     assert!(!log(tmp.path(), "vega").contains("mux spawn"));
     let state: serde_json::Value = serde_json::from_str(

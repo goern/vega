@@ -462,7 +462,8 @@ impl Services for Live {
                     }
                     vega_gate::start::Outcome::Running(m)
                     | vega_gate::start::Outcome::FailOpen(m)
-                    | vega_gate::start::Outcome::Failed(m) => {
+                    | vega_gate::start::Outcome::Failed(m)
+                    | vega_gate::start::Outcome::Refused(m) => {
                         return Err(Fault::new(format!("gate pending: {m}")))
                     }
                 }
@@ -818,6 +819,7 @@ mod tests {
             extra: vec![],
             tier: None,
             model: None,
+            ..Default::default()
         };
         let of =
             |a: &Value, r: &st::SpawnRecord| session_in(a, std::slice::from_ref(r), home.path());

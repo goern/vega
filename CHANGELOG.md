@@ -8,6 +8,12 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
 ## 290 · 2026-11-26
 
 - feature: Native Windows builds include `vega secrets` for scoped environment injection and ACL-protected host identities. See the [io-win delivery steps](docs/design/secrets.md#native-windows-io-win).
+- feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces
+  them on a push's own commits: a bare `Assisted-by: claude` there refuses the push until it is reworded
+  (merged branches are not checked). A claude reviewer is no longer excluded only because the pushing
+  pane's session log was not found (vega-v20k). Gate reviewers ignore the clone's mise config instead of
+  hanging on mise's trust prompt (vega-r36c). `vega uac land` accepts `VEGA_GATE=skip` only with
+  `VEGA_GATE_REASON` and shows it in the receipt (vega-sw7k).
 
 ## 289 · 2026-11-26
 
