@@ -5,7 +5,7 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
-## 218 · 2026-11-16
+## 229 · 2026-11-16
 
 - feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
   the gate's `timeout`, closes its beads `abandoned` with the reason and mails the author once, without
@@ -13,7 +13,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   (Dolt server down) no longer drops the review's state with its beads still `running`: the state stays
   until every bead is closed and the sweep retries.
 
-## 217 · 2026-11-16
+## 228 · 2026-11-16
 
 - feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces
   them on a push's own commits: a bare `Assisted-by: claude` there refuses the push until it is reworded
@@ -25,13 +25,141 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   without a reviewer ("review running elsewhere" until the timeout): the gate adopts the bead, and a
   leftover local one without reviewer state is abandoned after 5 minutes.
 
-## 216 · 2026-11-16
+## 227 · 2026-11-16
 
 - feature: local `vega mux spawn` and `reopen` on hc start the agent through `~/.local/bin/hc-toolbox-shell`
   when that executable exists, so agents and their tool shells run in the toolbox whose glibc the vega
   binaries need (vega-alc). Hosts without the launcher, and remote `--machine` spawns, are unchanged.
   The spawn environment, including `--env` values, is forwarded as `env K=V` and therefore shows in the
   agent's process argv: keep secrets out of `--env`. Gate reviewers still start on the host.
+## 226 · 2026-11-17
+
+- feature: Browser sessions are visible in the herdr-app panels and the windows themselves
+  (vega-nic.19). The Services panel gains a Browsers group from `vega browser ls --json` (colour dot,
+  owner, headed/headless, age, state; unowned sessions and loose browser processes included; close
+  is a two-step confirm that runs `vega browser close`), refreshed with the panel (first show and
+  manual Refresh — no new timer) and published as shared state for the sidebar, whose agent rows now
+  show up to three coloured browser dots for sessions their pane owns. Each session gets a colour:
+  its owner project's `[symbols.project_colors]` entry in `~/.config/vega/theme.toml` (new optional
+  section, validated `#RRGGBB` like host colours), else a stable hash of the session name; `ls
+  --json` carries it. Explicitly headed agent-browser calls (`--headed` flag or truthy
+  `AGENT_BROWSER_HEADED`) carry a per-session `--init-script` mark (coloured frame + session tag +
+  `[session]` title prefix, aria-hidden from `snapshot`; verified against agent-browser 0.31.1 on
+  Chrome for Testing and the global Chromium); headless and attaching calls stay unchanged,
+  `vega browser launch` never marks, and `VEGA_BROWSER_MARK=0` disables the mark everywhere.
+  Fixed: the CDP probe spoke
+  HTTP/1.0, which Chrome 146 silently drops, so `vega browser ab` failed with `port_held` against
+  the real global Chromium; it now speaks HTTP/1.1. Apply `herdr-app.vega-services` and
+  `herdr-app.vega-sidebar` to see the panels. See
+  [docs/design/browser.md](docs/design/browser.md).
+
+## 225 · 2026-11-17
+
+- feature: Browser work moves into the `vega browser` plugin (guide: `vega skills browser`): the
+  global Chromium on 127.0.0.1:9223 (`ab`, `chromium`), the throwaway fallback for bot blockers
+  (`launch`, `cleanup`), and the session inventory `ls [--json]`/`gc`/`close` with owner pane, project,
+  age and state. Named agent-browser sessions are now the one rule: the `agent-browser` shim (agent
+  shells only) passes named calls (`--session <name>` or `AGENT_BROWSER_SESSION`) through unchanged and
+  records their owner; unnamed calls are refused with a hint (`--help`, `skills`, `session list` pass).
+  `vega review` is unaffected (it names its sessions). CI and human shells never see the shim.
+- migration: The global `browser` skill (~/.agents/skills/browser) is replaced by forwarding scripts to
+  the plugin (installed by `mise run install`); after the vega-skills repo drops the skill, run
+  `vega skills lib remove browser -g` to take it out of the global set. The forwarding scripts stay
+  until the remaining hard-coded callers (brainz) switched, then they go. See
+  [docs/design/browser.md](docs/design/browser.md).
+
+## 224 · 2026-11-16
+
+- feature: Route facts now come from lanista, not the seats overlay. vega reads
+  `lanista --json routes` once per command (bounded, `VEGA_LANISTA_BIN` overrides
+  the binary): `~/.config/lanista/routes.local.json` (lanista's) owns route id →
+  canonical + cost class, and the `canonical`/`cost` keys in
+  `~/.config/vega/lanista/seats.local.json` are deprecated fallbacks — used only
+  when lanista has no entry; conflicts warn on stderr and lanista wins; unknown
+  stays unknown, never zero. `vega lanista hosts` shows `cost`/`origin` (JSON:
+  `canonical`, `cost`, `cost_origin`), `vega mux spawn` appends route facts to an
+  unknown capacity line (`capacity: unknown (no enmaas account window in the
+  sample; route subscription, origin local)`), `vega lanista pin` prints the
+  resolved facts, and `vega lanista doctor` checks seats.local canonical/cost
+  against lanista (warn on mismatch). A missing/old lanista degrades to the
+  fallback with a `vega lanista install` hint. See the route-facts section in
+  [docs/design/lanista-catalog.md](docs/design/lanista-catalog.md).
+
+## 223 · 2026-11-16
+
+- feature: Hosts can extend their model tiers without repo edits through a host-local
+  seats overlay at `~/.config/vega/lanista/seats.local.json` (schema 1, entries
+  `{provider, pin, tier, canonical?, cost}` — e.g. puck pins its pi tiers to its
+  EnMaaS gateway with `enmaas/<id>`). `vega lanista install`/seats sync never touches
+  the overlay; invalid entries are reported on stderr and skipped. Resolution order is
+  project > host > registry default > overlay > repo seats; for lane pi an overlay pin
+  for a tier wins over the zai fallback, and `vega lanista hosts` shows such cells with
+  source `overlay`. `mux spawn --kind pi --tier X` on puck resolves `enmaas/<id>`, and
+  capacity reports the `enmaas/` prefix as its own provider with unknown (not zero)
+  headroom. See the overlay section in
+  [docs/design/lanista-catalog.md](docs/design/lanista-catalog.md).
+
+## 222 · 2026-11-16
+
+- feature: The vega-sidebar keeps a diagnostics log for the intermittent "This
+  view could not be re-rendered … interrupted" / "The sidebar could not be
+  loaded" overlays: render/init phase breadcrumbs in memory, interrupted/slow/
+  failed renders recorded with phase, timings and input sizes, flushed to a
+  size-capped ring file at `~/.config/herdr-app/data/vega-sidebar-diagnostics/
+  render-log.jsonl` (app data survives `vega config apply`). No timers, no
+  per-frame file I/O; `herdr-app check` writes nothing.
+
+## 221 · 2026-11-16
+
+- feature: The vega-sidebar no longer trips herdr-app's "This view could not be
+  re-rendered; showing last good … interrupted" overlay on large fleets. All
+  derivation (project groups and repo-group member JSON, agent trees, view/
+  Active/pin filtering, project order, per-project totals, row labels) moved into
+  a cache rebuilt only when its inputs change; `render()` reads the cache and
+  builds rows. With a fake fleet of 140 terminals, 110 agents and 40 projects
+  (27-member repo group), a render with unchanged inputs drops from ~15 ms to
+  ~1.5 ms, a render after a data change from ~15 ms to ~2.4 ms. Re-apply the
+  `herdr-app.vega-sidebar` unit (or the herdr-app group) to pick it up.
+
+## 220 · 2026-11-16
+
+- feature: The keychain lock shows SSH agent state and key count. `vega config
+  infra` checks configured Git host SSH auth; `--fleet` checks saved hc machines.
+  Failures include repair hints for macOS Background/Aqua sessions.
+- unit: Apply `herdr-app.mods` after upgrading vegad on sender and relay hosts;
+  see [SSH agent setup](docs/design/ssh-agent.md) for the dotfiles-owned socket.
+
+## 219 · 2026-11-16
+
+- feature: Repo groups show as one sidebar block with a single UAC row. Only
+  members with live agents appear, nested with their own attention badges;
+  group views, pins and drag order apply to the whole block.
+- unit: apply `herdr-app.vega-sidebar` to use the grouped rendering.
+
+## 218 · 2026-11-16
+
+- feature: `vega uac adopt hc:<host>/<pane>` confirms parent, mode and briefing
+  records on the lane host before reporting success. Both hosts need matching
+  vega versions. Use it from the current UAC to re-parent resumed lanes after a
+  reboot; `--headless` routes questions to the UAC. The facility view now includes
+  fresh remote hc agents from the project registry.
+- optional: Pre-upgrade spawns without durable records need manual harness resume
+  followed by adoption; `vega mux reopen --help` explains recovery.
+
+## 217 · 2026-11-16
+
+- feature: Repo-group member projects show their shared UAC in the sidebar and
+  project window, with member-specific attention badges.
+- unit: use matching vegad and apply `herdr-app.vega-sidebar` for group UAC labels.
+
+## 216 · 2026-11-16
+
+- feature: Right-click sidebar agent rows to Pin/Unpin; pinned agents show a pin
+  and stay visible under Active. UAC menus also offer Open project window.
+- feature: Saved sidebar views offer Respect pins, keeping pinned projects and
+  agents visible outside the view's filters. Existing views default off;
+  `vega project view <name> --respect-pins` enables it when replacing a view.
+- unit: apply `herdr-app.vega-sidebar` with the matching project CLI to use it.
 
 ## 215 · 2026-11-15
 

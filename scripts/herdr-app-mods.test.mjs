@@ -5,6 +5,12 @@ import vm from 'node:vm';
 
 function load(name, {allowFocus=false}={}) {
   const state = new Map(), storage = new Map(), calls = [], tasks = [], commands = [];
+  const files = new Map(), fsCalls = [];
+  const fakeFs = {
+    mkdir: async p => { fsCalls.push(['mkdir', p]); },
+    readFile: async (p, enc) => { if (!files.has(p)) throw new Error('ENOENT'); return files.get(p); },
+    writeFile: async (p, text) => { fsCalls.push(['write', p]); files.set(p, text); },
+  };
   let props = {}, rendering = false, background = false;
   function el() {
     const obj={items:[],handlers:{}};let proxy;
@@ -31,6 +37,7 @@ function load(name, {allowFocus=false}={}) {
     closeOverlay:s=>calls.push(['close',s]),notify:s=>calls.push(['toast',s]),
     nextCommand:()=>{background=true;return new Promise(r=>commands.push(r));},watchFolder:()=>new Promise(()=>{}),
     exec:async (...a)=>{calls.push(['exec',...a]);return {code:0,stdout:'{}'};},
+    checking:()=>false, appHome:()=>'/scratch/app-home', fs: fakeFs,
     localStorage:{getItem:k=>storage.get(k)??null,removeItem:k=>storage.delete(k),setItem:(k,v)=>storage.set(k,v)},Date,Map,Set,JSON};
   let code=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/main.js`,import.meta.url),'utf8');
   code=code.replace(/^import .*;\n/gm,'').replace('export default class','globalThis.Mod = class');
@@ -42,10 +49,143 @@ function load(name, {allowFocus=false}={}) {
   }
   vm.runInContext(code,context);
   const mod=new context.Mod();
-  return {mod,state,storage,calls,cx,api:context,commands,newCopy:()=>new context.Mod(),setProps:p=>{props=p;},render(){rendering=true;try{return mod.render(cx);}finally{rendering=false;}},async flush(){await Promise.all(tasks.filter(p=>p));}};
+  return {mod,state,storage,calls,cx,api:context,commands,files,fsCalls,newCopy:()=>new context.Mod(),setProps:p=>{props=p;},render(){rendering=true;try{return mod.render(cx);}finally{rendering=false;}},async flush(){await Promise.all(tasks.filter(p=>p));}};
 }
 const row=()=>({schema:2,project:'project-a',checkout:'/repo with spaces',at:Date.now()/1000,decisions:1,
   decision_texts:[{id:'b-1',title:'Choose',question:'What next?',project:'project-a'}],waiting_panes:[]});
+
+test('rally group nests io sentinels under one ganymede UAC with member actions and badges',()=>{
+  const h=load('vega-sidebar'),coord='github.com/durandom/rally-ng-app',member='github.com/durandom/rally-ng-maps';
+  const uac={address:'ganymede/t1j',state:'live',status:'idle',labels:{'vega.role':'uac','vega.project-id':coord,'vega.project':'rally-ng-app','vega.git':'dirty','vega.group-members':JSON.stringify([coord,member])}};
+  const child={address:'io/t2',state:'live',status:'working',parent:uac.address,labels:{'vega.role':'sentinel','vega.project-id':member}};
+  h.api.terminals=()=>[uac,child];
+  h.api.agents=()=>[uac,child].map(a=>({...a,pane:a.address,program:{key:'codex'}}));
+  h.mod.init({},h.cx);
+  h.state.set('vega.badges',[
+    {...row(),project:coord,machine:'ganymede',decisions:9},
+    {...row(),project:member,machine:'ganymede',decisions:2},
+    {...row(),project:member,machine:'io',decisions:7},
+  ]);
+  const nodes=elements(h.render()),header=nodes.find(n=>n.idValue===`uac-${member}`);
+  assert(header);assert(texts(header).includes('rally-ng-maps'));
+  assert(!texts(header).includes('no UAC'));assert(!texts(header).includes('dirty'));
+  const block=nodes.find(n=>n.idValue===`project-block-${coord}`);
+  assert(elements(block).includes(header),'member header is inside the coordination block');
+  assert.equal(nodes.filter(n=>n.idValue==='ag-ganymede/t1j').length,1);
+  assert(!nodes.some(n=>typeof n.idValue==='string'&&n.idValue.startsWith('group-uac-')));
+  const context=nodes.find(n=>n.idValue==='ag-ganymede/t1j');
+  assert(context);assert(nodes.some(n=>n.idValue==='ag-io/t2'));
+  const badge=nodes.find(n=>n.idValue===`total-uac-${member}`);
+  assert(texts(badge).includes('2'));
+  badge.handlers.on_click({},h.cx);
+  let overlay=h.calls.filter(c=>c[0]==='open').at(-1)[1];
+  assert.equal(overlay.props.attentionProject,member);assert.equal(overlay.props.uac,uac.address);
+  header.handlers['on_mouse_down:right']({},h.cx);
+  overlay=h.calls.filter(c=>c[0]==='open').at(-1)[1];
+  assert.equal(overlay.props.projectConfig,member);assert.equal(overlay.props.uac,uac.address);
+  context.handlers.on_click();assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.focus'&&c[2].pane===uac.address));
+  context.handlers['on_mouse_down:right']({},h.cx);
+  overlay=h.calls.filter(c=>c[0]==='open').at(-1)[1];
+  h.setProps({...overlay.props,overlay:'menu'});
+  elements(h.render()).find(n=>n.idValue==='agent-project').handlers.on_click({},h.cx);
+  overlay=h.calls.filter(c=>c[0]==='open').at(-1)[1];
+  assert.equal(overlay.props.projectConfig,coord);assert.equal(overlay.props.uac,uac.address);
+  h.setProps(overlay.props);
+  assert(texts(h.mod.uacTab(h.mod.colors())).includes(uac.address));
+  h.setProps({});h.state.set('vega.hide-inactive',true);
+  assert(elements(h.render()).some(n=>n.idValue==='ag-ganymede/t1j'),'active member keeps its one idle group UAC context');
+  h.mod.preferences={projects:{},views:{Remote:{machines:['ganymede'],labels:[]}}};
+  h.state.set('vega.view','Remote');
+  assert(elements(h.render()).some(n=>n.idValue==='ag-ganymede/t1j'),'machine view uses the group UAC host');
+  h.mod.preferences.views.Remote.machines=['io'];
+  assert(elements(h.render()).some(n=>n.idValue==='ag-ganymede/t1j'),'member host matches the entire group');
+  h.api.focused=()=>({terminal:uac.address});h.api.theme=()=>({selected:'#selected'});
+  assert.equal(elements(h.render()).filter(n=>n.bgValue==='#selected').length,1,'only one highlighted UAC row');
+  h.api.focused=()=>({terminal:child.address});
+  const selected=elements(h.render()).filter(n=>n.bgValue==='#selected');
+  assert.equal(selected.length,1);assert.equal(selected[0].idValue,'ag-io/t2');
+  h.api.agents=()=>[child];
+  assert.equal(elements(h.render()).filter(n=>n.idValue==='ag-ganymede/t1j').length,1,'missing UAC agent report still supplies one context row');
+  h.mod.folded.add(`uac-${member}`);
+  assert(!elements(h.render()).some(n=>n.idValue==='ag-io/t2'));
+  assert(elements(h.render()).some(n=>n.idValue==='ag-ganymede/t1j'));
+  h.mod.folded.clear();
+  h.state.set('vega.view','all');uac.labels['vega.group-members']='';
+  assert.equal(h.mod.projectGroups([uac,child]).uacs.has(member),false);
+});
+
+test('puck 27-member group hides empty members and keeps folds, order, views and pins at block scope',()=>{
+  const h=load('vega-sidebar'),coord='github.com/team/epic-creator';
+  const members=Array.from({length:27},(_,i)=>`github.com/team/member-${i}`);
+  const uac={address:'puck/t19',state:'live',status:'idle',labels:{'vega.role':'uac','vega.project-id':coord,'vega.harness':'pi','vega.group-members':JSON.stringify(members)}};
+  const agent=(address,project,status='working')=>({address,state:'live',status,labels:{'vega.project-id':project},program:{key:'codex'}});
+  const first=agent('io/t2',members[0]),second=agent('puck/t3',members[1],'idle');
+  const own={...agent('t4',members[2]),labels:{'vega.project-id':members[2],'vega.role':'uac'}};
+  const shell={...agent('puck/t5',members[3]),foreground:{name:'zsh'}};
+  const dead={...agent('puck/t6',members[4]),state:'exited'};
+  const all=[uac,first,second,own,shell,dead];
+  h.api.terminals=()=>all;h.api.agents=()=>[second,own,first,uac];h.mod.init({},h.cx);
+  h.api.theme=()=>({selected:'#selected'});h.api.focused=()=>({terminal:uac.address});
+  const nodes=()=>elements(h.render()),ids=()=>nodes().map(n=>n.idValue);
+  let tree=h.render(),block=elements(tree).find(n=>n.idValue===`project-block-${coord}`);
+  assert.equal(elements(block).filter(n=>typeof n.idValue==='string'&&n.idValue.startsWith('uac-')).length,3,'coord plus two members with agents');
+  assert(elements(block).some(n=>n.idValue==='ag-io/t2'));
+  assert(!elements(block).some(n=>n.idValue===`uac-${members[2]}`),'own UAC stays outside');
+  for(const member of members.slice(3))assert(!ids().includes(`uac-${member}`),'no agents: '+member);
+  assert.equal(nodes().filter(n=>n.bgValue==='#selected').length,1);
+  assert.equal(ids().filter(id=>id==='ag-puck/t19').length,1);
+  assert.deepEqual(Array.from(h.calls.filter(c=>c[0]==='order').at(-1)[1]),[uac.address,first.address,second.address,own.address],'navigation follows block/member render order');
+  h.mod.move([coord,members[2]],members[2],coord);
+  assert.deepEqual(JSON.parse(h.storage.get('project-order')),[members[2],coord],'drag persists block IDs only');
+  h.mod.folded.add(`uac-${coord}`);assert(!ids().includes('ag-io/t2'));assert(!ids().includes('ag-puck/t19'));
+  assert(ids().includes('ag-t4'));h.mod.folded.clear();
+  h.mod.preferences={projects:{[members[26]]:{labels:['work']}},views:{Work:{labels:['work'],machines:[]},Strict:{labels:['excluded'],machines:[],respect_pins:false}}};
+  h.state.set('vega.view','Work');assert(ids().includes('ag-io/t2'),'even an empty member label admits whole block');
+  assert(!ids().includes('ag-t4'),'own UAC no longer shares group views');
+  h.state.set('vega.view','Strict');first.labels['herdr.pinned']='true';
+  assert(!ids().includes(`uac-${coord}`),'strict view excludes pinned agent');
+  h.mod.preferences.views.Strict.respect_pins=true;
+  assert(ids().includes('ag-puck/t19'));assert(ids().includes('ag-io/t2'));
+  assert(!ids().includes('ag-puck/t3'),'individual pin does not admit siblings');
+  delete first.labels['herdr.pinned'];uac.labels['herdr.pinned']='true';
+  assert.equal(ids().filter(id=>id==='ag-puck/t19').length,1,'pinning UAC admits only one UAC row');
+  assert(!ids().includes('ag-io/t2'),'pinning UAC does not admit member agents');
+  delete uac.labels['herdr.pinned'];first.labels['herdr.pinned']='true';
+  h.mod.preferences.projects[coord]={pinned:true};
+  assert(ids().includes('ag-puck/t3'),'project pin admits whole group');
+  h.state.set('vega.hide-inactive',true);h.api.focused=()=>null;
+  assert(ids().includes('ag-puck/t19'));assert(ids().includes('ag-io/t2'));
+  assert(!ids().includes(`uac-${members[1]}`),'Active hides idle unpinned members');
+  h.api.layout=()=>({id:'sidebar',size:{px:76}});
+  assert.equal(ids().filter(id=>id==='ag-puck/t19').length,1,'compact rail has no UAC duplicates');
+  h.api.layout=()=>null;h.state.set('vega.hide-inactive',false);
+  delete h.mod.preferences.projects[coord].pinned;
+  h.mod.preferences.projects[members[26]].pinned=true;
+  assert(ids().includes('ag-puck/t3'),'legacy member project pin admits group');
+  h.state.set('vega.view','all');uac.labels['vega.group-members']='';
+  block=elements(h.render()).find(n=>n.idValue===`project-block-${coord}`);
+  assert(!elements(block).some(n=>n.idValue==='ag-io/t2'),'removed membership restores independent projects');
+  assert(ids().includes(`uac-${members[0]}`));
+  assert.equal(ids().filter(id=>id==='ag-puck/t19').length,1);
+});
+
+test('group membership ignores malformed, dead and foreign-role labels; own UAC wins',()=>{
+  const h=load('vega-sidebar'),member='github.com/team/maps',coord='github.com/team/app';
+  const group={address:'ganymede/t1',state:'live',labels:{'vega.role':'uac','vega.project-id':coord,'vega.group-members':JSON.stringify([member])}};
+  const resolve=terms=>h.mod.projectGroups(terms).uacs.get(member)?.address;
+  assert.equal(resolve([group]),group.address);
+  const own={address:'t2',state:'live',labels:{'vega.role':'uac','vega.project-id':member}};
+  assert.equal(resolve([group,own]),own.address);assert.equal(resolve([own,group]),own.address);
+  assert.equal(resolve([{...group,state:'exited'}]),undefined);
+  assert.equal(resolve([{...group,labels:{...group.labels,'vega.project-id':''}}]),undefined,'a group needs a coordination project');
+  for(const role of ['sentinel','uber'])assert.equal(resolve([{...group,labels:{...group.labels,'vega.role':role}}]),undefined);
+  assert.equal(resolve([{...group,labels:{...group.labels,'vega.window':'status'}}]),undefined);
+  for(const value of ['{broken','null','{}','"maps"','[null,42,{},""]']) {
+    assert.equal(resolve([{...group,labels:{...group.labels,'vega.group-members':value}}]),undefined);
+  }
+  assert.equal(resolve([{...group,address:'t1'}]),'t1');
+  assert(h.mod.projectGroups([group]).projects.has(member));
+});
 
 test('stock tabs and pane forks render static themed working dots and keep actions',()=>{
   const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
@@ -923,6 +1063,185 @@ function projectFixture(h) {
   return project;
 }
 
+test('sidebar shows coloured browser dots on owning agent rows and derives once per payload',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);
+  h.render();
+  assert(!elements(h.render()).some(n=>typeof n.idValue==='string'&&n.idValue.includes('browsers')),'no badge without browser data');
+  const model=h.mod.modelCache;
+  h.state.set('vega.browsers',{at:Date.now()/1000,sessions:[
+    {session:'classic-live',colour:'#d9465f',state:'live',pane:'t2',project:'spellkave',headed:true,age:60},
+    {session:'classic-p2',colour:'#0e8f6f',state:'live',pane:'t2',project:'spellkave',headed:false,age:60},
+    {session:'huk24',colour:'#3d73cc',state:'live',pane:'t3',project:'brainz',headed:true,age:60},
+    {session:'unowned-x',colour:'#9d6bf0',state:'unowned',pane:null,project:null,headed:null,age:null},
+    {session:'herdr-pane',colour:'#123456',state:'live',pane:'w1:p9',project:'x',headed:null,age:null}],
+    loose:[]});
+  h.render();
+  assert.notEqual(h.mod.modelCache,model,'a new browser payload rebuilds the model');
+  let cached=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,cached,'an unchanged payload reuses the cache');
+  const nodes=elements(h.render());
+  const badge=nodes.find(n=>n.idValue==='vega-t2-browsers');
+  assert(badge,'the owning sentinel row carries a badge');
+  const dots=badge.items.filter(n=>n.bgValue?.startsWith?.('#'));
+  assert.deepEqual(dots.map(n=>n.bgValue),['#d9465f','#0e8f6f'],'one dot per session in its colour');
+  assert.equal(badge.items.find(n=>n.tooltipValue).tooltipValue,'browser classic-live · live · headed');
+  assert(nodes.some(n=>n.idValue==='vega-t3-browsers'),'the other owner carries its badge');
+  assert(!nodes.some(n=>n.idValue==='vega-t4-browsers'),'a session-less agent has no badge');
+  // More than three sessions collapse into dots plus a count; the render
+  // itself never reads browsers (no exec of vega browser anywhere).
+  h.state.set('vega.browsers',{at:Date.now()/1000,sessions:[1,2,3,4,5].map(i=>
+    ({session:`s${i}`,colour:'#d9465f',state:'live',pane:'t2',project:'p',headed:true,age:1})),loose:[]});
+  h.render();
+  const capped=elements(h.render()).find(n=>n.idValue==='vega-t2-browsers');
+  assert.equal(capped.items.filter(n=>n.bgValue==='#d9465f').length,3);
+  assert(texts(capped).includes('+2'));
+  assert(!h.calls.some(c=>c[0]==='exec'&&c[1]?.[0]==='vega'&&c[1]?.[1]?.[0]==='browser'),'the sidebar never reads browsers itself');
+});
+
+test('sidebar derivation is cached between renders and rebuilt exactly when an input changes',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);
+  h.render();
+  const first=h.mod.modelCache;
+  assert.ok(first,'first render derives a model');
+  h.render();
+  assert.equal(h.mod.modelCache,first,'unchanged inputs reuse the cached model');
+  // Terminal data: a pin label rebuilds.
+  const all=h.api.terminals();h.api.terminals=()=>all;
+  all[1].labels['herdr.pinned']='true';
+  h.render();assert.notEqual(h.mod.modelCache,first);
+  let model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  assert(elements(h.render()).some(n=>n.tooltipValue==='Pinned agent'),'rebuilt model carries the pin marker');
+  // Agent data: a status change rebuilds.
+  const agents=h.api.agents();h.api.agents=()=>agents;agents[2].status='blocked';
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  // Focus changes rebuild (the focused row highlight and Active retention read it).
+  h.api.focused=()=>({terminal:'t3'});
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  // Views, badges and preferences rebuild; a stale badge row (past 60 s) rebuilds too.
+  h.state.set('vega.view',`label:${'work'}`);
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  h.state.set('vega.badges',[{project,at:Date.now()/1000,decisions:1}]);
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  h.state.set('vega.badges',[{project,at:Date.now()/1000-61,decisions:1}]);
+  h.render();assert.notEqual(h.mod.modelCache,model,'crossing the 60 s freshness boundary rebuilds');
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  h.mod.preferences={projects:{[project]:{pinned:true}},views:{}};
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  // Manual project order is a model input (drag order).
+  h.mod.move([project],project,project);h.mod.order=['zzz-other'];
+  h.render();assert.notEqual(h.mod.modelCache,model,'manual order is a model input');
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  // Pure build state reuses the cache: folds, theme, layout width, shared-state mirrors.
+  h.mod.folded.add(`uac-${project}`);
+  h.render();assert.equal(h.mod.modelCache,model);
+  h.api.theme=()=>({selected:'#selected'});h.api.layout=()=>({id:'sidebar',size:{px:76}});
+  h.render();assert.equal(h.mod.modelCache,model);
+  h.api.layout=()=>null;h.mod.folded.clear();
+  // Waiting episodes (shared state) rebuild the waiting rows.
+  h.state.set('vega.waiting-state',{[JSON.stringify([project,'','t2'])]:{cleared:true}});
+  h.render();assert.notEqual(h.mod.modelCache,model);
+  model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
+  // The localStorage fallback (restart path) is an input too: shared state unset.
+  const g=load('vega-sidebar');projectFixture(g);g.mod.init({},g.cx);g.render();
+  g.storage.set('active-view','all');g.render();
+  const restart=g.mod.modelCache;
+  g.storage.set('active-view','label:work');
+  g.render();assert.notEqual(g.mod.modelCache,restart,'localStorage view fallback rebuilds');
+  g.render();assert.equal(g.mod.modelCache,g.mod.modelCache);
+  // The rendered tree still follows rebuilt data: unpin removes the marker.
+  all[1].labels={};
+  h.render();
+  assert(!elements(h.render()).some(n=>n.tooltipValue==='Pinned agent'));
+});
+
+test('sidebar diagnostics: breadcrumbs detect interrupted renders, record slow/failed ones, flush a capped ring file',async()=>{
+  const diagDir='/scratch/app-home/data/vega-sidebar-diagnostics',diagPath=`${diagDir}/render-log.jsonl`;
+  const h=load('vega-sidebar');projectFixture(h);
+  const d=h.mod.constructor.diagState();
+  h.mod.init({},h.cx);
+  // The module-eval load line flushes to the ring file.
+  await d.flush();
+  assert(h.files.get(diagPath)?.includes('"e":"load"'));
+  // Happy path: renders do no file I/O and leave no breadcrumb or events behind.
+  const writes=()=>h.fsCalls.filter(c=>c[0]==='write').length;
+  const before=writes();
+  h.render();h.render();
+  assert.equal(writes(),before,'no per-render file I/O');
+  assert.equal(d.current,null);assert.equal(d.pending.length,0);
+  // Phase breadcrumbs: a rebuild render walks signature -> derive -> elements,
+  // and the input sizes land in the in-flight breadcrumb's meta.
+  const seen=[];
+  const realTree=h.mod.projectTree.bind(h.mod);
+  h.mod.projectTree=(...a)=>{seen.push([d.current?.phase,d.current?.meta?.terminals]);return realTree(...a);};
+  h.render();
+  h.mod.projectTree=realTree;
+  assert.deepEqual([...seen.at(-1)],['elements',4]);
+  assert.equal(d.pending.length,0);
+  // A breadcrumb that never finished is detected by the next begin.
+  const stale={kind:'render:main',start:Date.now()-5130,phaseAt:Date.now()-4210,phase:'derive:order',
+    phases:[['begin',1],['signature',120],['derive',60],['derive:trees',4030]],
+    meta:{terminals:140,agents:110,panes:96,spaces:44,badges:12,projects:40,sigLen:28410,view:'all',filtering:false}};
+  d.current=stale;
+  h.render();
+  const interrupted=JSON.parse(d.pending.find(l=>l.includes('"e":"interrupted"')));
+  assert.equal(interrupted.kind,'render:main');assert.equal(interrupted.phase,'derive:order');
+  assert.equal(interrupted.by,'render:main');
+  assert.ok(interrupted.phaseMs>=4210&&interrupted.phaseMs<4300);
+  assert.ok(interrupted.sinceStartMs>=5130&&interrupted.sinceStartMs<5220);
+  assert.deepEqual(interrupted.phases.at(-1),['derive:trees',4030]);
+  assert.equal(interrupted.sizes.agents,110);assert.equal(interrupted.sizes.sigLen,28410);
+  await d.flush();
+  assert(h.files.get(diagPath).includes('"e":"interrupted"'),'interrupted render reaches the log');
+  // A thrown render records an exception with its phase, then clears the breadcrumb.
+  const realSpaces=h.api.spaces;
+  h.api.spaces=()=>{throw new Error('boom');};
+  assert.throws(()=>h.render());
+  const failed=JSON.parse(d.pending.find(l=>l.includes('"e":"exception"')));
+  assert.equal(failed.kind,'render:main');assert.equal(failed.phase,'signature');
+  assert.ok(failed.error.includes('boom'));assert.equal(failed.sizes,null,'sizes are whatever the render had reached');
+  assert.equal(d.current,null,'a caught render is not an interruption');
+  h.api.spaces=realSpaces;h.render();
+  // Slow renders carry the phase breakdown and input sizes.
+  d.slowMs=0;d.pending.length=0;
+  h.render();
+  const slow=JSON.parse(d.pending.find(l=>l.includes('"e":"slow"')));
+  d.slowMs=10;
+  assert.equal(slow.kind,'render:main');
+  assert.ok(slow.phases.some(([name])=>name==='signature'));
+  assert.ok(slow.phases.some(([name])=>name==='elements'));
+  assert.equal(slow.sizes.terminals,4);
+  // Flushes are rate-limited: events inside the window wait for a later one.
+  h.files.set(diagPath,'');
+  d.lastWrite=Date.now();d.pending.length=0;
+  d.current={...stale,start:Date.now(),phaseAt:Date.now()};
+  h.render();
+  await new Promise(r=>setTimeout(r,10));
+  assert.equal(writes(),before+1,'rate window holds the flush');
+  assert.equal(d.pending.length,1,'event stays pending');
+  d.lastWrite=0;
+  d.current={...stale,start:Date.now(),phaseAt:Date.now()};
+  h.render();
+  await new Promise(r=>setTimeout(r,10));
+  assert.equal((h.files.get(diagPath).match(/"e":"interrupted"/g)||[]).length,2,'coalesced flush writes both');
+  // The ring file is size-capped, keeping the newest lines.
+  const filler=JSON.stringify({e:'fill',pad:'x'.repeat(120)});
+  h.files.set(diagPath,Array.from({length:1200},()=>filler).join('\n')+'\n');
+  d.lastWrite=0;d.pending.length=0;
+  d.current={...stale,kind:'render:main',start:Date.now(),phaseAt:Date.now()};
+  h.setProps({mail:'t7'});
+  h.render();
+  await new Promise(r=>setTimeout(r,10));
+  const ring=h.files.get(diagPath);
+  assert.ok(ring.length<=d.fileMax,'ring file stays capped');
+  assert.ok((ring.match(/"e":"fill"/g)||[]).length<1200,'oldest lines dropped');
+  assert.ok(ring.trimEnd().endsWith('"by":"render:mail"}'),'newest event kept and names the detecting copy');
+  h.setProps({});
+});
+
 test('inactive filter retains UAC context and active descendants; retains done sub-agents; hides idle and unknown rows and empty groups',()=>{
   const h=load('vega-sidebar'),project=projectFixture(h);
   const all=h.api.terminals();
@@ -1237,6 +1556,79 @@ test('legacy-only projects stay visible and no-UAC projects retain manual order'
   assert.equal(h.mod.projectGroups(all).projectOfAgent({address:'legacy'}),'legacy');
 });
 
+test('agent popup pins live terminals and preserves UAC actions and Escape',()=>{
+  const h=load('vega-sidebar');projectFixture(h);h.mod.init({},h.cx);
+  for(const id of ['ag-puck/t1','sub-t2','ag-t3']) {
+    elements(h.render()).find(n=>n.idValue===id).handlers['on_mouse_down:right']({},h.cx);
+    const spec=h.calls.filter(c=>c[0]==='open').at(-1)[1];
+    assert.equal(spec.kind,'popup');assert.equal(spec.props.agentMenu.address,id.replace(/^(ag|sub)-/,''));
+  }
+  const m=load('vega-sidebar');const all=h.api.terminals();m.api.terminals=()=>all;
+  m.setProps({agentMenu:{address:'puck/t1'},overlay:'menu'});m.mod.init({},m.cx);
+  assert.equal(m.calls.length,0,'menu starts no navigation or reads');
+  let nodes=elements(m.render());assert(texts(nodes.find(n=>n.idValue==='pin-agent')).includes('Pin'));
+  nodes.find(n=>n.idValue==='pin-agent').handlers.on_click({},m.cx);
+  assert.equal(JSON.stringify(m.calls.find(c=>c[0]==='run')),JSON.stringify(['run','terminal.pin',{terminal:'puck/t1',pinned:true}]));
+  all[0].labels['herdr.pinned']='true';nodes=elements(m.render());
+  assert(texts(nodes.find(n=>n.idValue==='pin-agent')).includes('Unpin'));
+  nodes.find(n=>n.idValue==='pin-agent').handlers.on_click({},m.cx);
+  assert.equal(m.calls.filter(c=>c[0]==='run').at(-1)[2].pinned,false);
+  nodes.find(n=>n.idValue==='agent-project').handlers.on_click({},m.cx);
+  assert.equal(m.calls.filter(c=>c[0]==='open').at(-1)[1].props.projectConfig,'github.com/team/a');
+  m.render().handlers.on_key_down({keystroke:'escape'},m.cx);
+  assert(m.calls.some(c=>c[0]==='close'&&c[1]==='menu'));
+  m.setProps({agentMenu:{address:'t3'},overlay:'menu'});
+  assert(!elements(m.render()).some(n=>n.idValue==='agent-project'));
+  all.find(t=>t.address==='t3').state='exited';
+  assert(!elements(m.render()).some(n=>n.idValue==='pin-agent'),'vanished targets have no pin action');
+});
+
+test('pins survive Active and only cross saved view filters with Respect pins',()=>{
+  const h=load('vega-sidebar'),project=projectFixture(h);const all=h.api.terminals();
+  for(const address of ['t2','t3','t4'])all.find(t=>t.address===address).labels['herdr.pinned']='true';
+  all.push({address:'puck/sibling',state:'live',parent:'puck/t1',status:'working',labels:{}});
+  h.api.terminals=()=>all;h.mod.init({},h.cx);h.state.set('vega.hide-inactive',true);
+  const ids=()=>elements(h.render()).map(n=>n.idValue);
+  for(const id of ['ag-puck/t1','sub-t2','ag-t3','ag-t4'])assert(ids().includes(id),id);
+  assert(elements(elements(h.render()).find(n=>n.idValue==='sub-t2')).some(n=>n.tooltipValue==='Pinned agent'));
+  h.mod.preferences={projects:{[project]:{labels:['work']}},views:{Strict:{labels:['other'],machines:['other']}}};
+  h.state.set('vega.view','Strict');assert(!ids().includes(`uac-${project}`));assert(!ids().includes('ag-t4'));
+  h.mod.preferences.views.Strict.respect_pins=true;
+  for(const active of [false,true]) {
+    h.state.set('vega.hide-inactive',active);
+    for(const id of [`uac-${project}`,'sub-t2','ag-t3','ag-t4'])assert(ids().includes(id),`${id}, Active=${active}`);
+    assert(!ids().includes('sub-puck/sibling'),'unpinned working sibling cannot cross view boundary');
+    h.api.layout=()=>({id:'sidebar',size:{px:76}});
+    const nodes=elements(h.render());assert(nodes.some(n=>n.idValue==='ag-t2'),'rail includes pinned child');
+    nodes.find(n=>n.idValue==='ag-t3').handlers['on_mouse_down:right']({},h.cx);
+    assert.equal(h.calls.filter(c=>c[0]==='open').at(-1)[1].props.agentMenu.address,'t3');
+    h.api.layout=()=>null;
+  }
+  h.mod.preferences.projects[project].pinned=true;
+  assert(ids().includes('sub-puck/sibling'),'pinned project admits its working members');
+  h.mod.preferences.views.Strict.respect_pins=false;
+  assert(!ids().includes(`uac-${project}`),'project pins also obey strict views');
+  h.state.set('vega.view','label:other');assert(!ids().includes(`uac-${project}`),'ad-hoc view remains strict');
+  h.state.set('vega.view','all');delete all.find(t=>t.address==='t3').labels['herdr.pinned'];
+  assert(!ids().includes('ag-t3'),'unpinning idle agent restores Active filtering');
+});
+
+test('view popup edits, saves and clears Respect pins with the whole saved view',async()=>{
+  const h=load('vega-sidebar');h.setProps({viewMenu:true,overlay:'views'});
+  const prefs={projects:{},views:{Work:{labels:['work'],machines:[],respect_pins:true},Old:{labels:['work'],machines:[]}}};
+  h.api.exec=async(bin,args)=>{h.calls.push(['exec',bin,args]);return {code:0,stdout:JSON.stringify(prefs)};};
+  h.mod.init({},h.cx);await h.flush();assert.equal(h.mod.viewRespectPins,false);
+  elements(h.render()).find(n=>n.idValue==='edit-view-Work').handlers.on_click({},h.cx);
+  assert.equal(h.mod.viewRespectPins,true);await h.mod.saveView(h.cx);
+  const argv=()=>h.calls.filter(c=>c[0]==='exec'&&c[2][1]==='view').at(-1)[2];
+  assert(argv().includes('--respect-pins'));
+  elements(h.render()).find(n=>n.idValue==='respect-pins').handlers.on_click({},h.cx);
+  await h.mod.saveView(h.cx);assert(!argv().includes('--respect-pins'));
+  h.mod.viewRespectPins=true;
+  elements(h.render()).find(n=>n.idValue==='edit-view-Old').handlers.on_click({},h.cx);
+  assert.equal(h.mod.viewRespectPins,false,'old views reset the editor toggle');
+});
+
 test('view popup selects, saves and deletes CLI-owned views without persisting config in shared state',async()=>{
   const h=load('vega-sidebar');h.setProps({viewMenu:true,overlay:'views'});
   let preferences={projects:{},views:{Work:{labels:['work'],machines:['puck']}}};
@@ -1468,7 +1860,7 @@ test('keychain popup opens once globally per lock, click reopens only its own te
 test('keychain status uses theme colours, host and since tooltips, and stale data becomes unknown',async()=>{
   const h=load('vega'), now=Date.now()/1000;
   const t={ansi1:'theme-red',ansi2:'theme-green',dim:'theme-dim'};h.api.theme=()=>t;
-  h.mod.applyKeychains(['unlocked','locked','unknown'].map((state,i)=>({host:['localmac','puck','offline'][i],state,since:now-30,at:now})),now,h.cx);
+  h.mod.applyKeychains(['unlocked','locked','unknown'].map((state,i)=>({host:['localmac','puck','offline'][i],state,since:now-30,at:now,agent:{state:'ready',keys:2}})),now,h.cx);
   await h.flush();
   h.mod.localKeychainHost='localmac';
   const lockOf=focus=>{h.api.focused=()=>({terminal:focus});return elements(h.render()).filter(n=>String(n.idValue).startsWith('keychain-'));};
@@ -2116,4 +2508,94 @@ test('services displays registered metadata and toggles hidden agent ports witho
   assert.equal(h.calls.length,0,'filter changes do not scan or forward');
   toggle.handlers.on_click({},h.cx);
   assert(!JSON.stringify(h.render()).includes('codex :5000'));
+});
+
+
+test('services shows a Browsers group with colours, scope and a two-step close',async()=>{
+  const h=load('vega-services');
+  const terms=[{address:'t1',state:'live',pid:10,labels:{'herdr.space':'s1','vega.project-id':'org/a','vega.role':'uac'}},
+    {address:'t2',state:'live',pid:20,labels:{'herdr.space':'s2','vega.project-id':'org/b','vega.role':'uac'}}];
+  h.api.terminals=()=>terms;
+  h.api.focused=()=>({terminal:'t1',space:'s1'});
+  Object.assign(h.mod,{rows:[],errors:[],forwards:new Map(),pending:new Set(),targets:new Map(),
+    browserConfirm:new Set(),browserClosing:new Set(),browserError:null,
+    browsers:{at:Date.now()/1000,sessions:[
+      {session:'mine-live',colour:'#d9465f',state:'live',pane:'t1',project:'a',headed:true,age:120},
+      {session:'other-proj',colour:'#0e8f6f',state:'live',pane:'t2',project:'b',headed:false,age:120},
+      {session:'no-owner',colour:'#3d73cc',state:'unowned',pane:null,project:null,headed:null,age:null}],
+      loose:[{pid:900,headed:true,n:3}]}});
+  const nodes=root=>[root,...(root?.items??[]).filter(x=>x&&typeof x==='object').flatMap(nodes)];
+  const text=JSON.stringify(h.render());
+  assert(text.includes('Browsers'));
+  assert(text.includes('mine-live'));assert(text.includes('headed'));
+  assert(text.includes('no-owner'));assert(text.includes('unowned browser · pid 900'));
+  assert(!text.includes('other-proj'),'another project session is scoped out');
+  const dot=nodes(h.render()).find(n=>n.idValue==='browser-mine-live');
+  assert(dot.items[0].items[0].bgValue==='#d9465f','colour dot in the session colour');
+  // Two-step close: the first click asks, the second runs vega browser close.
+  const close=nodes(h.render()).find(n=>n.idValue==='browser-close-mine-live');
+  close.handlers.on_click({},h.cx);
+  assert.equal(h.calls.length,0,'no exec before the confirm');
+  assert(JSON.stringify(h.render()).includes('Close session?'));
+  h.api.exec=async(...args)=>{h.calls.push(args);return {code:0,stdout:''};};
+  const confirm=nodes(h.render()).find(n=>n.idValue==='browser-close-mine-live');
+  confirm.handlers.on_click({},h.cx);await h.flush();
+  assert(h.calls.some(c=>c[1]?.[0]==='browser'&&c[1]?.[1]==='close'&&c[1]?.[2]==='mine-live'),'runs vega browser close after the confirm');
+  assert(!h.mod.browserConfirm.has('mine-live'),'confirm resets after the action');
+});
+
+test('services refresh reads vega browser ls once and publishes the badge payload',async()=>{
+  const h=load('vega-services');
+  h.api.appHome=()=>'/temporary-home/herdr-app';
+  h.api.readTextFile=async()=> 'fake script';
+  h.api.hc=async()=>({code:0,stdout:JSON.stringify({machines:[]})});
+  h.api.spaces=()=>[];h.api.terminals=()=>[];h.api.focused=()=>null;
+  let browserReads=0;
+  h.api.exec=async(...args)=>{
+    h.calls.push(args);
+    if(args[1][0]==='browser') {
+      browserReads++;
+      return {code:0,stdout:JSON.stringify({schema:1,error:null,
+        sessions:[{session:'s1',state:'live',colour:'#d9465f',pane:'t7',project:'vega',headed:true,pid:11,age:5,idle:5},
+          {session:'s2',state:'closed',colour:'#0e8f6f',pane:null,project:null,headed:null,pid:null,age:5,idle:5}],
+        browsers:[{pid:11,kind:'chrome-for-testing',headed:true,age:5,port:0,user_data_dir:'/x/s1-profile',global:false},
+          {pid:12,kind:'chrome-for-testing',headed:true,age:5,port:0,user_data_dir:'/x/s1-profile',global:false},
+          {pid:20,kind:'chromium',headed:true,age:5,port:9223,user_data_dir:'/g',global:true},
+          {pid:30,kind:'chrome-for-testing',headed:false,age:5,port:0,user_data_dir:'/tmp/uuid',global:false}]})};
+    }
+    return {code:0,stdout:JSON.stringify({listeners:[],parents:{},cwds:{},home:'/temporary-home'})};
+  };
+  h.mod.init({},h.cx);await h.flush();
+  assert.equal(browserReads,1,'one browser read per refresh');
+  const shared=h.state.get('vega.browsers');
+  assert.equal(JSON.stringify(shared.sessions),JSON.stringify(
+    [{session:'s1',colour:'#d9465f',state:'live',pane:'t7',project:'vega',headed:true,age:5}]));
+  assert.equal(JSON.stringify(shared.loose),JSON.stringify([{pid:30,headed:false,n:1}]),'global and session-owned browsers are not loose');
+  // A failing read keeps the panel alive with an inline error.
+  h.api.exec=async(...args)=>{
+    if(args[1][0]==='browser') return {code:1,stderr:'vega browser ls failed'};
+    return {code:0,stdout:JSON.stringify({listeners:[],parents:{},cwds:{},home:'/h'})};
+  };
+  h.mod.refresh(h.cx);await h.flush();
+  assert.match(h.mod.browserError,/vega browser ls failed/);
+  assert(JSON.stringify(h.render()).includes('vega browser ls failed'));
+});
+
+test('keychain indicator includes agent count, fix hint and expires agent claims',async()=>{
+  const h=load('vega'),now=Date.now()/1000;
+  h.mod.localKeychainHost='localmac';
+  const sample={host:'localmac',state:'unlocked',since:now-30,at:now,agent:{state:'ready',keys:3}};
+  h.mod.applyKeychains([sample],now,h.cx);
+  let lock=elements(h.render()).find(n=>n.idValue==='keychain-localmac');
+  assert(lock.tooltipValue.includes('ready · 3 keys'));
+  assert(texts(lock).includes(' 3'));
+  h.mod.applyKeychains([{...sample,agent:{state:'empty',keys:0}}],now,h.cx);
+  lock=elements(h.render()).find(n=>n.idValue==='keychain-localmac');
+  assert(lock.tooltipValue.includes('empty · 0 keys'));
+  assert(lock.tooltipValue.includes('Terminal.app'));
+  assert(lock.tooltipValue.includes('--apple-use-keychain'));
+  h.mod.applyKeychains([sample],now-181,h.cx);
+  lock=elements(h.render()).find(n=>n.idValue==='keychain-localmac');
+  assert(lock.tooltipValue.includes('agent.sock: unknown'));
+  assert(!lock.tooltipValue.includes('3 keys'));
 });

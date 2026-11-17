@@ -18,6 +18,75 @@ Host reads work outside a project. `hosts [--host <host>] --json` returns rows w
 host, seat, lane, tier, model, source (`host` or `global`), until, and allowed models.
 Private hosts enumerate known registry hosts; inbox-only hosts list only self.
 
+### Host-local seats overlay (vega-weju)
+
+An inbox-only host that can reach pi only through a gateway (puck via EnMaaS) still needs
+`mux spawn --kind pi --tier X` to resolve a startable id, without repo edits. The host-local overlay
+`~/.config/vega/lanista/seats.local.json` (`$XDG_CONFIG_HOME/vega/lanista/seats.local.json`) provides it;
+`vega lanista install`/seats sync never touches this file (it syncs only `$XDG_CONFIG_HOME/lanista/seats.json`).
+
+```json
+{
+  "schema": 1,
+  "seats": {
+    "herdr-agents": [
+      {"provider": "pi", "pin": "enmaas/gome-3.1", "tier": "flagship", "cost": "unknown"},
+      {"provider": "pi", "pin": "enmaas/gome-2.4", "tier": "balanced", "cost": "budget"}
+    ]
+  }
+}
+```
+
+Entries carry the lane (`provider`: a repo lane), the startable `pin` (gateway ids such as `enmaas/<id>`),
+a `tier`, and — deprecated fallbacks since vega-777n, see the next section — optional `canonical` and
+required `cost` (`subscription|budget|unknown`). Unknown fields, lanes, tiers, cost values, empty pins and unknown seats
+are reported on stderr and skipped — never silently used; a file that is not valid JSON disables the whole
+overlay with one diagnostic. `vega lanista doctor` prints the overlay state.
+
+The overlay merges once in `seats::effective()` — repo pins plus overlay pins, overlay first, so an overlay
+pin wins for its (provider, tier) — and feeds every resolution site (change validation, `resolve_cell`, the
+`hosts` rows, `lanista pin`, mux tier selection). Precedence stays project > host > registry default >
+overlay > repo global. For lane pi an overlay pin for the tier wins over the historical zai chain; project
+and host pi pins still outrank it. `hosts` rows show such cells with source `overlay` and the resolved
+lane `pi`; the lane allowlist includes the gateway id.
+
+Overlay pins are resolution-local: registry host/default writes validate on the receiver against its own
+seats, so a gateway id relays nowhere unless the control host also allows it. Capacity treats the `enmaas/`
+model prefix as its own provider with no quota window: `capacity: unknown (no enmaas account window in the
+sample)` — unknown, not zero. Follow-ups (availability probe, route pricing, rollback CLI) are filed as
+separate beads.
+
+### Route facts through lanista (vega-777n)
+
+Ownership, agreed with the lanista UAC (contract: lanista `docs/routes.md` at main `3b1c337`): vega's
+`seats.local.json` owns only provider + tier → route id. lanista's host-local
+`$XDG_CONFIG_HOME/lanista/routes.local.json` owns route id → canonical id and the route facts (cost class,
+pricing, limits, context, modalities; each field `{value, source_note, as_of}` with `schema` 1). The join
+key is the exact runtime route id, string-equal — no alias or normalize.
+
+vega never reads that file directly. It runs `lanista --json routes` (the listing form; the per-route
+`lanista --json route <id>` exits 1 when absent) **at most once per command**, through one bounded
+subprocess (`crates/vega-herdr/src/routes.rs`, 5 s timeout, `VEGA_LANISTA_BIN` overrides the binary for
+tests). Precedence per field: lanista's resolved entry — including an explicit `null`, which masks and
+stays unknown; unknown is never zero — then the seats overlay's deprecated `canonical`/`cost` as the
+fallback (origin `seats-overlay`), then unknown. When both sides are known and differ, vega warns on
+stderr and lanista wins. A missing, old, hung or broken lanista degrades to the fallback with a hint
+(`vega lanista install`), never fails the command.
+
+Consumers:
+
+- `vega lanista hosts` rows carry `canonical`, `cost` and `cost_origin` (JSON) plus `cost,origin` text
+  columns for every resolved model that is a lanista route or an overlay pin.
+- `vega mux spawn` resolves the selected model's facts (inside the capacity thread, parallel with agent
+  start) and appends them to an unknown capacity line:
+  `capacity: unknown (no enmaas account window in the sample; route subscription, origin local)`. With
+  real headroom the route facts stay out — the window is the capacity.
+- `vega lanista pin` prints the resolved `canonical`/`cost` (with origin) instead of the seats pin's own.
+- `vega lanista doctor` adds vega rows after lanista's own checks: a canonical/cost mismatch is `warn`
+  (fix: record the facts in `routes.local.json`, drop them from `seats.local.json`), a fallback in use is
+  `ok`-info, and an unreadable lanista or overlay is `warn` with the hint. Doctor keeps its existing
+  `lanista --json doctor` call; the mismatch check adds the one `lanista --json routes` read.
+
 ### Registry defaults
 
 `vega lanista pin <lane> --tier <tier> --default --set <model>` (or `--clear`)

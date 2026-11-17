@@ -1,5 +1,6 @@
 //! Model pins shared by lanista's CLI and agent spawning.
 pub mod hosts;
+pub mod routes;
 pub mod seats;
 
 use std::path::Path;
@@ -8,7 +9,7 @@ use vega_herdr::Failure;
 /// Resolve a tier in the target checkout, using the same project overrides as
 /// `vega lanista pin`. An unavailable registry falls back to the shipped pins.
 pub fn resolve(provider: &str, tier: &str, cwd: &Path) -> Result<String, Failure> {
-    let pins = seats::pins(seats::SEATS, seats::DEFAULT_SEAT).expect("embedded seats are tested");
+    let pins = seats::effective(seats::DEFAULT_SEAT).expect("embedded seats are tested");
     let pin = seats::global(&pins, provider, tier).ok_or_else(|| {
         Failure::new(
             "usage",
@@ -23,6 +24,7 @@ pub fn resolve(provider: &str, tier: &str, cwd: &Path) -> Result<String, Failure
         &vega_registry::View::default(),
         &host_config,
         &defaults,
+        &pins,
         None,
         seats::DEFAULT_SEAT,
         provider,
@@ -74,6 +76,7 @@ pub fn resolve(provider: &str, tier: &str, cwd: &Path) -> Result<String, Failure
                 &view,
                 &host_config,
                 &defaults,
+                &pins,
                 Some(project.id.as_str()),
                 seats::DEFAULT_SEAT,
                 provider,
@@ -99,10 +102,12 @@ pub fn select(
     lane: &str,
     tier: &str,
 ) -> Option<String> {
+    let pins = seats::pins(seats::SEATS, seat).ok()?;
     select_layers(
         view,
         config,
         &hosts::Config::default(),
+        &pins,
         project,
         seat,
         lane,
@@ -114,12 +119,23 @@ pub fn select_layers(
     view: &vega_registry::View,
     config: &hosts::Config,
     defaults: &hosts::Config,
+    pins: &[seats::Pin],
     project: &str,
     seat: &str,
     lane: &str,
     tier: &str,
 ) -> Option<String> {
-    hosts::resolve_cell(view, config, defaults, Some(project), seat, lane, tier).map(|p| p.model)
+    hosts::resolve_cell(
+        view,
+        config,
+        defaults,
+        pins,
+        Some(project),
+        seat,
+        lane,
+        tier,
+    )
+    .map(|p| p.model)
 }
 
 /// Active project override (host, model, expiry), shared with the pin CLI.

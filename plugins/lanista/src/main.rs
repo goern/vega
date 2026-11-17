@@ -262,7 +262,13 @@ fn home() -> Result<ExitCode, Failure> {
         state.label(),
         tilde(&path.display().to_string())
     );
-    let pins = seats::pins(seats::SEATS, seats::DEFAULT_SEAT).unwrap_or_default();
+    let overlay = seats::overlay_path();
+    println!(
+        "seats_overlay: {} {}",
+        seats::overlay_summary(&overlay),
+        tilde(&overlay.display().to_string())
+    );
+    let pins = seats::effective(seats::DEFAULT_SEAT).unwrap_or_default();
     let lanes = seats::providers(&pins);
     println!(
         "global_pins[{}]{{seat,provider,flagship,balanced,budget}}:",
@@ -493,7 +499,8 @@ fn doctor() -> Result<ExitCode, Failure> {
             "run `lanista doctor` by hand",
         )
     })?;
-    let rows = doctor_rows(&v);
+    let mut rows = doctor_rows(&v);
+    rows.extend(route_fact_rows());
     println!("checks[{}]{{status,name,message,fix}}:", rows.len());
     for r in &rows {
         println!("  {r}");
@@ -507,6 +514,102 @@ fn doctor() -> Result<ExitCode, Failure> {
     } else {
         ExitCode::from(1)
     })
+}
+
+/// vega's own check: the seats overlay's deprecated `canonical`/`cost`
+/// (now fallbacks) against lanista's route facts (one bounded
+/// `lanista --json routes` read). A conflict warns — lanista wins — a
+/// fallback in use is info, and an unreadable lanista or overlay warns.
+fn route_fact_rows() -> Vec<String> {
+    let table = match vega_herdr::routes::read() {
+        Ok(table) => table,
+        Err(unavailable) => {
+            return vec![format!(
+                "warn,route_facts,{},{}",
+                cell(&format!(
+                    "cannot compare seats.local canonical/cost with lanista: {}",
+                    unavailable.why
+                )),
+                cell(unavailable.hint)
+            )]
+        }
+    };
+    let blob = match std::fs::read_to_string(seats::overlay_path()) {
+        Ok(blob) => blob,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(e) => {
+            return vec![format!(
+                "warn,route_facts,{},-",
+                cell(&format!("seats overlay unreadable: {e}"))
+            )]
+        }
+    };
+    route_fact_rows_for(&table, &blob)
+}
+
+/// The pure part of [`route_fact_rows`] over one overlay blob (tests).
+fn route_fact_rows_for(table: &vega_herdr::routes::Table, blob: &str) -> Vec<String> {
+    let overlay = match seats::overlay_pins(blob) {
+        Ok(overlay) => overlay,
+        Err(e) => {
+            return vec![format!(
+                "warn,route_facts,{},-",
+                cell(&format!("seats overlay invalid: {e}"))
+            )]
+        }
+    };
+    let fix = "record the facts in ~/.config/lanista/routes.local.json (lanista owns route facts), then drop canonical/cost from seats.local.json";
+    let mut rows = Vec::new();
+    for (seat, pins) in &overlay.seats {
+        for pin in pins {
+            if pin.canonical.is_none() && pin.cost == "unknown" {
+                continue; // carries no deprecated facts
+            }
+            match table.route(&pin.model) {
+                Some(route) => {
+                    let mut mismatches: Vec<String> = Vec::new();
+                    if let (Some(seats_canonical), Some(route_canonical)) =
+                        (&pin.canonical, &route.canonical)
+                    {
+                        if seats_canonical != route_canonical {
+                            mismatches.push(format!(
+                                "canonical {seats_canonical} vs lanista {route_canonical}"
+                            ));
+                        }
+                    }
+                    if pin.cost != "unknown" {
+                        match route.cost.as_deref() {
+                            Some(cost) if cost != pin.cost => mismatches
+                                .push(format!("cost {} vs lanista {cost}", pin.cost)),
+                            None => mismatches
+                                .push(format!("cost {} vs lanista unknown", pin.cost)),
+                            _ => {}
+                        }
+                    }
+                    if !mismatches.is_empty() {
+                        rows.push(format!(
+                            "warn,route_facts,{},{}",
+                            cell(&format!(
+                                "{} [{seat}]: seats.local {} (lanista wins)",
+                                pin.model,
+                                mismatches.join("; ")
+                            )),
+                            cell(fix)
+                        ));
+                    }
+                }
+                None => rows.push(format!(
+                    "ok,route_facts,{},{}",
+                    cell(&format!(
+                        "{} [{seat}]: seats.local canonical/cost used as fallback (no lanista route entry)",
+                        pin.model
+                    )),
+                    cell(fix)
+                )),
+            }
+        }
+    }
+    rows
 }
 
 /// TOON rows from lanista's doctor JSON, errors first.
@@ -542,9 +645,10 @@ fn pin(
     target: Option<&str>,
     default: bool,
 ) -> Result<ExitCode, Failure> {
-    // vega's tiers: the repo copy, whatever a host's file says.
+    // vega's tiers: the repo copy, whatever a host's file says, plus this
+    // host's seats overlay.
     let blob = seats::SEATS;
-    let pins = seats::pins(blob, seat).map_err(|e| {
+    let pins = seats::effective(seat).map_err(|e| {
         Failure::new(
             "seat_unknown",
             e,
@@ -598,6 +702,7 @@ fn pin(
         &vega_registry::View::default(),
         &host_config,
         &defaults,
+        &pins,
         None,
         seat,
         provider,
@@ -677,6 +782,7 @@ fn pin(
                     &view,
                     &host_config,
                     &defaults,
+                    &pins,
                     Some(&project),
                     seat,
                     provider,
@@ -720,8 +826,35 @@ fn pin(
     println!("tier: {}", p.tier);
     println!("role: {}", p.role);
     println!("engine: {}", p.engine);
+    // Route facts for the resolved model: lanista owns route id → canonical
+    // and cost class (one bounded read); the seats pin's deprecated values
+    // are the fallback, and a conflict warns with lanista winning.
+    let (facts, warnings) = vega_lanista::routes::resolve(&model, &pins, &routes_table());
+    for warning in &warnings {
+        eprintln!("vega lanista: {warning}");
+    }
+    if let Some(facts) = &facts {
+        if let Some(canonical) = &facts.canonical {
+            println!("canonical: {canonical}");
+        }
+        if let Some(cost) = &facts.cost {
+            println!("cost: {cost} (origin {})", facts.origin);
+        }
+    }
     println!("seat: {seat}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The lanista routes table, or empty with a diagnostic: a missing/old
+/// lanista degrades every reader to the seats overlay fallback.
+fn routes_table() -> vega_herdr::routes::Table {
+    match vega_herdr::routes::read() {
+        Ok(table) => table,
+        Err(unavailable) => {
+            eprintln!("vega lanista: {unavailable}; using the seats overlay fallback");
+            vega_herdr::routes::Table::default()
+        }
+    }
 }
 
 fn resolution_source(pin: &vega_lanista::hosts::Resolution, local: &str) -> String {
@@ -729,12 +862,16 @@ fn resolution_source(pin: &vega_lanista::hosts::Resolution, local: &str) -> Stri
         "host" => format!("host ({local})"),
         "project" => format!("project ({})", pin.writer.as_deref().unwrap_or("unknown")),
         "global" => "global seats".into(),
+        "overlay" => "seats overlay".into(),
         other => other.into(),
     }
 }
 
 fn hosts_cmd(host: Option<&str>, json: bool) -> Result<ExitCode, Failure> {
-    let rows = vega_lanista::hosts::list(host).map_err(|e| {
+    // One bounded lanista read per command; a missing/old lanista degrades
+    // to the seats overlay fallback with a hint (never fails the listing).
+    let table = routes_table();
+    let rows = vega_lanista::hosts::list(host, &table).map_err(|e| {
         Failure::new(
             "registry_read",
             e,
@@ -745,24 +882,29 @@ fn hosts_cmd(host: Option<&str>, json: bool) -> Result<ExitCode, Failure> {
         println!("{}", serde_json::json!({"rows":rows}));
     } else {
         println!(
-            "pins[{}]{{host,seat,lane,tier,model,source,until}}:",
+            "pins[{}]{{host,seat,lane,tier,model,source,until,cost,origin}}:",
             rows.len()
         );
         for row in rows {
-            let cells: Vec<_> = ["host", "seat", "lane", "tier", "model", "source", "until"]
-                .iter()
-                .map(|k| {
-                    cell(
-                        &row[*k]
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| row[*k].to_string()),
-                    )
-                })
-                .collect();
+            let cells: Vec<_> = [
+                "host",
+                "seat",
+                "lane",
+                "tier",
+                "model",
+                "source",
+                "until",
+                "cost",
+                "cost_origin",
+            ]
+            .iter()
+            .map(|k| cell(&row[*k].as_str().map(str::to_string).unwrap_or_default()))
+            .collect();
             println!("  {}", cells.join(","));
         }
-        println!("help: vega lanista hosts --json   # includes allowed models per lane");
+        println!(
+            "help: vega lanista hosts --json   # includes allowed models and route facts per lane"
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -831,10 +973,12 @@ fn host_pin(
     } else {
         vega_lanista::hosts::read_default(host).unwrap_or_default()
     };
+    let pins = seats::effective(seat).unwrap_or_default();
     let selected = vega_lanista::hosts::resolve_cell(
         &vega_registry::View::default(),
         if default { &empty } else { &config },
         &defaults,
+        &pins,
         None,
         seat,
         lane,
@@ -1010,6 +1154,66 @@ mod tests {
             sync_line(Some(&st), "ganymede", "ganymede", now),
             "builder: fetched 1h ago (error: lanista fetch: exit status: 1), published never (ok)"
         );
+    }
+
+    #[test]
+    fn doctor_checks_seats_local_against_lanista_routes() {
+        let overlay = r#"{"schema":1,"seats":{"herdr-agents":[
+            {"provider":"pi","pin":"enmaas/gome-3.1","tier":"flagship","canonical":"gome-3.1","cost":"subscription"},
+            {"provider":"pi","pin":"enmaas/gome-2.4","tier":"balanced","cost":"budget"},
+            {"provider":"pi","pin":"enmaas/gome-1.9","tier":"budget","cost":"budget"}
+        ]}}"#;
+        let route = |id: &str, canonical: Option<&str>, cost: Option<&str>| {
+            (
+                id.to_string(),
+                vega_herdr::routes::Route {
+                    route_id: id.into(),
+                    canonical: canonical.map(str::to_string),
+                    cost: cost.map(str::to_string),
+                    cost_origin: "local".into(),
+                },
+            )
+        };
+        let table = vega_herdr::routes::Table {
+            routes: [
+                // Conflicts on both canonical and cost: lanista wins.
+                route("enmaas/gome-3.1", Some("gome-3.2"), Some("budget")),
+                // Matching values stay quiet.
+                route("enmaas/gome-2.4", None, Some("budget")),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let rows = route_fact_rows_for(&table, overlay);
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+        let conflict = &rows[0];
+        assert!(conflict.starts_with("warn,route_facts,"), "{conflict}");
+        assert!(
+            conflict.contains("enmaas/gome-3.1 [herdr-agents]: seats.local"),
+            "{conflict}"
+        );
+        assert!(
+            conflict.contains("canonical gome-3.1 vs lanista gome-3.2"),
+            "{conflict}"
+        );
+        assert!(
+            conflict.contains("cost subscription vs lanista budget"),
+            "{conflict}"
+        );
+        assert!(conflict.contains("(lanista wins)"), "{conflict}");
+        assert!(conflict.ends_with(",\"record the facts in ~/.config/lanista/routes.local.json (lanista owns route facts), then drop canonical/cost from seats.local.json\""), "{conflict}");
+        // No lanista entry: the deprecated values are the fallback.
+        let fallback = &rows[1];
+        assert!(fallback.starts_with("ok,route_facts,"), "{fallback}");
+        assert!(
+            fallback.contains("enmaas/gome-1.9 [herdr-agents]"),
+            "{fallback}"
+        );
+        // A pin without deprecated facts never reports.
+        let lean = "{\"schema\":1,\"seats\":{\"herdr-agents\":[{\"provider\":\"pi\",\"pin\":\"enmaas/x\",\"tier\":\"budget\",\"cost\":\"unknown\"}]}}";
+        assert!(route_fact_rows_for(&table, lean).is_empty());
+        assert!(route_fact_rows_for(&table, "not json")[0].contains("seats overlay invalid"));
     }
 
     #[test]

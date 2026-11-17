@@ -576,6 +576,18 @@ vega-tabs. Apply its new `herdr-app.vega-services` whole-folder config unit befo
 the layout; no shipped layout or mod is edited in place. The original small
 implementation and prior-art licenses are documented in its UPSTREAM.md.
 
+A "Browsers" group (vega-nic.19) joins the panel from one local
+`vega browser ls --json` per refresh (first show and manual Refresh, no timer):
+sessions with their colour dot, owner pane/project, headed/headless, age and
+state, plus loose browser processes no session claims (listed without a close).
+Project-scoped sessions follow the panel's focus filter; unowned ones always
+show. Close is a two-step confirm running `vega browser close <session>` only.
+The same rows are published as shared state `vega.browsers` for the sidebar's
+agent-row browser dots (colour per session, up to three plus a count), so the
+sidebar never reads browsers itself; the payload is part of its render model's
+input signature. Colours and the headed-window mark come from vega-browser
+([browser.md](browser.md), phase 2).
+
 On first show and explicit Refresh it snapshots listeners (`ss -tlnpH` on Linux,
 `lsof` on macOS), parent PIDs and listener cwds through `exec` on each space’s hc
 machine. Python 3 plus ps and ss/lsof are required there. The panel groups by
@@ -646,3 +658,97 @@ registration lifetime, dependencies may start/restart independently. Registered
 services default to same local ports to preserve embedded URLs; the panel labels
 the bundle ports. Preflight checks every local bind and SSH catches bind races.
 No forwards start during registration or Refresh.
+
+## Sidebar pins and saved views (vega-0h4c.100)
+
+Right-click any expanded agent row (including children and the Über row), or a
+compact rail row, to open a pointer popup with Pin/Unpin. UAC agent menus also
+include Open project window; project headers retain their existing right-click
+action. The popup stops propagation and closes on selection or Escape. It reads
+the terminal's live `herdr.pinned` label and writes only through
+`run("terminal.pin", {terminal, pinned})`. Pins belong to the terminal, survive
+sidebar reloads and disappear when the terminal ends. A small themed pin marks
+pinned rows. Pins keep idle agents visible under Active, including nested agents;
+existing folds still apply. There is no additional pin store or redraw timer.
+
+The view editor's Respect pins toggle is saved with the label/machine filters in
+`$XDG_CONFIG_HOME/vega/projects.toml` as `views.<name>.respect_pins`.
+`vega project config --json` returns it, defaulting to false for old views;
+`vega project view <name> --label … --machine … --respect-pins` enables it.
+View writes replace the whole view, so omitting the flag clears the option.
+All and ad-hoc label views retain their existing semantics.
+
+An opted-in view admits pinned projects and their members despite its label or
+machine filters. An individual pinned agent admits only itself and the project
+context needed to reach it; unrelated siblings in an excluded project stay
+hidden. View eligibility is computed before Active eligibility, so pins do not
+bypass a strict view unless Respect pins is enabled. Active still hides idle
+unpinned agents within pinned projects. Fake-host tests exercise menu actions,
+markers, nested/remote agents, compact rows and combined view/Active filtering;
+CLI tests use temporary preference paths. Live deployment remains a UAC step.
+
+Repo groups render as one sidebar block under the coordination project's single
+UAC row. Membership comes only from `vega.group-members`, a JSON array of
+canonical project IDs published by the owning vegad from its ordinary UAC claim
+records on each metadata refresh. This reuses routing records without a UI
+registry query or timer; release clears the label. Only live UAC terminals
+participate. A member with its own live UAC keeps its own top-level block.
+
+Within the group, members appear as indented subheaders only while they have
+visible live agents of their own, with those agents below. Empty members and
+members with only plain terminals have no subheader. Each member retains its
+name, labels, project-window action and attention badge; attention comes from
+that project's badge on the shared UAC host, never coordination totals. Member
+headers do not copy the coordination project's name or git status. The UAC row
+appears once, including when needed as context under Active or an individual
+agent pin; selecting it highlights only that row.
+
+Drag order and project pin controls belong to the top-level block. A view
+matching the coordination project or any member admits the block, including
+matches on remote member agent hosts. Existing member project pins also apply
+to the block. Respect pins still governs whether project or terminal pins cross
+a saved view boundary; an individual pinned terminal admits only itself and
+the group context, while a project pin admits the block's agents. Active still
+hides idle unpinned member agents. Folding the coordination header hides all
+members; a member subheader can fold its own rows without changing block order.
+
+## Sidebar render diagnostics (vega-0h4c.104)
+
+Even with the cached derivation (vega-0h4c.103) herdr-app still sometimes
+replaces the vega-sidebar with "This view could not be re-rendered; showing
+last good … interrupted" (the engine aborted `render()`, most likely its time
+budget) or "The sidebar could not be loaded" (module/init failure). An
+interrupted render cannot log itself, so `main.js` keeps breadcrumbs in module
+memory (shared by all copies, no I/O on the render path): the render or init
+in flight records its kind (`render:`/`init:` plus the copy kind:
+main, mail, attention, project, views, space-menu, agent-menu, settings), the
+current phase (`signature`, `derive` with the coarse buildModel phases
+`derive:trees`/`derive:order`/`derive:rows`, `elements`) and timings, plus the
+input sizes it has reached (terminals, agents, panes, spaces, badges,
+projects, signature length, view, Active filter).
+
+The next render or init that begins while a breadcrumb never finished records
+an `interrupted` event (last phase, ms spent in it, ms since start, phases so
+far, sizes, which copy detected it). A wrapper around `init`/`render` records
+caught exceptions (`exception`, with phase, ms and error; it rethrows so
+herdr-app behaviour is unchanged) and renders slower than 10 ms (`slow`, with
+the phase breakdown). Module evaluation records one `load` line.
+
+Events flush asynchronously via `fs/promises` (never awaited on the render
+path, never during `herdr-app check`: `checking()`), rate-limited to one write
+per 2 s, at most 100 pending lines, into a ring file capped at 128 KiB
+(trimmed to 64 KiB, oldest lines first):
+
+`~/.config/herdr-app/data/vega-sidebar-diagnostics/render-log.jsonl`
+(`$HERDR_APP_HOME`-relative; JSON Lines, one event per line).
+
+The path is app data, not mod code: `vega config apply` replaces the whole
+`mods/vega-sidebar` folder, but never writes under `data/`, so the log
+survives updates. Findings recorded with the bead: herdr-app keeps a "last
+good" render only in the window and surfaces load errors (files and mods) in
+`herdr-app status`'s `errors` array — readable, but the mod does not exec it
+per load; `console.log` goes to tracing under the `gpui_shell::script` target,
+gated by `RUST_LOG` on stderr, and is not persisted anywhere by default, so
+the ring file is the only durable record. Tests use fake `fs` in the vm
+loader: detection, phase wiring, exception/slow recording, rate limiting and
+the ring cap.

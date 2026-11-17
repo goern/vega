@@ -141,8 +141,10 @@ pub fn providers(sample: &Sample) -> Vec<&str> {
 }
 
 /// The source's provider for a spawn: `claude`, `codex`, `agy`, and `pi`
-/// by its `--provider`, else by the prefix of a `--model provider/model`.
-/// A bare `--model` is not guessed. `None`: no provider vega maps the kind to.
+/// by its `--provider`, else by the prefix of a `--model provider/model`
+/// (e.g. an EnMaaS seats-overlay pin `enmaas/<id>`, which has no quota
+/// window and reports unknown). A bare `--model` is not guessed. `None`:
+/// no provider vega maps the kind to.
 pub fn provider_for(kind: &str, args: &[String]) -> Option<&'static str> {
     match kind {
         "claude" => Some("claude"),
@@ -166,6 +168,7 @@ pub fn provider_for(kind: &str, args: &[String]) -> Option<&'static str> {
             match p? {
                 "xai" => Some("xai"),
                 "zai" => Some("zai"),
+                "enmaas" => Some("enmaas"),
                 _ => None,
             }
         }
@@ -430,17 +433,24 @@ fn ledger_lines(ledger: &Result<Ledger, String>, now: i64) -> Vec<String> {
 }
 
 /// What `vega mux spawn` says: the `capacity:` field, and a stderr warning
-/// when the binding window is thin.
+/// when the binding window is thin. `route` carries the spawned model's
+/// lanista route facts (cost class, origin) when it is a known route: a
+/// provider without an account window (an EnMaaS overlay pin) shows them
+/// instead of a bare unknown — unknown, never zero.
 pub fn spawn_check(
     kind: &str,
     args: &[String],
     sample: Result<Sample, String>,
     ledger: &Ledger,
     now: i64,
+    route: Option<&crate::routes::Facts>,
 ) -> (String, Option<String>) {
+    let route = route
+        .map(|facts| format!("; {}", facts.summary()))
+        .unwrap_or_default();
     let Some(provider) = provider_for(kind, args) else {
         let why = if kind == "pi" {
-            "pi without --provider or --model of xai|zai".to_string()
+            "pi without --provider or --model of xai|zai|enmaas".to_string()
         } else {
             format!("vega maps kind {kind} to no provider")
         };
@@ -448,11 +458,11 @@ pub fn spawn_check(
     };
     let sample = match sample {
         Ok(s) => s,
-        Err(why) => return (format!("capacity: unknown ({why})"), None),
+        Err(why) => return (format!("capacity: unknown ({why}{route})"), None),
     };
     let Some(h) = for_provider(&sample, provider, now).map(|h| h.covered_by(ledger, now)) else {
         return (
-            format!("capacity: unknown (no {provider} account window in the sample)"),
+            format!("capacity: unknown (no {provider} account window in the sample{route})"),
             None,
         );
     };
@@ -600,7 +610,8 @@ mod tests {
             let h = for_provider(&sample, "codex", now).unwrap();
             assert_eq!(h.left, 0.0);
             assert_eq!(h.on_credits(), usable);
-            let (text, warning) = spawn_check("codex", &[], Ok(sample), &Ledger::default(), now);
+            let (text, warning) =
+                spawn_check("codex", &[], Ok(sample), &Ledger::default(), now, None);
             assert!(text.contains(label), "{text}");
             assert_eq!(warning.is_none(), usable);
         }
@@ -645,6 +656,10 @@ mod tests {
             Some("xai")
         );
         assert_eq!(provider_for("pi", &strs(&["--provider=zai"])), Some("zai"));
+        assert_eq!(
+            provider_for("pi", &strs(&["--model", "enmaas/gome-3.1"])),
+            Some("enmaas")
+        );
         assert_eq!(
             provider_for("pi", &strs(&["--provider", "openai-codex"])),
             None
@@ -795,12 +810,109 @@ mod tests {
             ),
             ["capacity: unknown (no account window in the sample)"]
         );
-        let (f, w) = spawn_check("claude", &[], Ok(only_fable), &Ledger::default(), 0);
+        let (f, w) = spawn_check(
+            "claude",
+            &[],
+            Ok(only_fable.clone()),
+            &Ledger::default(),
+            0,
+            None,
+        );
         assert_eq!(
             f,
             "capacity: unknown (no claude account window in the sample)"
         );
         assert_eq!(w, None);
+        // An EnMaaS seats-overlay pin is its own provider with no window:
+        // capacity is unknown (not zero).
+        let args = strs(&["--model", "enmaas/gome-3.1"]);
+        let (f, w) = spawn_check("pi", &args, Ok(only_fable), &Ledger::default(), 0, None);
+        assert_eq!(
+            f,
+            "capacity: unknown (no enmaas account window in the sample)"
+        );
+        assert_eq!(w, None);
+    }
+
+    #[test]
+    fn route_facts_show_where_capacity_has_no_window() {
+        let args = strs(&["--model", "enmaas/gome-3.1"]);
+        let facts = crate::routes::Facts {
+            route_id: "enmaas/gome-3.1".into(),
+            canonical: Some("gome-3.1".into()),
+            cost: Some("subscription".into()),
+            origin: "local",
+        };
+        let only_fable = sample(
+            json!([row(
+                "claude",
+                "seven_day_fable",
+                5.0,
+                "2026-11-01T00:00:00Z"
+            )]),
+            json!([]),
+        );
+        let (f, w) = spawn_check(
+            "pi",
+            &args,
+            Ok(only_fable.clone()),
+            &Ledger::default(),
+            0,
+            Some(&facts),
+        );
+        assert_eq!(
+            f,
+            "capacity: unknown (no enmaas account window in the sample; route subscription, origin local)"
+        );
+        assert_eq!(w, None);
+        // Unknown stays unknown (never zero), also when the source is down.
+        let unknown = crate::routes::Facts {
+            cost: None,
+            ..facts.clone()
+        };
+        let (f, _) = spawn_check(
+            "pi",
+            &args,
+            Err("token-burn not found".into()),
+            &Ledger::default(),
+            0,
+            Some(&unknown),
+        );
+        assert_eq!(
+            f,
+            "capacity: unknown (token-burn not found; route cost unknown, origin local)"
+        );
+        // The seats-overlay fallback origin names itself.
+        let fallback = crate::routes::Facts {
+            cost: Some("subscription".into()),
+            origin: "seats-overlay",
+            ..unknown
+        };
+        let (f, _) = spawn_check(
+            "pi",
+            &args,
+            Ok(only_fable),
+            &Ledger::default(),
+            0,
+            Some(&fallback),
+        );
+        assert!(
+            f.ends_with("; route subscription, origin seats-overlay)"),
+            "{f}"
+        );
+        // With headroom the route facts stay out: the window is the capacity.
+        let (f, _) = spawn_check(
+            "claude",
+            &[],
+            Ok(recorded()),
+            &Ledger::default(),
+            at_recording(),
+            Some(&fallback),
+        );
+        assert_eq!(
+            f,
+            "capacity: claude 75% left (seven_day, resets in 5d17h; out in ~3d8h)"
+        );
     }
 
     #[test]
@@ -811,6 +923,7 @@ mod tests {
             Ok(recorded()),
             &Ledger::default(),
             at_recording(),
+            None,
         );
         assert_eq!(field, "capacity: codex 80% left (primary, resets in 3d22h)");
         assert_eq!(warning, None);
@@ -825,8 +938,14 @@ mod tests {
             ]),
             json!([]),
         );
-        let (field, warning) =
-            spawn_check("claude", &[], Ok(s), &Ledger::default(), at_recording());
+        let (field, warning) = spawn_check(
+            "claude",
+            &[],
+            Ok(s),
+            &Ledger::default(),
+            at_recording(),
+            None,
+        );
         assert_eq!(
             field,
             "capacity: claude 6% left (five_hour, resets in 2h; credits unknown)"
@@ -858,7 +977,8 @@ mod tests {
         let mut l = owned(1);
         // at_recording is Saturday; the week ends on Sunday 2026-10-11.
         l.plan("claude", "2026-10-11").unwrap();
-        let (field, warning) = spawn_check("claude", &[], Ok(thin_claude()), &l, at_recording());
+        let (field, warning) =
+            spawn_check("claude", &[], Ok(thin_claude()), &l, at_recording(), None);
         assert_eq!(
             field,
             "capacity: claude 6% left (five_hour, resets in 2h; out in ~1h; reset planned this week; credits unknown)"
@@ -875,7 +995,8 @@ mod tests {
     fn an_override_silences_the_warning_until_its_day() {
         let mut l = Ledger::default();
         l.override_until("claude", "2026-10-12").unwrap();
-        let (field, warning) = spawn_check("claude", &[], Ok(thin_claude()), &l, at_recording());
+        let (field, warning) =
+            spawn_check("claude", &[], Ok(thin_claude()), &l, at_recording(), None);
         assert!(
             field.ends_with("; override until 2026-10-12; credits unknown)"),
             "{field}"
@@ -883,15 +1004,29 @@ mod tests {
         assert_eq!(warning, None);
         // After its day the warning is back.
         let later = at_recording() + 3 * 86400;
-        let (_, warning) = spawn_check("claude", &[], Ok(thin_claude()), &l, later);
+        let (_, warning) = spawn_check("claude", &[], Ok(thin_claude()), &l, later, None);
         assert_eq!(warning, None, "the five_hour reset passed: full again");
-        let (_, warning) = spawn_check("claude", &[], Ok(thin_claude()), &owned(0), at_recording());
+        let (_, warning) = spawn_check(
+            "claude",
+            &[],
+            Ok(thin_claude()),
+            &owned(0),
+            at_recording(),
+            None,
+        );
         assert!(warning.is_some());
     }
 
     #[test]
     fn owned_resets_without_a_plan_still_warn_and_name_the_plan_command() {
-        let (_, warning) = spawn_check("claude", &[], Ok(thin_claude()), &owned(1), at_recording());
+        let (_, warning) = spawn_check(
+            "claude",
+            &[],
+            Ok(thin_claude()),
+            &owned(1),
+            at_recording(),
+            None,
+        );
         let w = warning.unwrap();
         assert!(
             w.ends_with("; 1 claude reset(s) owned: vega capacity plan claude --this-week"),
@@ -929,7 +1064,8 @@ mod tests {
                     "estimated_100_at": "2026-10-10T09:10:00Z"}]),
         );
         let args = strs(&["--provider", "xai"]);
-        let (field, warning) = spawn_check("pi", &args, Ok(s), &Ledger::default(), at_recording());
+        let (field, warning) =
+            spawn_check("pi", &args, Ok(s), &Ledger::default(), at_recording(), None);
         assert_eq!(
             field,
             "capacity: xai 30% left (weekly, resets in 3d16h; out in ~1h30m; credits unknown)"
@@ -953,6 +1089,7 @@ mod tests {
             Ok(s(0.3, "2026-10-10T08:00:00Z")),
             &Ledger::default(),
             now,
+            None,
         );
         assert_eq!(w, None, "low confidence");
         let (_, w) = spawn_check(
@@ -961,6 +1098,7 @@ mod tests {
             Ok(s(0.9, "2026-10-10T09:30:00Z")),
             &Ledger::default(),
             now,
+            None,
         );
         assert_eq!(w, None, "runs out after the reset");
     }
@@ -985,10 +1123,11 @@ mod tests {
             Ok(recorded()),
             &Ledger::default(),
             at_recording(),
+            None,
         );
         assert_eq!(
             f,
-            "capacity: unknown (pi without --provider or --model of xai|zai)"
+            "capacity: unknown (pi without --provider or --model of xai|zai|enmaas)"
         );
         assert_eq!(w, None);
         let (f, _) = spawn_check(
@@ -997,9 +1136,10 @@ mod tests {
             Err("token-burn not found".into()),
             &Ledger::default(),
             0,
+            None,
         );
         assert_eq!(f, "capacity: unknown (token-burn not found)");
-        let (f, _) = spawn_check("opencode", &[], Ok(recorded()), &Ledger::default(), 0);
+        let (f, _) = spawn_check("opencode", &[], Ok(recorded()), &Ledger::default(), 0, None);
         assert_eq!(
             f,
             "capacity: unknown (vega maps kind opencode to no provider)"
@@ -1031,8 +1171,14 @@ mod tests {
                 "claude/seven_day_fable"
             ]
         );
-        let (field, warning) =
-            spawn_check("claude", &[], Ok(s), &Ledger::default(), at_recording());
+        let (field, warning) = spawn_check(
+            "claude",
+            &[],
+            Ok(s),
+            &Ledger::default(),
+            at_recording(),
+            None,
+        );
         assert!(
             field.starts_with("capacity: claude 60% left (five_hour, "),
             "{field}"
