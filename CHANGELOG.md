@@ -5,7 +5,7 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
-## 229 · 2026-11-16
+## 229 · 2026-11-17
 
 - feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
   the gate's `timeout`, closes its beads `abandoned` with the reason and mails the author once, without
@@ -13,7 +13,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   (Dolt server down) no longer drops the review's state with its beads still `running`: the state stays
   until every bead is closed and the sweep retries.
 
-## 228 · 2026-11-16
+## 228 · 2026-11-17
 
 - feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces
   them on a push's own commits: a bare `Assisted-by: claude` there refuses the push until it is reworded
@@ -25,7 +25,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   without a reviewer ("review running elsewhere" until the timeout): the gate adopts the bead, and a
   leftover local one without reviewer state is abandoned after 5 minutes.
 
-## 227 · 2026-11-16
+## 227 · 2026-11-17
 
 - feature: local `vega mux spawn` and `reopen` on hc start the agent through `~/.local/bin/hc-toolbox-shell`
   when that executable exists, so agents and their tool shells run in the toolbox whose glibc the vega
