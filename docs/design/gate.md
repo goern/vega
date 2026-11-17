@@ -296,7 +296,7 @@ seconds, pulled every 60 s), so a pass on one host counts on all.
 | type, label | `task`, label `gate` (not bd's own `gate` issue type, which bd hides as an async wait gate) |
 | title | `gate: <branch>@<head:8> (<reviewer kind>/<model>)` |
 | external_ref | `gate:<key>`: the lookup key |
-| metadata | `head`, `base`, `target`, `diff_sha256`, `key`, `author_kinds`, `author_models`, `reviewer_kind`, `reviewer_model`, `reviewer_pane`, `reviewer_host`, `segment` (`run <a>..<b>`, `branch <P2>`, `merge <M>`), `review` (shared by the beads of one review), `verdict` (`running`, `pass`, `fail`, `skipped`, `unreviewed`, `abandoned`, `superseded`, `no-reviewer`, `spawn-failed`), `started_at` |
+| metadata | `head`, `base`, `target`, `diff_sha256`, `key`, `author_kinds`, `author_models`, `reviewer_kind`, `reviewer_model`, `reviewer_pane`, `reviewer_host`, `segment` (`run <a>..<b>`, `branch <P2>`, `merge <M>`), `review` (shared by the beads of one review), `abandons_before_retry` (section 7), `verdict` (`running`, `pass`, `fail`, `skipped`, `unreviewed`, `abandoned`, `superseded`, `no-reviewer`, `spawn-failed`), `started_at` |
 | notes | findings, one line each: `file:line rubric/principle score: fix` |
 | close reason | verdict, reviewer, findings count, head sha |
 
@@ -328,6 +328,7 @@ timeout, since their state is not visible here.
 | Reviewer dies (pane gone), exits, or is silent past `timeout`, with no verdict | ended actively, without a push (section 7, Sweep): reviewer killed if still running, beads `abandoned` (reason `reviewer <pane> exited without a verdict` or `reviewer <pane> silent past the <n> s timeout`), the author mailed once, clone and state cleaned. The next start picks the next candidate; a second abandon for the same key fails open (infrastructure, spike input 7) |
 | bd fails while ending a review (its Dolt server down) | the state stays, holding the beads not yet finished and the end reason; the next sweep retries, without a second mail. A state file is removed only after every bead is finished, so no bead stays `running` with nothing left to finish it. `vega gate start` stops with the bd error instead of dropping it |
 | A push's own commit has `Assisted-by` without a model, or none names the pane's kind with one | refused at once: exit 1 with the commits to reword; no bead, no reviewer (section 4, step 1) |
+| `vega gate start --retry` (the abandons came from broken infrastructure, now fixed) | ignores every earlier abandon of the keys of this start, with no attempt to tell infrastructure from reviewer. Nothing is rewritten: each bead the start creates carries `abandons_before_retry` = the abandons the key had then. A key counts only its abandons beyond the highest such marker on its beads, so a later start without `--retry` sees one fresh abandon, not three, and the old beads stay as evidence. A retry that creates no bead (pass, review already running) records nothing and changes nothing |
 | Target ref missing locally | uses `<remote>/HEAD`; none either: fail open |
 | Reviewer pushes | refused (section 1) |
 

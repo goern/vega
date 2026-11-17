@@ -5,6 +5,12 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
+## 230 · 2026-11-17
+
+- feature: `vega gate start --retry` ignores earlier abandoned reviews of the branch's segments and starts a fresh
+  review; use it after fixing the reviewer's login or API key, when the gate failed open with "review abandoned
+  twice". Old review beads are never edited.
+
 ## 229 · 2026-11-17
 
 - feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
