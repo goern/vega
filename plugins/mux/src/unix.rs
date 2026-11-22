@@ -1271,8 +1271,20 @@ fn spawn_env(
     kind: &str,
     actor: Option<&str>,
     socket: Option<&str>,
+    cwd: Option<&str>,
     user: &[String],
 ) -> Vec<String> {
+    // The project's dolt server (mise env of the agent's cwd): agent tool
+    // shells never run `mise activate`. On another machine that host's own
+    // `vega mux` resolves it; `--env` wins.
+    let beads: Vec<String> = cwd
+        .filter(|_| machine().is_none())
+        .map(|c| vega_plugin::beads_env(Path::new(c)))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| !user.iter().any(|e| e.starts_with(&format!("{k}="))))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
     let own = user.iter().any(|e| e.starts_with("BEADS_ACTOR="));
     let color = (kind == "codex" && !user.iter().any(|e| e.starts_with("FORCE_COLOR=")))
         .then(|| "FORCE_COLOR=1".to_string());
@@ -1292,6 +1304,7 @@ fn spawn_env(
         .map(actor_env)
         .into_iter()
         .chain(socket)
+        .chain(beads)
         .chain(color)
         .chain(suggest)
         .chain(batch)
@@ -1706,7 +1719,13 @@ fn spawn_inner(
             // herdr's worktree commands take no --env: swap the root pane for
             // a split of it that has the env.
             actor = beads_actor(&w.path);
-            let env = spawn_env(kind, actor.as_deref(), socket.as_deref(), user_env);
+            let env = spawn_env(
+                kind,
+                actor.as_deref(),
+                socket.as_deref(),
+                Some(&w.path),
+                user_env,
+            );
             let pane = if env.is_empty() {
                 w.pane.clone()
             } else {
@@ -1729,7 +1748,13 @@ fn spawn_inner(
             }
             args.extend(["--cwd", &cwd, "--label", name, "--no-focus"]);
             actor = beads_actor(&cwd);
-            let env = spawn_env(kind, actor.as_deref(), socket.as_deref(), user_env);
+            let env = spawn_env(
+                kind,
+                actor.as_deref(),
+                socket.as_deref(),
+                Some(&cwd),
+                user_env,
+            );
             args.extend(env_args(&env));
             let v = herdr(&args)?;
             let tab = str_of(&v["result"]["tab"], "tab_id").to_string();
@@ -1743,7 +1768,13 @@ fn spawn_inner(
             let layout = herdr(&["pane", "layout", "--pane", &me.pane])?;
             let direction = split_direction(&layout["result"]["layout"], &me.pane);
             actor = beads_actor(&cwd);
-            let env = spawn_env(kind, actor.as_deref(), socket.as_deref(), user_env);
+            let env = spawn_env(
+                kind,
+                actor.as_deref(),
+                socket.as_deref(),
+                Some(&cwd),
+                user_env,
+            );
             let mut args = vec![
                 "pane",
                 "split",
@@ -1764,7 +1795,13 @@ fn spawn_inner(
         }
         Place::At(At::Workspace) => {
             actor = beads_actor(&cwd);
-            let env = spawn_env(kind, actor.as_deref(), socket.as_deref(), user_env);
+            let env = spawn_env(
+                kind,
+                actor.as_deref(),
+                socket.as_deref(),
+                Some(&cwd),
+                user_env,
+            );
             let mut args = vec![
                 "workspace",
                 "create",
@@ -2567,7 +2604,7 @@ mod tests {
         socket: Option<&str>,
         user: &[String],
     ) -> Vec<String> {
-        let mut env = spawn_env(kind, actor, socket, user);
+        let mut env = spawn_env(kind, actor, socket, None, user);
         env.retain(|e| e != "GIT_SSH_COMMAND=ssh -o BatchMode=yes");
         env
     }
@@ -2762,6 +2799,34 @@ printf '{"result":{"process_info":{"pane_id":"w1:p2","shell_pid":4242}}}\n'"#,
     }
 
     #[test]
+    fn spawn_env_carries_the_projects_beads_dolt_unless_overridden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml = tmp.path().join("mise.toml");
+        std::fs::write(
+            &toml,
+            "[env]\nBEADS_DOLT_SERVER_PORT = \"3307\"\nOTHER_SECRET = \"x\"\n",
+        )
+        .unwrap();
+        std::env::set_var("MISE_TRUSTED_CONFIG_PATHS", tmp.path());
+        let cwd = tmp.path().to_str().unwrap();
+        let env = spawn_env("pi", None, None, Some(cwd), &[]);
+        std::env::remove_var("MISE_TRUSTED_CONFIG_PATHS");
+        if env.is_empty() {
+            return; // no mise on this machine
+        }
+        assert!(env.contains(&"BEADS_DOLT_SERVER_PORT=3307".to_string()));
+        assert!(!env.iter().any(|e| e.contains("OTHER_SECRET")));
+        let own = ["BEADS_DOLT_SERVER_PORT=1".to_string()];
+        let env = spawn_env("pi", None, None, Some(cwd), &own);
+        assert_eq!(
+            env.iter()
+                .filter(|e| e.starts_with("BEADS_DOLT_SERVER_PORT="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn spawn_env_parses_and_builds_herdr_flags() {
         assert_eq!(
             parse_env("VEGA_GATE_ROLE=reviewer").unwrap(),
@@ -2797,11 +2862,11 @@ printf '{"result":{"process_info":{"pane_id":"w1:p2","shell_pid":4242}}}\n'"#,
     #[test]
     fn spawned_git_uses_batch_ssh_unless_overridden() {
         assert_eq!(
-            spawn_env("codex", None, None, &[]),
+            spawn_env("codex", None, None, None, &[]),
             ["FORCE_COLOR=1", "GIT_SSH_COMMAND=ssh -o BatchMode=yes"]
         );
         let own = ["GIT_SSH_COMMAND=ssh -i key".to_string()];
-        assert_eq!(spawn_env("pi", None, None, &own), own);
+        assert_eq!(spawn_env("pi", None, None, None, &own), own);
     }
 
     #[test]
