@@ -5,6 +5,22 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
+## 276 · 2026-11-23
+
+- feature: `vega <plugin>` and `vega mux spawn` give `bd` and spawned agents the project's dolt server
+  variables (`BEADS_DOLT_AUTO_START`, `_SERVER_HOST`, `_SERVER_PORT`, `_SERVER_USER`, `_SHARED_SERVER`), read
+  from `mise env` in the working directory (3 s limit; nothing else of mise's env, never a password). Gate
+  runs, `vega uac` and agent panes reach the shared Dolt server without `mise activate` or `~/.zshenv` exports.
+  `--machine` spawns resolve them on the target through its `vega-mux beads-env`, so the target needs this
+  version; an older target gets none, with a stderr note.
+- required: a directory mise does not trust, or without the variables in its mise config (e.g. no
+  `mise.local.toml`), gives no variables; vega prints a `mise env failed ... run mise trust` hint on stderr
+  for an untrusted one.
+- optional: precedence differs by path. Plugins keep a variable already set in the caller's environment;
+  `vega mux spawn` puts the project's values in the pane env over the caller's, and `--env` wins over both.
+  Agents keep their spawn-time values: an hc spawn record and a resumed agent do not follow later edits of
+  `mise.local.toml`.
+
 ## 275 · 2026-11-23
 
 - feature: `vega gate start --retry` ignores earlier abandoned reviews of the branch's segments and starts a fresh
