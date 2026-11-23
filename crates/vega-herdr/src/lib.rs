@@ -6,6 +6,7 @@ pub mod asks;
 pub mod badges;
 pub mod capacity;
 pub mod catalog;
+#[cfg(unix)]
 pub mod cutover;
 pub mod daemon_health;
 pub mod dialog;
@@ -13,6 +14,7 @@ pub mod gather;
 pub mod hc;
 pub mod hosts;
 pub mod launch;
+pub mod platform;
 pub use hc::{hc, hc_local, hc_on, own_terminal, Terminal};
 pub mod lanes;
 pub mod mail;
@@ -28,11 +30,13 @@ pub mod resets;
 pub mod resume;
 pub mod routes;
 pub mod service_config;
+#[cfg(unix)]
 pub mod socket;
 pub mod state;
 pub mod theme;
 pub mod vegad_env;
 pub mod waiting;
+#[cfg(unix)]
 pub mod waits;
 
 use std::env;
@@ -54,7 +58,7 @@ static BOUNDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 const DAEMON_CALL_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(1)
 } else {
-    socket::CALL_TIMEOUT
+    Duration::from_secs(5)
 };
 
 /// Enable before starting daemon workers: every herdr subprocess, including
@@ -114,6 +118,7 @@ pub fn print_failure_json(f: &Failure) {
     );
 }
 
+#[cfg(unix)]
 pub fn local_host() -> String {
     Command::new("hostname")
         .arg("-s")
@@ -281,14 +286,14 @@ pub(crate) fn output_with_stdin_within(
     timeout: Duration,
     stdin: Stdio,
 ) -> std::io::Result<Option<Output>> {
-    use std::os::unix::process::CommandExt;
     let start = Instant::now();
+    platform::isolate(cmd);
     let mut child = cmd
-        .process_group(0)
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let _tree = platform::ProcessTree::attach(&mut child)?;
     let drain = |r: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
@@ -342,12 +347,36 @@ pub(crate) fn output_with_stdin_within(
 /// End the isolated command, including descendants retaining its pipes, and
 /// reap off the caller: even SIGKILL can wait on a kernel I/O stall.
 fn kill_and_reap(mut child: std::process::Child) {
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
+    platform::kill_tree(&mut child);
     thread::spawn(move || {
         let _ = child.wait();
     });
+}
+
+/// One-shot transport output; a failed write can still carry hc's diagnosis.
+pub(crate) struct RpcLine {
+    pub line: std::io::Result<Vec<u8>>,
+    pub stderr: Vec<u8>,
+}
+
+const RPC_STDERR_LIMIT: usize = 16 * 1024;
+
+/// Drain continuously, retaining only the tail even when hc floods stderr.
+fn drain_rpc_stderr(mut reader: impl Read, tail: &std::sync::Mutex<Vec<u8>>) {
+    let mut chunk = [0; 4096];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut tail = tail.lock().expect("stderr tail lock");
+                let excess = (tail.len() + n).saturating_sub(RPC_STDERR_LIMIT);
+                tail.drain(..excess);
+                tail.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
 }
 
 /// Exchange one newline-delimited request/reply while keeping stdin open.
@@ -356,18 +385,26 @@ pub(crate) fn rpc_line_within(
     cmd: &mut Command,
     input: Vec<u8>,
     timeout: Option<Duration>,
-) -> std::io::Result<Option<Vec<u8>>> {
+) -> std::io::Result<Option<RpcLine>> {
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::process::CommandExt;
     let start = Instant::now();
+    platform::isolate(cmd);
     let mut child = cmd
-        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
+    let _tree = platform::ProcessTree::attach(&mut child)?;
     let mut stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = tail.clone();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        drain_rpc_stderr(stderr, &captured);
+        let _ = err_tx.send(());
+    });
     let (tx, rx) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let result = (|| {
@@ -382,19 +419,38 @@ pub(crate) fn rpc_line_within(
     });
     let result = match timeout {
         Some(timeout) => match rx.recv_timeout(timeout.saturating_sub(start.elapsed())) {
-            Ok(result) => result.map(Some),
+            Ok(result) => Ok(Some(result)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(e) => Err(std::io::Error::other(e)),
         },
-        None => rx
-            .recv()
-            .map_err(std::io::Error::other)
-            .and_then(|r| r.map(Some)),
+        None => rx.recv().map_err(std::io::Error::other).map(Some),
     };
     // A reply completes this connection. Neither exit status nor descendants
     // retaining inherited pipes should delay a one-shot RPC.
     kill_and_reap(child);
-    result
+    result.map(|result| {
+        result.map(|line| {
+            let valid_reply = line
+                .as_ref()
+                .ok()
+                .and_then(|line| serde_json::from_slice::<Value>(line).ok())
+                .is_some_and(|v| {
+                    v["jsonrpc"] == "2.0"
+                        && v["id"] == 1
+                        && (v.get("result").is_some() || v.get("error").is_some())
+                });
+            if !valid_reply {
+                // Cleanup has killed descendants holding stderr open. Never join
+                // the reader: even killed processes can stall in kernel I/O.
+                let grace = Duration::from_millis(100);
+                let budget =
+                    timeout.map_or(grace, |t| grace.min(t.saturating_sub(start.elapsed())));
+                let _ = err_rx.recv_timeout(budget);
+            }
+            let stderr = tail.lock().expect("stderr tail lock").clone();
+            RpcLine { line, stderr }
+        })
+    })
 }
 
 fn hint_for(code: &str) -> &'static str {
@@ -452,10 +508,13 @@ pub fn me() -> Result<Me, Failure> {
     if let Some(p) = panes.iter().find(|p| p["pane_id"] == hint.as_str()) {
         if let Ok(v) = herdr_local(&["pane", "process-info", "--pane", &hint]) {
             let pids = pane_pids(&v["result"]["process_info"]);
-            let first = std::os::unix::process::parent_id();
+            #[cfg(unix)]
+            let first = Some(std::os::unix::process::parent_id());
+            #[cfg(windows)]
+            let first = parent_of(std::process::id());
             if reaches(std::process::id(), &pids, |pid| {
                 if pid == std::process::id() {
-                    Some(first)
+                    first
                 } else {
                     parent_of(pid)
                 }
@@ -611,6 +670,7 @@ fn program_name(chain: &[&str], shell: &str) -> String {
 }
 
 /// `pid -> command name` for the given pids, from one `ps` call.
+#[cfg(unix)]
 fn comm_names<'a>(pids: impl Iterator<Item = &'a u32>) -> Vec<(u32, String)> {
     let list = pids.map(u32::to_string).collect::<Vec<_>>().join(",");
     if list.is_empty() {
@@ -665,6 +725,7 @@ fn reaches(pid: u32, targets: &[u32], parent: impl Fn(u32) -> Option<u32>) -> bo
 }
 
 /// Parent pid of one process, from `ps -o ppid= -p`.
+#[cfg(unix)]
 fn parent_of(pid: u32) -> Option<u32> {
     let out = Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
@@ -674,6 +735,7 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 /// `pid -> ppid` for all processes, from `ps`.
+#[cfg(unix)]
 fn process_table() -> Result<Vec<(u32, u32)>, Failure> {
     let out = Command::new("ps")
         .args(["-axo", "pid=,ppid="])
@@ -725,8 +787,12 @@ pub fn cell(s: &str) -> String {
 }
 
 pub fn collapse_home(path: &str) -> String {
-    match env::var("HOME") {
-        Ok(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
+    #[cfg(unix)]
+    let home = env::var("HOME").ok();
+    #[cfg(windows)]
+    let home = platform::home().map(|p| p.to_string_lossy().into_owned());
+    match home {
+        Some(home) if path.starts_with(&home) => format!("~{}", &path[home.len()..]),
         _ => path.to_string(),
     }
 }
@@ -823,12 +889,58 @@ pub fn set_machine(m: Option<String>) {
     let _ = MACHINE.set(m);
 }
 
+#[cfg(windows)]
+fn parent_of(pid: u32) -> Option<u32> {
+    platform::parent_of(pid)
+}
+#[cfg(windows)]
+fn process_table() -> Result<Vec<(u32, u32)>, Failure> {
+    platform::processes()
+        .map(|p| p.into_iter().map(|(id, parent, _)| (id, parent)).collect())
+        .map_err(|e| {
+            Failure::new(
+                "process_table_failed",
+                e.to_string(),
+                "check Windows process access",
+            )
+        })
+}
+#[cfg(windows)]
+fn comm_names<'a>(pids: impl Iterator<Item = &'a u32>) -> Vec<(u32, String)> {
+    let ids: Vec<_> = pids.copied().collect();
+    platform::processes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(id, _, _)| ids.contains(id))
+        .map(|(id, _, name)| (id, name))
+        .collect()
+}
+
+#[cfg(windows)]
+pub fn local_host() -> String {
+    env::var("COMPUTERNAME")
+        .unwrap_or_else(|_| "unknown".into())
+        .to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rpc_stderr_retains_only_bounded_tail() {
+        let mut input = vec![b'x'; super::RPC_STDERR_LIMIT * 4];
+        input.extend_from_slice(b"final diagnosis");
+        let tail = std::sync::Mutex::new(Vec::new());
+        super::drain_rpc_stderr(input.as_slice(), &tail);
+        let tail = tail.into_inner().unwrap();
+        assert_eq!(tail.len(), super::RPC_STDERR_LIMIT);
+        assert_eq!(tail, input[input.len() - super::RPC_STDERR_LIMIT..]);
+    }
+
     use super::*;
     use serde_json::json;
 
     #[test]
+    #[cfg(unix)]
     fn subprocess_deadline_covers_a_stall_and_inherited_pipes() {
         for script in ["sleep 10", "sleep 10 & exit 0"] {
             let start = Instant::now();
@@ -850,6 +962,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn daemon_herdr_calls_time_out_and_next_call_can_succeed() {
         const CHILD: &str = "VEGA_HERDR_DEADLINE_TEST";
         if env::var_os(CHILD).is_some() {

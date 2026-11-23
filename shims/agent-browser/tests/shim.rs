@@ -58,10 +58,14 @@ fn run(f: &Fix, args: &[&str], env: &[(&str, String)]) -> Output {
         )
         .env("VEGA_FIX", &f.tmp)
         .env("XDG_STATE_HOME", f.tmp.join("state"))
+        .env("XDG_DATA_HOME", f.tmp.join("data"))
         .env("HOME", f.tmp.join("home"))
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("VEGA_AGENT_BROWSER_BIN")
         .env_remove("AGENT_BROWSER_SESSION")
+        .env_remove("AGENT_BROWSER_HEADED")
+        .env_remove("AGENT_BROWSER_CDP")
+        .env_remove("VEGA_BROWSER_LEGACY_HEADED")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HC_TERMINAL_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
@@ -95,7 +99,33 @@ fn err(o: &Output) -> String {
 }
 
 #[test]
-fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() {
+fn headed_external_config_and_existing_legacy_binding_stay_upstream() {
+    let f = fix();
+    let config = f.tmp.join("proj/agent-browser.json");
+    fs::write(
+        &config,
+        r#"{"cdp":"ws://example.test/devtools/browser/external"}"#,
+    )
+    .unwrap();
+    let args = ["--session", "legacy", "--headed", "get", "url"];
+    let o = run(&f, &args, &[]);
+    assert!(o.status.success(), "{o:?}");
+    fs::remove_file(config).unwrap();
+
+    let sockets = f.tmp.join("sock");
+    fs::create_dir(&sockets).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(sockets.join("legacy.sock")).unwrap();
+    let o = run(
+        &f,
+        &args,
+        &[("AGENT_BROWSER_SOCKET_DIR", sockets.display().to_string())],
+    );
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(argv(&f).len(), 2);
+}
+
+#[test]
+fn isolated_headless_and_explicit_headed_calls_keep_their_original_route() {
     let f = fix();
     let o = run(
         &f,
@@ -111,13 +141,15 @@ fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() 
     assert_eq!(rec["project"], "proj");
     assert!(rec["first_seen"].as_i64().unwrap() > 0);
 
-    // An explicit --headed flag marks: the mark flag rides along first.
+    // Explicit CDP attachment keeps the original headed marking path.
     let o = run(
         &f,
         &[
             "--session",
             "vega-shim-test",
             "--headed",
+            "--cdp",
+            "12345",
             "open",
             "https://x",
         ],
@@ -129,7 +161,7 @@ fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() 
     assert_eq!(
         argv(&f).last().unwrap(),
         &format!(
-            "--init-script {} --session vega-shim-test --headed open https://x",
+            "--init-script {} --session vega-shim-test --headed --cdp 12345 open https://x",
             mark.display()
         )
     );
@@ -139,7 +171,10 @@ fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() 
     let o = run(
         &f,
         &["--session", "vega-shim-test", "open", "https://y"],
-        &[("AGENT_BROWSER_HEADED", "1".into())],
+        &[
+            ("AGENT_BROWSER_HEADED", "1".into()),
+            ("AGENT_BROWSER_CDP", "12345".into()),
+        ],
     );
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     assert!(argv(&f).last().unwrap().starts_with("--init-script "));
@@ -152,6 +187,8 @@ fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() 
             "--session",
             "vega-shim-test",
             "--headed",
+            "--cdp",
+            "12345",
             "open",
             "https://z",
         ],
@@ -160,8 +197,30 @@ fn named_headless_calls_pass_through_unchanged_and_headed_ones_carry_the_mark() 
     assert!(o.status.success(), "{}{}", out(&o), err(&o));
     assert_eq!(
         argv(&f).last().unwrap(),
-        "--session vega-shim-test --headed open https://z"
+        "--session vega-shim-test --headed --cdp 12345 open https://z"
     );
+}
+
+#[test]
+fn ordinary_headed_calls_enter_dev_without_falling_back_to_the_real_binary() {
+    let f = fix();
+    let o = run(
+        &f,
+        &["--headed", "--session", "dev", "open", "https://x"],
+        &[],
+    );
+    assert!(!o.status.success());
+    assert!(argv(&f).is_empty());
+    assert!(out(&o).contains("project"), "{}", out(&o));
+}
+
+#[test]
+fn explicit_headless_overrides_the_headed_environment() {
+    let f = fix();
+    let args = ["--session", "dev", "--headed", "false", "open", "https://x"];
+    let o = run(&f, &args, &[("AGENT_BROWSER_HEADED", "true".into())]);
+    assert!(o.status.success(), "{}{}", out(&o), err(&o));
+    assert_eq!(argv(&f), [args.join(" ")]);
 }
 
 #[test]
@@ -256,7 +315,7 @@ fn named_calls_keep_every_flag_and_subcommand() {
             "open",
             "https://y",
         ],
-        vec!["--session", "sk", "--cdp", "9224", "get", "url"],
+        vec!["--session", "sk", "--cdp", "9324", "get", "url"],
     ] {
         let refs: Vec<&str> = args.to_vec();
         let o = run(&f, &refs, &[]);
@@ -304,4 +363,22 @@ fn a_session_key_owner_is_not_a_pane() {
     let rec = &records(&f)["hand-started"];
     assert_eq!(rec["pane"], Value::Null);
     assert!(!rec["host"].as_str().unwrap().is_empty());
+}
+
+#[test]
+fn raw_shared_attach_points_to_scoped_profile() {
+    let f = fix();
+    for args in [
+        vec!["--session", "x", "--cdp", "9223", "get", "url"],
+        vec![
+            "--session",
+            "x",
+            "connect",
+            "ws://localhost:9224/devtools/browser/abc",
+        ],
+    ] {
+        let result = run(&f, &args, &[]);
+        assert_eq!(result.status.code(), Some(2));
+    }
+    assert!(argv(&f).is_empty());
 }

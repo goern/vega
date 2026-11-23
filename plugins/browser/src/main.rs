@@ -16,6 +16,9 @@ use std::time::Duration;
 use vega_browser::{cdp, cdp::Probe, mark, owner, pane, procs, procs::Browser, real, session_name};
 use vega_herdr::{capacity::duration, cell, print_failure, print_failure_json, Failure};
 
+mod session_cleanup;
+mod vpn;
+
 const HELP: &str = include_str!("../help/browser.md");
 const SKILL: &str = include_str!("../SKILL.md");
 
@@ -24,6 +27,23 @@ const DAY: i64 = 86400;
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args == [vega_browser::dev::share::WORKER] {
+        return match vega_browser::dev::share::worker() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout().lock(), "{}", error.message);
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if args == [vega_browser::dev::PROXY] {
+        return if vega_browser::dev::serve().is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");
         return ExitCode::SUCCESS;
@@ -39,14 +59,33 @@ fn main() -> ExitCode {
             print!("{SKILL}");
             Ok(ExitCode::SUCCESS)
         }
+        [a] if a == "install" => vega_browser::install::install().map(|_| ExitCode::SUCCESS),
+        [a] if a == "doctor" || a == "status" => vega_browser::install::status().map(|s| {
+            vega_browser::install::print_status(&s, false);
+            ExitCode::SUCCESS
+        }),
+        [a, b] if (a == "doctor" || a == "status") && b == "--json" => {
+            vega_browser::install::status().map(|s| {
+                vega_browser::install::print_status(&s, true);
+                ExitCode::SUCCESS
+            })
+        }
         [a] if a == "ls" => ls(false).map(|_| ExitCode::SUCCESS),
         [a] if a == "--json" => ls(true).map(|_| ExitCode::SUCCESS),
         [a, b] if a == "ls" && b == "--json" => ls(true).map(|_| ExitCode::SUCCESS),
         [a, rest @ ..] if a == "ab" => ab(rest),
+        [a, rest @ ..] if a == "dev" => vega_browser::dev::command(rest),
+        [a, rest @ ..] if a == "vpn" => vpn::command(rest),
         [a, rest @ ..] if a == "chromium" => chromium(rest),
         [a, rest @ ..] if a == "launch" => launch(rest),
         [a, rest @ ..] if a == "cleanup" => cleanup(rest),
-        [a] if a == "gc" => gc().map(|_| ExitCode::SUCCESS),
+        [a] if a == "gc" => session_cleanup::gc().map(|_| ExitCode::SUCCESS),
+        [a, b] if a == "gc" && b == "--dry-run" => {
+            session_cleanup::inventory().map(|_| ExitCode::SUCCESS)
+        }
+        [a, s, flag, identity] if a == "disconnect" && flag == "--identity" => {
+            session_cleanup::disconnect(s, identity).map(|_| ExitCode::SUCCESS)
+        }
         [a, s] if a == "close" => close(s).map(|_| ExitCode::SUCCESS),
         _ => Err(Failure::new(
             "usage",
@@ -70,15 +109,23 @@ fn main() -> ExitCode {
 /// The global Chromium: CDP port, persistent profile, binary. Environment
 /// overrides (`CDP_PORT`, `CDP_PROFILE`, `CDP_CHROMIUM`) are the old
 /// scripts' and stay for tests and non-default installs.
-struct Global {
+struct Chromium {
     port: u16,
     profile: PathBuf,
     chromium: PathBuf,
+    extra_args: Vec<String>,
 }
 
-fn global() -> Global {
+fn chromium_override() -> Option<PathBuf> {
+    env::var_os("CDP_CHROMIUM")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn global() -> Chromium {
     let home = || PathBuf::from(env::var_os("HOME").unwrap_or_default());
-    Global {
+    Chromium {
+        extra_args: Vec::new(),
         port: env::var("CDP_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -87,9 +134,7 @@ fn global() -> Global {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join(".local/share/vega-chromium")),
-        chromium: env::var_os("CDP_CHROMIUM")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+        chromium: chromium_override()
             .unwrap_or_else(|| PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium")),
     }
 }
@@ -98,17 +143,22 @@ fn no_agent_browser() -> Failure {
     Failure::new(
         "no_agent_browser",
         "the real agent-browser binary was not found",
-        "install agent-browser (npm i -g agent-browser), or set VEGA_AGENT_BROWSER_BIN",
+        "run vega browser install, or set VEGA_AGENT_BROWSER_BIN",
     )
 }
 
 /// `vega browser ab --session <name> <agent-browser args>`: agent-browser on
 /// the global Chromium only, the port of the old `scripts/ab`.
 fn ab(args: &[String]) -> Result<ExitCode, Failure> {
-    let g = global();
-    let Some(session) = session_name(args) else {
-        return Err(vega_browser::name_failure());
+    let (profile, args) = vpn::select(args)?;
+    let args = args.as_slice();
+    let g = match &profile {
+        Some(v) => v.browser(),
+        None => global(),
     };
+    if session_name(args).is_none() {
+        return Err(vega_browser::name_failure());
+    }
     let attach = format!("ab always attaches to 127.0.0.1:{}", g.port);
     let refuse =
         |what: &str| Failure::new("not_allowed", format!("{what} is not allowed"), &attach);
@@ -127,46 +177,22 @@ fn ab(args: &[String]) -> Result<ExitCode, Failure> {
             return Err(refuse(a));
         }
     }
-    ensure_global(&g, None).map_err(|f| {
-        Failure::new(
-            &f.code,
-            format!(
-                "the global Chromium is not available; no fallback browser ({})",
-                f.message
-            ),
-            &f.hint,
-        )
-    })?;
-    let real = real::real_binary().ok_or_else(no_agent_browser)?;
-    let record = owner::record_from_env(vega_shim::unix_now());
-    owner::upsert(&session, record.clone());
-    let mut cmd = Command::new(&real);
-    cmd.arg("--cdp")
-        .arg(g.port.to_string())
-        .args(mark::with_mark(args, &session, record.project.as_deref()));
-    for var in [
-        "AGENT_BROWSER_AUTO_CONNECT",
-        "AGENT_BROWSER_PROVIDER",
-        "AGENT_BROWSER_EXECUTABLE_PATH",
-    ] {
-        cmd.env_remove(var);
+    let _vpn_lock = profile.as_ref().map(|v| v.lock()).transpose()?;
+    if let Some(v) = &profile {
+        v.require_running()?;
+    } else {
+        ensure_chromium(&g, None).map_err(|f| {
+            Failure::new(
+                &f.code,
+                format!(
+                    "the global Chromium is not available; no fallback browser ({})",
+                    f.message
+                ),
+                &f.hint,
+            )
+        })?;
     }
-    let status = cmd.status().map_err(|e| {
-        Failure::new(
-            "agent_browser_failed",
-            format!("{}: {e}", real.display()),
-            "install agent-browser (npm i -g agent-browser)",
-        )
-    })?;
-    if !status.success() && cdp::probe(g.port) != Probe::Cdp {
-        eprintln!(
-            "ab: lost the global Chromium on 127.0.0.1:{}; no fallback browser",
-            g.port
-        );
-    }
-    Ok(ExitCode::from(
-        status.code().unwrap_or(1).clamp(0, 255) as u8
-    ))
+    vega_browser::dev::shared::command(args, g.port)
 }
 
 /// `vega browser chromium [url]`: attach to or start the global Chromium
@@ -185,7 +211,7 @@ fn chromium(args: &[String]) -> Result<ExitCode, Failure> {
         _ => return Err(usage()),
     };
     let g = global();
-    let label = ensure_global(&g, url.as_deref())?;
+    let label = ensure_chromium(&g, url.as_deref())?;
     println!(
         "{}: 127.0.0.1:{}, profile {}",
         label,
@@ -196,7 +222,7 @@ fn chromium(args: &[String]) -> Result<ExitCode, Failure> {
 }
 
 /// The old `chromium.sh` state machine.
-fn ensure_global(g: &Global, url: Option<&str>) -> Result<&'static str, Failure> {
+fn ensure_chromium(g: &Chromium, url: Option<&str>) -> Result<&'static str, Failure> {
     let profile = g.profile.display().to_string();
     match cdp::probe(g.port) {
         Probe::Cdp => {
@@ -232,7 +258,7 @@ fn ensure_global(g: &Global, url: Option<&str>) -> Result<&'static str, Failure>
     }
 }
 
-fn own_failure(g: &Global) -> Failure {
+fn own_failure(g: &Chromium) -> Failure {
     Failure::new(
         "foreign_listener",
         format!(
@@ -246,7 +272,7 @@ fn own_failure(g: &Global) -> Failure {
 
 /// Up to 50 probes, 0.2 s apart, as the old `wait_up`.
 fn wait_up(
-    g: &Global,
+    g: &Chromium,
     label: &'static str,
     timeout: impl Fn(u16) -> String,
 ) -> Result<&'static str, Failure> {
@@ -263,7 +289,7 @@ fn wait_up(
     Err(Failure::new("no_cdp", timeout(g.port), ""))
 }
 
-fn start(g: &Global, url: Option<&str>) -> Result<(), Failure> {
+fn start(g: &Chromium, url: Option<&str>) -> Result<(), Failure> {
     if !g.chromium.is_file() {
         return Err(Failure::new(
             "missing_chromium",
@@ -287,6 +313,7 @@ fn start(g: &Global, url: Option<&str>) -> Result<(), Failure> {
         .arg("--remote-debugging-address=127.0.0.1")
         .arg(format!("--user-data-dir={}", g.profile.display()))
         .args(["--no-first-run", "--no-default-browser-check"])
+        .args(&g.extra_args)
         .arg(url.unwrap_or("about:blank"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -381,7 +408,7 @@ fn launch(args: &[String]) -> Result<ExitCode, Failure> {
             Failure::new(
                 "agent_browser_failed",
                 format!("{}: {e}", real.display()),
-                "install agent-browser (npm i -g agent-browser)",
+                "run vega browser install",
             )
         })?;
     if !attach.status.success() {
@@ -523,14 +550,12 @@ fn first_positional(args: &[String]) -> Option<&str> {
 }
 
 fn valid_session(s: &str) -> Result<(), Failure> {
-    let plain = !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let plain = vega_browser::legacy::valid_name(s);
     plain.then_some(()).ok_or_else(|| {
         Failure::new(
             "bad_session",
             format!("bad session name: {s}"),
-            "letters, digits, dot, underscore and hyphen only",
+            "letters, digits, underscore and hyphen only (agent-browser 0.43)",
         )
     })
 }
@@ -551,9 +576,17 @@ fn session_names(real: Option<&PathBuf>) -> Result<Vec<String>, String> {
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
-    Ok(vega_browser::parse_session_list(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    let mut names = vega_browser::parse_session_list(&String::from_utf8_lossy(&out.stdout));
+    for name in owner::load().keys() {
+        if vega_browser::dev::shared::bound(name)
+            .map_err(|e| e.message)?
+            .is_some()
+            && !names.contains(name)
+        {
+            names.push(name.clone());
+        }
+    }
+    Ok(names)
 }
 
 /// `vega browser ls [--json]`: sessions with owner and state, plus the
@@ -563,6 +596,7 @@ fn ls(json: bool) -> Result<(), Failure> {
     let records = owner::load();
     let real = real::real_binary();
     let listed = session_names(real.as_ref());
+    let dev = vega_browser::dev::session_names();
     let now = vega_shim::unix_now();
     let local = vega_herdr::local_host();
     let names: BTreeSet<String> = listed
@@ -570,6 +604,7 @@ fn ls(json: bool) -> Result<(), Failure> {
         .flatten()
         .cloned()
         .chain(records.keys().cloned())
+        .chain(dev.iter().flatten().cloned())
         .collect();
     let mut alive: HashMap<String, Option<bool>> = HashMap::new();
     let rows: Vec<(String, &str, Option<owner::Record>)> = names
@@ -578,7 +613,9 @@ fn ls(json: bool) -> Result<(), Failure> {
             let Some(rec) = records.get(name) else {
                 return (name.clone(), "unowned", None);
             };
-            let state = if listed.as_ref().is_ok_and(|l| !l.contains(name)) {
+            let state = if listed.as_ref().is_ok_and(|l| !l.contains(name))
+                && dev.as_ref().is_ok_and(|l| !l.contains(name))
+            {
                 "closed"
             } else if now - rec.last_seen > DAY {
                 "stale"
@@ -608,7 +645,11 @@ fn ls(json: bool) -> Result<(), Failure> {
             (b, is_global)
         })
         .collect();
-    let error = listed.as_ref().err().cloned();
+    let error = listed
+        .as_ref()
+        .err()
+        .cloned()
+        .or_else(|| dev.err().map(|e| e.message));
     if json {
         println!("{}", json_view(&rows, &browsers, &error, now));
         return Ok(());
@@ -726,84 +767,33 @@ fn json_view(
     })
 }
 
-/// `vega browser gc`: close the sessions of dead owner panes, prune records
-/// of sessions that no longer exist (design, decision 4: never a live
-/// owner's session, never an unrecorded one).
-fn gc() -> Result<(), Failure> {
-    let records = owner::load();
-    let real = real::real_binary().ok_or_else(no_agent_browser)?;
-    let listed = session_names(Some(&real));
-    let local = vega_herdr::local_host();
-    let mut alive: HashMap<String, Option<bool>> = HashMap::new();
-    let mut closed = 0;
-    let mut live = 0;
-    let mut remote = 0;
-    let mut unattributed = 0;
-    let mut unknown = 0;
-    // Records of sessions that no longer exist go first: closing them is
-    // pointless, and they must not count as kept.
-    let mut pruned = BTreeSet::new();
-    if let Ok(list) = &listed {
-        for session in records.keys() {
-            if !list.contains(session) {
-                owner::remove(session);
-                println!("pruned {session} (no agent-browser session)");
-                pruned.insert(session.clone());
-            }
-        }
-    }
-    for (session, rec) in records.iter().filter(|(s, _)| !pruned.contains(*s)) {
-        let Some(pane) = &rec.pane else {
-            unattributed += 1;
-            continue;
-        };
-        if rec.host != local {
-            // Its owner's host runs its own gc with the same record.
-            remote += 1;
-            continue;
-        }
-        match *alive
-            .entry(pane.clone())
-            .or_insert_with(|| pane::alive(pane))
-        {
-            Some(true) => live += 1,
-            None => {
-                unknown += 1;
-                println!("kept {session}: cannot tell whether pane {pane} is alive");
-            }
-            Some(false) => {
-                let _ = Command::new(&real)
-                    .args(["--session", session, "close"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                owner::remove(session);
-                println!("closed {session} (owner pane {pane} is gone)");
-                closed += 1;
-            }
-        }
-    }
-    println!(
-        "gc: {closed} closed, kept {} ({} live owner pane, {} on another host, {} unattributed, {} liveness unknown)",
-        live + remote + unattributed + unknown,
-        live,
-        remote,
-        unattributed,
-        unknown
-    );
-    Ok(())
-}
-
 /// `vega browser close <session>`: close one session on explicit request.
 fn close(session: &str) -> Result<(), Failure> {
     valid_session(session)?;
+    if let Some(port) = vega_browser::dev::shared::bound(session)? {
+        vega_browser::dev::shared::command(
+            &["--session".into(), session.into(), "close".into()],
+            port,
+        )?;
+        return Ok(());
+    }
+    if vega_browser::dev::session_names()?
+        .iter()
+        .any(|name| name == session)
+    {
+        let args = [
+            "--session".to_owned(),
+            session.to_owned(),
+            "close".to_owned(),
+        ];
+        vega_browser::dev::command(&args)?;
+        return Ok(());
+    }
     let real = real::real_binary().ok_or_else(no_agent_browser)?;
     let out = Command::new(real)
         .args(["--session", session, "close"])
         .output()
         .map_err(|e| Failure::new("agent_browser_failed", e.to_string(), ""))?;
-    owner::remove(session);
     if !out.status.success() {
         return Err(Failure::new(
             "close_failed",
@@ -816,6 +806,7 @@ fn close(session: &str) -> Result<(), Failure> {
             "check the session with agent-browser session list",
         ));
     }
+    owner::remove(session);
     println!("closed: {session}");
     Ok(())
 }
@@ -831,7 +822,17 @@ mod tests {
 
     #[test]
     fn help_lists_every_command() {
-        for cmd in ["ab", "chromium", "launch", "cleanup", "ls", "gc", "close"] {
+        for cmd in [
+            "ab",
+            "dev",
+            "chromium",
+            "launch",
+            "cleanup",
+            "ls",
+            "gc",
+            "disconnect",
+            "close",
+        ] {
             assert!(HELP.contains(cmd), "help misses {cmd}");
         }
     }
@@ -846,7 +847,8 @@ mod tests {
     #[test]
     fn session_names_validate() {
         assert!(valid_session("review-t7m").is_ok());
-        assert!(valid_session("wt.journey_2").is_ok());
+        assert!(valid_session("wt-journey_2").is_ok());
+        assert!(valid_session("wt.journey_2").is_err());
         assert!(valid_session("").is_err());
         assert!(valid_session("../x").is_err());
         assert!(valid_session("a b").is_err());

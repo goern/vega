@@ -100,7 +100,9 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "tempfile",
+ "tungstenite",
  "vega-browser",
+ "vega-herdr",
  "vega-shim",
 ]
 
@@ -626,6 +628,12 @@ dependencies = [
  "quote",
  "syn 3.0.6",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "ed25519"
@@ -2867,8 +2875,17 @@ dependencies = [
 name = "vega-browser"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "libc",
+ "rusqlite",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "subtle",
  "tempfile",
+ "tungstenite",
+ "ureq",
+ "url",
  "vega-build",
  "vega-herdr",
  "vega-plugin",
@@ -2883,6 +2900,7 @@ version = "0.1.0"
 name = "vega-capacity"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "tempfile",
  "vega-build",
@@ -2963,6 +2981,7 @@ name = "vega-herdr"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dunce",
  "libc",
  "regex",
  "rusqlite",
@@ -2973,6 +2992,7 @@ dependencies = [
  "tempfile",
  "toml_edit",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3128,6 +3148,7 @@ dependencies = [
  "vega-theme-sync",
  "vega-transcript",
  "vega-uber-msg",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3152,6 +3173,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tungstenite",
+ "url",
+ "vega-browser",
  "vega-build",
  "vega-herdr",
  "vega-plugin",
@@ -3198,6 +3221,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vega-build",
+ "vega-herdr",
  "vega-plugin",
 ]
 
@@ -3205,6 +3229,7 @@ dependencies = [
 name = "vega-shim"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "tempfile",
 ]
 
@@ -3215,6 +3240,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vega-build",
+ "vega-herdr",
  "vega-plugin",
 ]
 

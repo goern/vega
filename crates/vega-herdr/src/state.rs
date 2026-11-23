@@ -42,10 +42,7 @@ pub fn state_file(kind: &str, pane: &str) -> Option<PathBuf> {
 
 /// `state_file` for an explicit machine (`None`: this one).
 pub fn state_file_on(kind: &str, machine: Option<&str>, pane: &str) -> Option<PathBuf> {
-    let state = env::var("XDG_STATE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.local/state")))?;
+    let state = crate::platform::state_home()?;
     let machine = machine.unwrap_or("local");
     let encoded = crate::pane::hc_storage_token(pane);
     let pane = encoded
@@ -104,6 +101,10 @@ pub fn save_brief(machine: Option<&str>, pane: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Windows wall-clock ticks can coincide. Keep successive briefs distinct
+    // so a reply acknowledges exactly the brief that preceded it.
+    #[cfg(windows)]
+    let ms = ms.max(brief_of(machine, pane).unwrap_or(0).saturating_add(1));
     write(&state_file_on("briefs", machine, pane), &ms.to_string());
 }
 
@@ -299,11 +300,8 @@ pub fn inbox_only_hosts() -> Vec<String> {
     if let Ok(v) = env::var("VEGA_POST_INBOX_ONLY") {
         return parse_hosts(&v.replace(',', "\n"));
     }
-    let file = env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|c| !c.is_empty())
-        .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.config")))
-        .map(|c| Path::new(&c).join("vega").join("inbox-only"));
+    let file =
+        crate::platform::config_home().map(|c| Path::new(&c).join("vega").join("inbox-only"));
     match file.and_then(|f| std::fs::read_to_string(f).ok()) {
         Some(text) => parse_hosts(&text),
         None => DEFAULT_INBOX_ONLY.iter().map(|h| h.to_string()).collect(),
@@ -441,7 +439,7 @@ pub fn save_mode_checked(
     let record = json!({"name": name, "mode": mode.as_str()});
     let tmp = file.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&tmp, record.to_string())?;
-    let result = std::fs::rename(&tmp, &file);
+    let result = crate::platform::replace(&tmp, &file);
     if result.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
@@ -618,7 +616,11 @@ pub fn settle(machine: Option<&str>, pane: &str) {
 /// The child sent its parent a message since its last new work: it is not
 /// silent, whatever channel it used.
 pub fn set_replied(machine: Option<&str>, pane: &str) {
-    write(&state_file_on("replied", machine, pane), "");
+    #[cfg(windows)]
+    let text = brief_of(machine, pane).unwrap_or(0).to_string();
+    #[cfg(not(windows))]
+    let text = String::new();
+    write(&state_file_on("replied", machine, pane), &text);
 }
 
 pub fn has_replied(machine: Option<&str>, pane: &str) -> bool {
@@ -633,6 +635,16 @@ pub fn owes(machine: Option<&str>, pane: &str) -> bool {
     let Some(brief) = brief_of(machine, pane) else {
         return false;
     };
+    // NTFS mtimes may lag the wall clock and are not a causal ordering. New
+    // Windows records name the answered brief; retain mtime reads for legacy
+    // empty records. Unix keeps its existing on-disk contract.
+    #[cfg(windows)]
+    if let Some(answered) = state_file_on("replied", machine, pane)
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .and_then(|text| text.parse::<u128>().ok())
+    {
+        return brief > answered;
+    }
     let replied = state_file_on("replied", machine, pane)
         .and_then(|f| std::fs::metadata(f).ok())
         .and_then(|m| m.modified().ok())
@@ -1027,6 +1039,10 @@ pub struct SpawnRecord {
     pub tier: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub tier_why: Option<String>,
+    #[serde(default)]
+    pub bead: Option<String>,
     /// Launch argv without the task (harness first), for an in-place resume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub argv: Vec<String>,
@@ -1060,7 +1076,7 @@ pub fn save_spawn(record: &SpawnRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(file.parent().expect("state file has parent"))?;
     let temporary = file.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(record)?)?;
-    std::fs::rename(temporary, file)
+    crate::platform::replace(temporary, file)
 }
 
 pub fn spawn_records() -> Vec<SpawnRecord> {
@@ -1158,7 +1174,10 @@ mod tests {
             );
             return;
         }
-        let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+        let tick = || {
+            #[cfg(not(windows))]
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         let pane = "hc:t1w";
         assert!(!owes(None, pane), "no brief: nothing owed");
         save_parent_on(None, pane, "fable-chat", "hc:t1n");

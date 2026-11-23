@@ -19,6 +19,19 @@ fn setup() -> (tempfile::TempDir, Ctx) {
     }
     fs::create_dir_all(home.join(".local/bin")).unwrap();
     script(&home.join(".local/bin"), "dcg", "echo 0.16.0");
+    script(
+        &home.join(".local/bin"),
+        "vega-browser",
+        r#"
+case "$1" in
+status)
+ if test -f "$HOME/browser-current"; then state=current; else state=missing; fi
+ if test -f "$HOME/no-npm"; then npm=false; else npm=true; fi
+ printf '{"state":"%s","pinned":"0.43.0","chrome":"%s","npm":%s}\n' "$state" "$state" "$npm";;
+install) touch "$HOME/browser-current";;
+esac
+"#,
+    );
     let skills = script(
         d.path(),
         "vega-skills",
@@ -1389,4 +1402,46 @@ fn removing_dcg_cleans_up_only_managed_guards_and_retains_backups() {
         fs::read_to_string(&extension).unwrap(),
         "// user-owned guard\n"
     );
+}
+
+#[test]
+fn browser_runtime_unit_converges_and_reports_drift() {
+    let (_tmp, ctx) = setup();
+    let p = plan(&ctx, Unit::Browser).unwrap();
+    assert!(p.browser_pending);
+    assert!(state(&p, &[]).starts_with("differs"));
+    assert!(matches!(
+        apply(&ctx, Unit::Browser, &BTreeSet::new()),
+        Outcome::Written(_)
+    ));
+    assert_eq!(
+        apply(&ctx, Unit::Browser, &BTreeSet::new()),
+        Outcome::Unchanged
+    );
+    script(&ctx.env.home.join(".local/bin"), "vega-browser", "exit 1");
+    assert!(matches!(
+        apply(&ctx, Unit::Browser, &BTreeSet::new()),
+        Outcome::Failed(_)
+    ));
+}
+
+#[test]
+fn browser_runtime_unit_skips_a_host_without_agent_browser_and_npm() {
+    let (_tmp, ctx) = setup();
+    fs::write(ctx.env.home.join("no-npm"), "").unwrap();
+    assert!(matches!(
+        apply(&ctx, Unit::Browser, &BTreeSet::new()),
+        Outcome::Skipped(r) if r.contains("does not use browsers")
+    ));
+    assert!(!ctx.env.home.join("browser-current").exists());
+}
+
+#[test]
+fn browser_runtime_unit_fails_when_the_status_fails() {
+    let (_tmp, ctx) = setup();
+    script(&ctx.env.home.join(".local/bin"), "vega-browser", "exit 1");
+    assert!(matches!(
+        apply(&ctx, Unit::Browser, &BTreeSet::new()),
+        Outcome::Failed(_)
+    ));
 }

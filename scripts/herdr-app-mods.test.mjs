@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-function load(name, {allowFocus=false}={}) {
+function load(name, {allowFocus=false,crlf=false}={}) {
   const state = new Map(), storage = new Map(), calls = [], tasks = [], commands = [];
   const files = new Map(), fsCalls = [];
   const fakeFs = {
@@ -25,7 +25,7 @@ function load(name, {allowFocus=false}={}) {
     }});return proxy;
   }
   const cx={notify(){},open_url:url=>calls.push(['open-url',url]),write_to_clipboard:text=>calls.push(['clipboard',text]),stop_propagation(){calls.push(['stop']);},timer:{every(){}},sleep(){background=true;return new Promise(()=>{});},spawn(f){background=false;const p=f(cx);if(!background)tasks.push(p);return p;}};
-  const api={View:class {},div:el,h_flex:el,v_flex:el,svg:el,image:el,
+  const api={View:class {},div:el,h_flex:el,v_flex:el,svg:source=>Object.assign(el(),{svgSource:source}),image:el,
     InputState:{new(options={}){assert.equal(rendering,false,'input state created in render');let value=options.value??'';return {handlers:{},on(event,f){this.handlers[event]=f;},value:()=>value,set_value:v=>{value=v;},focus(){assert(allowFocus,'focus stolen');calls.push(['focus']);}};}},
     Input:{new:el},ScrollHandle:{new:()=>({scroll_to_item:i=>calls.push(['scroll',i])})},
     Scrollbar:{vertical:el},v_virtual_list:(id,count,height,key,render)=>el().id(id).children(render({start:0,end:count})),
@@ -40,11 +40,12 @@ function load(name, {allowFocus=false}={}) {
     checking:()=>false, appHome:()=>'/scratch/app-home', fs: fakeFs,
     localStorage:{getItem:k=>storage.get(k)??null,removeItem:k=>storage.delete(k),setItem:(k,v)=>storage.set(k,v)},Date,Map,Set,JSON};
   let code=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/main.js`,import.meta.url),'utf8');
-  code=code.replace(/^import .*;\n/gm,'').replace('export default class','globalThis.Mod = class');
+  if (crlf) code=code.replace(/\r?\n/g,'\r\n');
+  code=code.replace(/^import .*;\r?\n/gm,'').replace('export default class','globalThis.Mod = class');
   const context=vm.createContext(api);
   if(['vega-window-tabs','vega-services'].includes(name)) for(const file of name==='vega-services'?['model.js']:['navigation.js','tabs.js','diff.js']) {
     const helper=fs.readFileSync(new URL(`../config/herdr-app/mods/${name}/${file}`,import.meta.url),'utf8')
-      .replace(/^import .*;\n/gm,'').replaceAll('export function','function').replaceAll('export const','const');
+      .replace(/^import .*;\r?\n/gm,'').replaceAll('export function','function').replaceAll('export const','const');
     vm.runInContext(helper,context);
   }
   vm.runInContext(code,context);
@@ -53,6 +54,142 @@ function load(name, {allowFocus=false}={}) {
 }
 const row=()=>({schema:2,project:'project-a',checkout:'/repo with spaces',at:Date.now()/1000,decisions:1,
   decision_texts:[{id:'b-1',title:'Choose',question:'What next?',project:'project-a'}],waiting_panes:[]});
+
+test('sidebar preference timer redraws only for changes, errors, and recovery', async () => {
+  const h = load('vega-sidebar'), timers = new Map();
+  h.cx.timer.every = (ms, tick) => timers.set(ms, tick);
+  let redraws = 0;
+  h.cx.notify = () => redraws++;
+  let response = {code: 0, stdout: '{"projects":{},"views":{}}'};
+  h.api.exec = async () => response;
+  h.mod.init({}, h.cx);
+  await h.flush();
+  redraws = 0;
+  const poll = () => timers.get(5000)(h.cx);
+  for (let i = 0; i < 3; i++) await poll();
+  assert.equal(redraws, 0);
+  response = {code: 0, stdout: '{"projects":{"alpha":{"pinned":true}},"views":{}}'};
+  await poll();
+  const lastGood = h.mod.preferences;
+  assert.equal(redraws, 1);
+  response = {code: 1, stderr: 'offline'};
+  await poll();
+  await poll();
+  assert.equal(redraws, 2);
+  assert.equal(h.mod.preferences, lastGood);
+  response = {code: 0, stdout: JSON.stringify(lastGood)};
+  await poll();
+  await poll();
+  assert.equal(redraws, 3);
+  assert.equal(h.mod.configError, null);
+});
+
+test('sidebar age timer redraws once when a label changes or a badge expires', () => {
+  const h = load('vega-sidebar'), timers = new Map();
+  h.cx.timer.every = (ms, tick) => timers.set(ms, tick);
+  let redraws = 0, now = 1_800_000_000_000;
+  h.cx.notify = () => redraws++;
+  h.api.Date = class extends Date { static now() { return now; } };
+  h.api.agents = () => [{address: 't7', status: 'idle'}];
+  h.mod.init({}, h.cx);
+  h.state.set('vega.badges', [{...row(), at: now / 1000 - 45}]);
+  h.render();
+  assert(texts(h.render()).includes('<1m'));
+  const tick = () => timers.get(30000)(h.cx);
+  tick();
+  assert.equal(redraws, 0);
+  now += 30_000;
+  tick();
+  tick();
+  assert.equal(redraws, 1, 'an expired badge invalidates once');
+  now += 30_000;
+  tick();
+  tick();
+  assert.equal(redraws, 2, 'the age boundary invalidates once');
+  assert(texts(h.render()).includes('1m'));
+});
+
+test('status polls skip identical render state and keychain heartbeat timestamps', async () => {
+  const h = load('vega');
+  let redraws = 0;
+  h.cx.notify = () => redraws++;
+  h.api.exec = async () => ({code: 0, stdout: '{"running":true,"rows":[]}'});
+  // Direct calls exercise the same poll body without launching the daemon or watcher task.
+  h.mod.watching = true;
+  for (let i = 0; i < 3; i++) await h.mod.refresh(h.cx);
+  assert.equal(redraws, 0);
+  const now = Date.now() / 1000;
+  const keychain = {host: 'puck', state: 'unlocked', since: now - 10, at: now,
+    agent: {state: 'ready', keys: 2, at: now}};
+  h.mod.applyKeychains([keychain], now, h.cx);
+  const published = h.state.get('vega.keychains');
+  h.mod.applyKeychains([{...keychain, at: now + 1, agent: {...keychain.agent, at: now + 1}}], now + 1, h.cx);
+  assert.equal(redraws, 1);
+  assert.equal(h.state.get('vega.keychains'), published);
+  h.mod.applyKeychains([keychain], now - 181, h.cx);
+  assert.equal(redraws, 2);
+  assert.equal(h.mod.keychains[0].state, 'unknown');
+});
+
+test('decision inbox timer redraws when content changes and closes on expiration', () => {
+  const h = load('vega-inbox');
+  let redraws = 0, tick;
+  h.cx.notify = () => redraws++;
+  h.cx.timer.every = (_ms, callback) => { tick = () => callback(h.cx); };
+  const badge = row();
+  h.state.set('vega.badges', [badge]);
+  h.setProps({overlay: 'inbox'});
+  h.mod.init({}, h.cx);
+  badge.at += 1;
+  tick();
+  assert.equal(redraws, 0);
+  badge.decision_texts[0].title = 'New title';
+  tick();
+  tick();
+  assert.equal(redraws, 1);
+  badge.at -= 120;
+  tick();
+  assert(h.calls.some(([call, id]) => call === 'close' && id === 'inbox'));
+});
+
+test('unspaced remote core agents join project rows without a native agent entry',()=>{
+  const h=load('vega-sidebar'),coord='github.com/durandom/rally-ng-app',member='github.com/durandom/rally-ng-maps';
+  const uac={address:'ganymede/t1j',state:'live',status:'idle',labels:{'vega.role':'uac','vega.project-id':coord,'herdr.space':'s1','vega.group-members':JSON.stringify([member])}};
+  const child={address:'io/t36',state:'live',status:'done',parent:uac.address,name:'guide',labels:{'vega.role':'sentinel','vega.harness':'claude','vega.mode':'headed','vega.project-id':member}};
+  h.api.terminals=()=>[uac,child];
+  h.api.agents=()=>[{...uac,pane:uac.address,space:'ganymede/s1'}];
+  h.mod.init({},h.cx);
+  let nodes=elements(h.render());
+  assert(nodes.some(n=>n.idValue==='ag-io/t36'));
+  assert(nodes.some(n=>n.idValue===`project-block-${member}`));
+  assert(!nodes.some(n=>n.idValue==='term-io/t36'));
+  const cached=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,cached);
+  // Core status participates in the existing cache and Active filtering.
+  h.state.set('vega.hide-inactive',true);
+  child.status='idle';nodes=elements(h.render());
+  assert(!nodes.some(n=>n.idValue==='ag-io/t36'));
+  child.status='working';h.render();assert.notEqual(h.mod.modelCache,cached);
+  // Native adoption supplies the richer row, never a duplicate.
+  h.api.agents=()=>[{...uac,pane:uac.address,space:'ganymede/s1'},{...child,pane:child.address}];
+  nodes=elements(h.render());assert.equal(nodes.filter(n=>n.idValue==='ag-io/t36').length,1);
+  h.api.agents=()=>[{...uac,pane:uac.address,space:'ganymede/s1'}];
+  // Without a group claim the child remains reachable through its parent tree.
+  delete uac.labels['vega.group-members'];
+  nodes=elements(h.render());assert(nodes.some(n=>n.idValue==='sub-io/t36'));
+  // Parent/project inheritance also works without the child's own project label.
+  delete child.labels['vega.project-id'];
+  nodes=elements(h.render());assert(nodes.some(n=>n.idValue==='sub-io/t36'));
+  assert.equal(h.mod.modelCache.membership.projectOfAgent(child),coord);
+  // If its parent disappears, its own project still supplies a top-level row.
+  child.labels['vega.project-id']=member;uac.state='exited';h.api.agents=()=>[];
+  nodes=elements(h.render());assert(nodes.some(n=>n.idValue==='ag-io/t36'));
+  // Saved views retain authority over these synthetic rows.
+  h.mod.preferences={projects:{},views:{hidden:{labels:['other'],machines:[]}}};
+  h.state.set('vega.view','hidden');nodes=elements(h.render());
+  assert(!nodes.some(n=>['ag-io/t36','sub-io/t36'].includes(n.idValue)));
+  h.state.set('vega.view','all');child.state='exited';
+  nodes=elements(h.render());assert(!nodes.some(n=>n.idValue==='ag-io/t36'));
+});
 
 test('rally group nests io sentinels under one ganymede UAC with member actions and badges',()=>{
   const h=load('vega-sidebar'),coord='github.com/durandom/rally-ng-app',member='github.com/durandom/rally-ng-maps';
@@ -951,6 +1088,17 @@ for (const source of ['machines','ganymede']) test(`badge failures retain last g
   await h.mod.badges(h.cx);assert.equal(h.mod.error,null,'success resets the streak');
 });
 
+test('unprovisioned hosts do not produce a second badge failure in the status bar',async()=>{
+  const h=load('vega');h.mod.seen=new Set();h.mod.watching=true;
+  h.mod.started=new Map([['io-win',{notProvisioned:true}]]);
+  h.api.exec=async()=>({code:0,stdout:JSON.stringify({rows:[],errors:[{source:'io-win',message:'hc io-win badges unavailable'}]})});
+  for(let i=0;i<4;i++) await h.mod.badges(h.cx);
+  assert.equal(h.mod.error,null);
+  h.mod.started.set('io-win',{notProvisioned:false});
+  for(let i=0;i<3;i++) await h.mod.badges(h.cx);
+  assert.equal(h.mod.error,'hc io-win badges unavailable','provisioned reader failures still surface');
+});
+
 test('whole reader failures keep badges and report a short error only after three failures',async()=>{
   const h=load('vega');h.mod.seen=new Set();h.mod.watching=true;
   h.state.set('vega.badges',[row()]);
@@ -1025,6 +1173,10 @@ print(json.dumps({'stdout':base64.b64encode(p.stdout).decode(),'stderr':base64.b
     const outer=run({}),inner=JSON.parse(outer.stdout);
     assert.equal(outer.code,0);assert.equal(inner.code,0);
     assert.equal(fs.readFileSync(log,'utf8').trim(),'relay start');
+    fs.unlinkSync(path.join(dir,'.local/bin/vega-post'));
+    assert.equal(JSON.parse(run({}).stdout).code,77,'missing binary is explicit');
+    fs.writeFileSync(path.join(dir,'.local/bin/vega-post'),'#!/bin/sh\nexit 1\n',{mode:0o755});
+    assert.equal(JSON.parse(run({}).stdout).code,1,'present broken binary remains a failure');
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });
 
@@ -1038,7 +1190,7 @@ test('vega mod starts vegad on connected machines now, then slowly; failures sho
   await h.mod.startRemotes(h.cx);
   assert.deepEqual(starts(),['ganymede'],'connected machines only');
   const call=h.calls.find(c=>c[0]==='exec');
-  assert.deepEqual(Array.from(call[2].slice(2)),['hc','exec','--json','--on','ganymede','--timeout','20','--','sh','-c','exec "$HOME/.local/bin/vega-post" relay start']);
+  assert.deepEqual(Array.from(call[2].slice(2)),['hc','exec','--json','--on','ganymede','--timeout','20','--','sh','-c',vm.runInContext('remoteStart',h.api)]);
   await h.mod.startRemotes(h.cx);assert.equal(starts().length,1,'not every refresh');
   now+=300001;await h.mod.startRemotes(h.cx);assert.equal(starts().length,2,'slow period');
   h.mod.machines=[{name:'ganymede',state:'disconnected'}];await h.mod.startRemotes(h.cx);
@@ -1048,6 +1200,95 @@ test('vega mod starts vegad on connected machines now, then slowly; failures sho
   for(let i=0;i<3;i++){await h.mod.startRemotes(h.cx);assert.equal(h.mod.startError,i<2?null:'hc ganymede vegad start failed');now+=60001;}
   assert(texts(h.render()).includes('vega: hc ganymede vegad start failed'));
   fail=false;await h.mod.startRemotes(h.cx);assert.equal(h.mod.startError,null);
+});
+
+test('unprovisioned remote starters stay quiet, diagnose once and recover on slow recheck',async()=>{
+  for (const result of [
+    {error:{kind:'spawn_failed',message:'cannot start sh: program not found'}},
+    {code:77,stdout:Buffer.from('vega-not-provisioned\n').toString('base64')},
+  ]) {
+    const h=load('vega'); let now=1e12, current=result; const logs=[];
+    h.api.Date={now:()=>now}; h.api.console={log:s=>logs.push(s)};
+    // Real hc shape: launch errors go to stderr with exit 1 and an empty stdout.
+    h.api.exec=async(_bin,args)=>{ const reply = args.includes('vega-post.exe') && (current.error?.message === 'cannot start sh: program not found' || (current.code === 77 && current.stdout)) ? {error:{kind:'spawn_failed',message:'cannot start vega-post.exe: program not found'}} : current; return {code:0,stdout:JSON.stringify(reply.error
+      ?{code:1,stdout:'',stderr:JSON.stringify(reply)}
+      :{code:0,stdout:JSON.stringify(reply),stderr:''})}; };
+    h.mod.machines=[{name:'io-win',state:'connected'}];
+    for(let i=0;i<4;i++) {
+      await h.mod.startRemotes(h.cx);
+      assert.equal(h.mod.startError,null);
+      assert.equal(h.mod.started.get('io-win').next,now+300000);
+      now+=300001;
+    }
+    assert.equal(logs.length,1);
+    assert.match(logs[0],/io-win not provisioned/);
+    assert(!texts(h.render()).includes('vegad start failed'));
+    for (current of [{code:1},{code:77},{error:{kind:'spawn_failed',message:'cannot start sh: permission denied'}},{code:0,timed_out:true}]) {
+      for(let i=0;i<3;i++){await h.mod.startRemotes(h.cx); now+=60001;}
+      assert.equal(h.mod.startError,'hc io-win vegad start failed');
+    }
+    current={code:0};await h.mod.startRemotes(h.cx);
+    assert.equal(h.mod.startError,null);
+    assert.equal(h.mod.started.get('io-win').notProvisioned,false);
+  }
+});
+
+test('Git sh without a Unix vega-post falls through to the native Windows worker',async()=>{
+  const h=load('vega'); const calls=[];
+  h.api.exec=async(_bin,args)=>{
+    calls.push(Array.from(args));
+    const reply=args.includes('sh') ? {code:77,stdout:Buffer.from('vega-not-provisioned\n').toString('base64')} : {code:0};
+    return {code:0,stdout:JSON.stringify({code:0,stdout:JSON.stringify(reply),stderr:''})};
+  };
+  h.mod.machines=[{name:'io-win',state:'connected'}];
+  await h.mod.startRemotes(h.cx);
+  assert.equal(calls.length,2);
+  assert.deepEqual(calls[1].slice(-3),['vega-post.exe','relay','start']);
+  assert.equal(h.mod.startError,null);
+  assert.equal(h.mod.started.get('io-win').notProvisioned,false);
+});
+
+test('native starter accepts recorded hc exec envelopes and retries a worker error',async()=>{
+  // io-win hc 0.1.21: stdout/stderr are base64, signal is null; launch
+  // failures are a different envelope on hc stderr with process exit 1.
+  const h=load('vega'); let now=1e12,broken=false; const calls=[];
+  h.api.Date={now:()=>now};
+  const envelope=(code,stdout)=>({code,ms:242,signal:null,stderr:'',
+    stdout:Buffer.from(stdout).toString('base64'),timed_out:false,truncated:false});
+  h.api.exec=async(_bin,args)=>{
+    calls.push(Array.from(args));
+    const result=args.includes('sh')
+      ? envelope(77,'vega-not-provisioned\n')
+      : envelope(broken?1:0,broken?'error: relay_failed\n':'relay: started\r\npid: 1234\r\n');
+    return {code:0,stdout:JSON.stringify({code:0,stdout:JSON.stringify(result),stderr:''})};
+  };
+  h.mod.machines=[{name:'io-win',state:'connected'}];
+  await h.mod.startRemotes(h.cx);
+  assert.deepEqual(calls[1].slice(-3),['vega-post.exe','relay','start']);
+  assert.equal(h.mod.started.get('io-win').next,now+300000);
+  assert.equal(h.mod.startError,null);
+  broken=true;
+  for(let i=0;i<3;i++){now+=300001;await h.mod.startRemotes(h.cx);}
+  assert.equal(h.mod.startError,'hc io-win vegad start failed');
+  assert.equal(h.mod.started.get('io-win').notProvisioned,false);
+});
+
+test('missing sh starts the Windows worker with direct argv and retries real launch failures',async()=>{
+  const h=load('vega',{crlf:true}); const calls=[]; let now=1e12, broken=false;
+  h.api.Date={now:()=>now};
+  h.api.exec=async(_bin,args)=>{
+    calls.push(Array.from(args));
+    const error=args.includes('sh') ? {kind:'spawn_failed',message:'cannot start sh: program not found'} : broken ? {kind:'spawn_failed',message:'cannot start vega-post.exe: permission denied'} : null;
+    return {code:0,stdout:JSON.stringify(error ? {code:1,stdout:'',stderr:JSON.stringify({error})} : {code:0,stdout:JSON.stringify({code:0}),stderr:''})};
+  };
+  h.mod.machines=[{name:'io-win',state:'connected'}];
+  await h.mod.startRemotes(h.cx);
+  assert.deepEqual(calls[1].slice(2),['hc','exec','--json','--on','io-win','--timeout','20','--','vega-post.exe','relay','start']);
+  assert.equal(h.mod.started.get('io-win').notProvisioned,false);
+  assert.equal(h.mod.startError,null);
+  broken=true;
+  for(let i=0;i<3;i++){now+=300001;await h.mod.startRemotes(h.cx);}
+  assert.equal(h.mod.startError,'hc io-win vegad start failed');
 });
 
 function projectFixture(h) {
@@ -1062,6 +1303,17 @@ function projectFixture(h) {
   h.api.agents=()=>[['puck/t1','puck/uac'],['t2','sentinel'],['t3','other'],['t4','scratch']].map(([address,space])=>({address,space,pane:address,tab:'tb',status:'idle',program:{}}));
   return project;
 }
+
+test('a nested sentinel with its own pane opens it; a paneless one peeks',()=>{
+  const h=load('vega-sidebar');projectFixture(h);h.mod.init({},h.cx);
+  const click=()=>{h.calls.length=0;elements(h.render()).find(n=>n.idValue==='sub-t2').handlers.on_click({},h.cx);};
+  click();
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='pane.focus'&&c[2].pane==='t2'),'kept child focuses its pane');
+  assert(!h.calls.some(c=>c[1]==='terminal.peek'));
+  const agents=h.api.agents();h.api.agents=()=>agents.map(a=>a.address==='t2'?{...a,pane:null}:a);
+  click();
+  assert(h.calls.some(c=>c[0]==='run'&&c[1]==='terminal.peek'&&c[2].terminal==='t2'),'paneless child peeks');
+});
 
 test('sidebar shows coloured browser dots on owning agent rows and derives once per payload',()=>{
   const h=load('vega-sidebar'),project=projectFixture(h);h.mod.init({},h.cx);
@@ -1109,7 +1361,11 @@ test('sidebar derivation is cached between renders and rebuilt exactly when an i
   all[1].labels['herdr.pinned']='true';
   h.render();assert.notEqual(h.mod.modelCache,first);
   let model=h.mod.modelCache;h.render();assert.equal(h.mod.modelCache,model);
-  assert(elements(h.render()).some(n=>n.tooltipValue==='Pinned agent'),'rebuilt model carries the pin marker');
+  const tree = elements(h.render());
+  const pins = tree.filter(n=>n.svgSource==='mods/vega-sidebar/pin.svg');
+  assert.ok(pins.length,'rebuilt model carries the pin marker');
+  assert.ok(pins.every(pin=>!Object.hasOwn(pin,'tooltipValue')),'pin SVGs have no tooltip');
+  assert.ok(tree.some(n=>n.tooltipValue==='Pinned agent' && n.items.some(child=>pins.includes(child))));
   // Agent data: a status change rebuilds.
   const agents=h.api.agents();h.api.agents=()=>agents;agents[2].status='blocked';
   h.render();assert.notEqual(h.mod.modelCache,model);
@@ -2598,4 +2854,43 @@ test('keychain indicator includes agent count, fix hint and expires agent claims
   lock=elements(h.render()).find(n=>n.idValue==='keychain-localmac');
   assert(lock.tooltipValue.includes('agent.sock: unknown'));
   assert(!lock.tooltipValue.includes('3 keys'));
+});
+
+test('registered services retain project ownership across fleet scans and legacy entries degrade',()=>{
+  const h=load('vega-services'), attribute=vm.runInContext('attribute',h.api);
+  const terms=['a','b'].map((p,i)=>({address:`ganymede/t${i}`,state:'live',pid:10+i,
+    labels:{'herdr.space':p,'vega.project-id':`git:example/${p}`},foreground:{cwd:`/repo/${p}`}}));
+  const spaces=['a','b'].map(p=>({id:`ganymede/${p}`,name:p}));
+  const listeners=[
+    {pid:100,project:'git:example/a',title:'Explicit A'},
+    {pid:101,cwd:'/repo/a/src',title:'Legacy cwd A'},
+    {pid:102,title:'Legacy pid B'},
+    {pid:103,title:'Unknown global'},
+    {pid:104,project:'git:example/absent',title:'Absent project'},
+  ].map((r,i)=>({...r,registered:true,port:5300+i,host:'127.0.0.1',name:'node'}));
+  const snapshot={parents:{100:11,102:11},cwds:{},listeners};
+  const rows=attribute(snapshot,'ganymede',terms,spaces,[]);
+  assert.equal(rows[0].project,'git:example/a','explicit owner overrides foreign ancestry');
+  assert.equal(rows[0].space,'');
+  assert.equal(rows[1].project,'git:example/a');assert.equal(rows[2].project,'git:example/b');
+  assert.equal(rows[3].global,true);assert.equal(rows[4].global,false);
+  Object.assign(h.mod,{rows,errors:[],forwards:new Map(),pending:new Set(),targets:new Map()});
+  h.api.terminals=()=>terms;h.api.focused=()=>({terminal:'ganymede/t1'});
+  let text=JSON.stringify(h.render());
+  assert(text.includes('Legacy pid B'));assert(text.includes('Global services (owner unknown)'));
+  for(const title of ['Explicit A','Legacy cwd A','Absent project']) assert(!text.includes(title),title);
+  h.mod.showAgentPorts=true;assert(!JSON.stringify(h.render()).includes('Explicit A'));
+  h.api.focused=()=>({terminal:'ganymede/t0'});text=JSON.stringify(h.render());
+  assert(text.includes('Explicit A'));assert(text.includes('Legacy cwd A'));assert(!text.includes('Legacy pid B'));
+  assert.equal(h.calls.length,0);
+});
+
+test('browser listeners and daemon descendants never become services',()=>{
+  const h=load('vega-services'), attribute=vm.runInContext('attribute',h.api);
+  const processes={100:'/opt/agent-browser-darwin-arm64 --daemon',101:'/opt/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --remote-debugging-port=0',102:'node node /lib/agent-browser/dist/daemon.js',103:'worker',104:'node node /repo/server.js --title chrome',105:'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',106:'/usr/bin/chromium --remote-debugging-port=0'};
+  const snapshot={parents:{100:10,101:10,102:10,103:100,104:10,105:10,106:10},cwds:{},processes,
+    listeners:Object.keys(processes).map(pid=>({pid:Number(pid),port:60000+Number(pid),name:'node',host:'127.0.0.1',registered:true,title:'Registered'}))};
+  const terms=[{address:'t1',state:'live',pid:10,labels:{'herdr.space':'s','vega.project-id':'a'}}];
+  const rows=attribute(snapshot,null,terms,[{id:'s',name:'A'}],[]);
+  assert.deepEqual(Array.from(rows,r=>r.pid),[104]);
 });

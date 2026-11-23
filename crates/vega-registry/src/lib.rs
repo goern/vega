@@ -12,6 +12,8 @@
 //! - `<host>.beat` = {"schema": 2, "at": unix, human_at?}: the host's vegad ran a reconcile; entries
 //!   of a host without a fresh beat are not trusted (absence proves nothing). `human_at`:
 //!   the host's last herdr pane focus (`uber_engaged`).
+//! - `<host>.identity.v2` = fresh native enrollment (schema, host, public_key,
+//!   projects with v2 IDs and owner-local locations); CLI-managed, not a live beat.
 //! - `<host>.agent.<pane>` = {pane, name, kind, status, cwd, repo_key,
 //!   waiting?}: `waiting` = {status, since} while the agent waits for the
 //!   Slayer (vega_herdr::waiting).
@@ -42,6 +44,7 @@
 //!
 //! Only this crate talks to the bucket; mux, uac and the relay call it.
 
+#[cfg(unix)]
 pub mod cutover;
 pub mod pins;
 mod removal;
@@ -83,6 +86,11 @@ pub fn pane_token(pane: &str) -> String {
 
 pub fn beat_key(host: &str) -> String {
     format!("{}.beat", token(host))
+}
+
+/// Fresh native host enrollment, managed by the client rather than reconcile.
+pub fn identity_key(host: &str) -> String {
+    format!("{}.identity.v2", token(host))
 }
 
 pub fn agent_key(host: &str, pane: &str) -> String {
@@ -323,9 +331,15 @@ pub fn local_entries(
             );
         }
     }
+    #[cfg(unix)]
     let wait_records = state_wait_records(host);
+    #[cfg(unix)]
+    let waits_available = wait_records.is_ok();
+    #[cfg(windows)]
+    let waits_available = false;
     let open_asks = vega_herdr::gather::open();
-    out.insert(format!("{}.orchestration",token(host)),json!({"at":unix_now(),"waits_available":wait_records.is_ok(),"asks_available":open_asks.is_ok()}));
+    out.insert(format!("{}.orchestration",token(host)),json!({"at":unix_now(),"waits_available":waits_available,"asks_available":open_asks.is_ok()}));
+    #[cfg(unix)]
     if let Ok(waits) = wait_records {
         for w in waits.into_iter().filter(|w| w.resolved.is_none()) {
             if let Ok(value) = serde_json::to_value(&w) {
@@ -351,6 +365,7 @@ pub fn project_folder(common: &str) -> &str {
     dir.rsplit('/').next().unwrap_or(dir)
 }
 
+#[cfg(unix)]
 fn state_wait_records(host: &str) -> Result<Vec<vega_herdr::waits::Wait>, String> {
     let file = vega_herdr::waits::path().ok_or("wait source unavailable")?;
     let waits = vega_herdr::waits::Store::read(&file).map_err(|_| "wait source unavailable")?;
@@ -368,20 +383,34 @@ pub fn project_origin_name(project: &str) -> Option<String> {
 
 /// `project_origin_name` with the Git budget given (tests of the bound).
 fn origin_name_within(project: &str, budget: Duration) -> Option<String> {
-    let dir = match project.strip_prefix("~/") {
-        Some(rest) => std::path::PathBuf::from(env::var_os("HOME")?).join(rest),
+    let relative = project.strip_prefix("~/");
+    #[cfg(windows)]
+    let relative = relative.or_else(|| project.strip_prefix("~\\"));
+    let dir = match relative {
+        Some(rest) => vega_herdr::platform::home()?.join(rest),
         None => std::path::PathBuf::from(project),
     };
-    let out = vega_herdr::output_within(
-        std::process::Command::new("git")
-            .arg("--git-dir")
-            .arg(dir)
-            .args(["config", "--get", "remote.origin.url"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0"),
-        budget,
-    )
-    .ok()??;
+    let mut command = std::process::Command::new("git");
+    #[cfg(unix)]
+    command
+        .arg("--git-dir")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"]);
+    #[cfg(windows)]
+    command.arg("-C").arg(dir).args([
+        // As in the project resolver, Git's config reader needs a relative
+        // filename rather than a verbatim Win32 --git-dir argument.
+        "config",
+        "--file",
+        "config",
+        "--includes",
+        "--get",
+        "remote.origin.url",
+    ]);
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    let out = vega_herdr::output_within(&mut command, budget).ok()??;
     if !out.status.success() {
         return None;
     }
@@ -530,6 +559,7 @@ impl View {
     }
 
     /// Runtime declarations, retaining stale records as evidence with unknown freshness.
+    #[cfg(unix)]
     pub fn explicit_waits(&self) -> Result<Vec<(vega_herdr::waits::Wait, bool)>, String> {
         let mut out = Vec::new();
         for (key, v) in &self.entries {
@@ -672,18 +702,12 @@ fn url() -> String {
     vega_herdr::service_config::get("VEGA_NATS_URL", "nats.url").unwrap_or_default()
 }
 
-fn config_dir() -> Option<String> {
-    env::var("XDG_CONFIG_HOME")
-        .ok()
-        .filter(|c| !c.is_empty())
-        .or_else(|| env::var("HOME").ok().map(|h| format!("{h}/.config")))
-}
-
 fn seed() -> Option<String> {
     let path = env::var("VEGA_NATS_NKEY")
         .ok()
         .filter(|p| !p.is_empty())
-        .or_else(|| config_dir().map(|c| format!("{c}/vega/nats.nk")))?;
+        .map(std::path::PathBuf::from)
+        .or_else(|| vega_herdr::platform::config_home().map(|c| c.join("vega").join("nats.nk")))?;
     std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
@@ -968,7 +992,8 @@ pub fn uac_entry(host: &str, record: &Value) -> Result<Value, String> {
 
 /// Makes this host's keys equal `desired` plus a fresh beat: puts what
 /// changed since `last` (the previous reconcile's values), deletes this
-/// host's keys that are no longer desired, except CLI-managed project pins.
+/// host's keys that are no longer desired, except CLI-managed project pins
+/// and the fresh native identity enrollment.
 /// Returns the new `last`.
 pub async fn reconcile(
     kv: &async_nats::jetstream::kv::Store,
@@ -988,6 +1013,7 @@ pub async fn reconcile(
     for k in present {
         if k.starts_with(&prefix)
             && *k != beat_key(host)
+            && *k != identity_key(host)
             && *k != format!("{}.notify.sent", token(host))
             && !pins::is_pin(k)
             && *k != format!("{}.lanista.host", token(host))
@@ -1111,6 +1137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wait_and_ask_projections_verify_their_publisher_and_keep_stale_records_unknown() {
         use vega_herdr::waits::{Actor, Change, Endpoint, Proof, Request, Store};
         let dir = tempfile::tempdir().unwrap();
@@ -1271,7 +1298,7 @@ mod tests {
             let p =
                 vega_herdr::project::resolve(&tmp.path().join(cwd), &state::post_host()).unwrap();
             let key = vega_herdr::home_relative(p.location.common_dir.to_str().unwrap());
-            assert!(key.starts_with("~/"), "{key}");
+            assert!(key.starts_with("~/") || key.starts_with("~\\"), "{key}");
             assert_eq!(project_origin_name(&key).as_deref(), Some(name));
         }
         let plain = tmp.path().join("orrery/main/.git").display().to_string();
@@ -1280,6 +1307,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn origin_config_failures_are_bounded() {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(mode) = env::var("VEGA_ORIGIN_TEST_MODE") {

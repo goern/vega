@@ -29,7 +29,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
@@ -232,7 +231,7 @@ fn source<'r>(kind: Kind, repo: &'r Repo, claude: &Value, codex: &str) -> Option
 fn claude_file() -> PathBuf {
     env::var("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_default()))
+        .unwrap_or_else(|_| crate::platform::home().unwrap_or_default())
         .join(".claude.json")
 }
 
@@ -243,8 +242,21 @@ fn read_claude(file: &Path) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Claude's Windows project keys use disk-canonical case and forward slashes
+/// (observed with native Claude Code 2.1.296 on io-win). `real` resolves the
+/// directory, removing verbatim prefixes and non-root trailing separators.
+/// Keep this separate from the native paths used for git and Codex.
+fn claude_key(path: &str) -> String {
+    #[cfg(windows)]
+    return real(path).replace('\\', "/");
+    #[cfg(not(windows))]
+    path.to_string()
+}
+
 fn claude_trusts(config: &Value, path: &str) -> bool {
-    config["projects"][path]["hasTrustDialogAccepted"] == json!(true)
+    // Do not canonicalize stored keys: Claude does an exact key lookup, so
+    // an old native-backslash entry cannot vouch for trust or pass read-back.
+    config["projects"][claude_key(path)]["hasTrustDialogAccepted"] == json!(true)
 }
 
 /// Claude's own check: `dir` or a parent of it up to the git toplevel.
@@ -269,7 +281,7 @@ fn trust_claude(file: &Path, path: &str) -> Result<(), String> {
         let tmp = with_suffix(file, &format!(".tmp.vega.{}", std::process::id()));
         let out = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
         write_new(&tmp, out.as_bytes())
-            .and_then(|()| fs::rename(&tmp, file))
+            .and_then(|()| crate::platform::replace(&tmp, file))
             .map_err(|e| {
                 let _ = fs::remove_file(&tmp);
                 e.to_string()
@@ -296,7 +308,7 @@ fn set_trust(config: &mut Value, path: &str) -> bool {
         return false;
     };
     match projects
-        .entry(path)
+        .entry(claude_key(path))
         .or_insert_with(|| json!({}))
         .as_object_mut()
     {
@@ -309,11 +321,9 @@ fn set_trust(config: &mut Value, path: &str) -> bool {
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut f = crate::platform::private_options(&mut options).open(path)?;
     f.write_all(bytes)?;
     f.sync_all()
 }
@@ -324,7 +334,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn codex_file() -> PathBuf {
     env::var("CODEX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(env::var("HOME").unwrap_or_default()).join(".codex"))
+        .unwrap_or_else(|_| crate::platform::home().unwrap_or_default().join(".codex"))
         .join("config.toml")
 }
 
@@ -352,50 +362,117 @@ fn trust_codex(file: &Path, path: &str, main: Option<&str>) -> Result<String, St
 }
 
 fn project_header(path: &str) -> String {
-    format!("[projects.\"{path}\"]")
+    format!("[projects.{}]", json!(path))
 }
 
 /// Whether `[projects."<path>"]` says `trust_level = "trusted"`.
 fn trusted(config: &str, path: &str) -> bool {
-    let header = project_header(path);
-    let mut lines = config.lines().map(str::trim);
-    lines.any(|l| l == header)
-        && lines
-            .take_while(|l| !l.starts_with('['))
-            .any(|l| l.replace(' ', "") == "trust_level=\"trusted\"")
+    #[cfg(windows)]
+    return windows_project(config, path).is_some_and(|p| {
+        p.get("trust_level").and_then(toml_edit::Item::as_str) == Some("trusted")
+    });
+    #[cfg(not(windows))]
+    {
+        let header = project_header(path);
+        let mut lines = config.lines().map(str::trim);
+        lines.any(|l| l == header)
+            && lines
+                .take_while(|l| !l.starts_with('['))
+                .any(|l| l.replace(' ', "") == "trust_level=\"trusted\"")
+    }
 }
 
 /// Any entry for `path`, trusted or not: an explicit choice vega keeps.
+#[cfg(windows)]
+fn windows_project(config: &str, path: &str) -> Option<toml_edit::Table> {
+    let doc: toml_edit::DocumentMut = config.parse().ok()?;
+    let project = doc
+        .get("projects")?
+        .as_table()?
+        .iter()
+        .find_map(|(key, value)| {
+            (real(key) == real(path))
+                .then(|| value.as_table().cloned())
+                .flatten()
+        });
+    project
+}
+
 fn has_project(config: &str, path: &str) -> bool {
-    let header = project_header(path);
-    config.lines().any(|l| l.trim() == header)
+    #[cfg(windows)]
+    return windows_project(config, path).is_some();
+    #[cfg(not(windows))]
+    {
+        let header = project_header(path);
+        config.lines().any(|l| l.trim() == header)
+    }
 }
 
 /// `(event:i:j, trusted_hash)` approved for `<checkout>/.codex/hooks.json`.
 fn hook_approvals(config: &str, checkout: &str) -> Vec<(String, String)> {
-    let prefix = format!("[hooks.state.\"{checkout}/.codex/hooks.json:");
-    let mut out = Vec::new();
-    let mut key: Option<String> = None;
-    for line in config.lines().map(str::trim) {
-        if let Some(rest) = line.strip_prefix(&prefix) {
-            key = rest.strip_suffix("\"]").map(str::to_string);
-        } else if line.starts_with('[') {
-            key = None;
-        } else if let (Some(k), Some(v)) = (&key, line.strip_prefix("trusted_hash")) {
-            let hash = v.trim().trim_start_matches('=').trim().trim_matches('"');
-            out.push((k.clone(), hash.to_string()));
-            key = None;
-        }
+    #[cfg(windows)]
+    {
+        let Ok(doc) = config.parse::<toml_edit::DocumentMut>() else {
+            return Vec::new();
+        };
+        let Some(state) = doc
+            .get("hooks")
+            .and_then(|h| h.get("state"))
+            .and_then(toml_edit::Item::as_table)
+        else {
+            return Vec::new();
+        };
+        let hooks = Path::new(checkout).join(".codex/hooks.json");
+        state
+            .iter()
+            .filter_map(|(key, value)| {
+                // Split from the right: the path itself contains a drive colon.
+                let mut parts = key.rsplitn(4, ':');
+                let j = parts.next()?;
+                let i = parts.next()?;
+                let event = parts.next()?;
+                let path = parts.next()?;
+                (real(path) == real(hooks.to_str()?))
+                    .then(|| {
+                        value
+                            .get("trusted_hash")?
+                            .as_str()
+                            .map(|hash| (format!("{event}:{i}:{j}"), hash.to_owned()))
+                    })
+                    .flatten()
+            })
+            .collect()
     }
-    out
+    #[cfg(not(windows))]
+    let prefix = format!("[hooks.state.\"{checkout}/.codex/hooks.json:");
+    #[cfg(not(windows))]
+    {
+        let mut out = Vec::new();
+        let mut key: Option<String> = None;
+        for line in config.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                key = rest.strip_suffix("\"]").map(str::to_string);
+            } else if line.starts_with('[') {
+                key = None;
+            } else if let (Some(k), Some(v)) = (&key, line.strip_prefix("trusted_hash")) {
+                let hash = v.trim().trim_start_matches('=').trim().trim_matches('"');
+                out.push((k.clone(), hash.to_string()));
+                key = None;
+            }
+        }
+        out
+    }
 }
 
 /// The config.toml lines that trust `path` and approve its hooks.
 fn entries(path: &str, hooks: &[(String, String)]) -> String {
     let mut s = format!("\n{}\ntrust_level = \"trusted\"\n", project_header(path));
     for (key, hash) in hooks {
+        let hook = format!("{path}/.codex/hooks.json:{key}");
         s += &format!(
-            "\n[hooks.state.\"{path}/.codex/hooks.json:{key}\"]\ntrusted_hash = \"{hash}\"\n"
+            "\n[hooks.state.{}]\ntrusted_hash = {}\n",
+            json!(hook),
+            json!(hash)
         );
     }
     s
@@ -454,10 +531,21 @@ fn with_suffix(file: &Path, suffix: &str) -> PathBuf {
 
 /// The path as the agents key it: symlinks resolved (`/tmp` is `/private/tmp`).
 fn real(path: &str) -> String {
-    fs::canonicalize(path)
+    // Verbatim Win32 paths require backslashes even when a config writer
+    // appended a forward-slash hook suffix. Normalize before opening the path.
+    #[cfg(windows)]
+    let native = path.replace('/', "\\");
+    #[cfg(windows)]
+    let canonical = dunce::canonicalize(&native);
+    #[cfg(not(windows))]
+    let canonical = fs::canonicalize(path);
+    let path = canonical
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| path.to_string())
+        .unwrap_or_else(|| path.to_string());
+    #[cfg(windows)]
+    let path = path.replace('/', "\\");
+    path
 }
 
 /// The worktree on the repo's `main` or `master` branch.
@@ -515,6 +603,101 @@ mod tests {
             main: main.map(str::to_string),
             shared: None,
         }
+    }
+
+    #[test]
+    fn trust_entries_escape_toml_keys_and_values() {
+        let path = r#"C:\Users\a user\repo"#;
+        let text = entries(path, &[("stop:0:0".into(), "sha256:abc".into())]);
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            doc["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            doc["hooks"]["state"][&format!("{path}/.codex/hooks.json:stop:0:0")]["trusted_hash"]
+                .as_str(),
+            Some("sha256:abc")
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn trust_matches_native_plain_forward_slash_and_verbatim_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dunce::canonicalize(dir.path()).unwrap();
+        let verbatim = fs::canonicalize(dir.path()).unwrap();
+        let plain = plain.to_str().unwrap();
+        let verbatim = verbatim.to_str().unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        fs::write(dir.path().join(".codex/hooks.json"), "{}").unwrap();
+        let hooks = vec![("stop:0:0".into(), "sha256:abc".into())];
+        for spelling in [
+            plain.to_owned(),
+            plain.replace('\\', "/"),
+            verbatim.to_owned(),
+        ] {
+            let text = entries(&spelling, &hooks);
+            assert!(trusted(&text, plain), "{spelling}");
+            assert!(has_project(&text, verbatim), "{spelling}");
+            assert_eq!(hook_approvals(&text, plain), hooks, "{spelling}");
+        }
+        let text = entries(plain, &[]).replace("\"trusted\"", "\"untrusted\"");
+        assert!(has_project(&text, verbatim));
+        assert!(!trusted(&text, verbatim));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn claude_windows_keys_match_native_claude_not_native_rust_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("rally-ng-maps.win-native");
+        fs::create_dir(&checkout).unwrap();
+        let plain = dunce::canonicalize(&checkout).unwrap();
+        let plain = plain.to_str().unwrap();
+        let verbatim = fs::canonicalize(&checkout).unwrap();
+        let expected = plain.replace('\\', "/");
+        let mut lower_drive = plain.to_string();
+        lower_drive.replace_range(..1, &plain[..1].to_ascii_lowercase());
+        for spelling in [
+            plain.to_string(),
+            expected.clone(),
+            verbatim.to_str().unwrap().to_string(),
+            format!("{plain}\\"),
+            format!("{expected}/"),
+            lower_drive,
+        ] {
+            let mut config = json!({"projects": {}});
+            assert!(set_trust(&mut config, &spelling));
+            // Assert what Claude reads, independently of vega's lookup helper.
+            assert_eq!(config["projects"].as_object().unwrap().len(), 1);
+            assert_eq!(
+                config["projects"][&expected]["hasTrustDialogAccepted"],
+                true
+            );
+            assert!(claude_trusts(&config, &spelling));
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn claude_windows_repairs_old_backslash_trust_without_losing_project_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dunce::canonicalize(dir.path()).unwrap();
+        let plain = plain.to_str().unwrap();
+        let key = plain.replace('\\', "/");
+        let file = dir.path().join(".claude.json");
+        let mut config = json!({"other": 7, "projects": {
+            plain: {"hasTrustDialogAccepted": true, "lastCost": 2},
+            &key: {"hasTrustDialogAccepted": false, "mcpServers": {"keep": {}}}
+        }});
+        assert!(!claude_trusts(&config, plain));
+        assert!(!claude_walk(&config, plain, plain));
+        fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();
+        trust_claude(&file, plain).unwrap();
+        config["projects"][&key]["hasTrustDialogAccepted"] = json!(true);
+        assert_eq!(read_claude(&file), config);
+        assert!(claude_walk(&read_claude(&file), plain, plain));
     }
 
     #[test]
@@ -644,7 +827,7 @@ mod tests {
         assert_eq!(r.shared.as_deref(), Some(o.as_str()));
         assert_eq!(r.codex_key(), c);
         assert_eq!(r.hooks_from(&c), Some(o.as_str()));
-        let config = format!("[projects.\"{o}\"]\ntrust_level = \"trusted\"\n");
+        let config = format!("[projects.{}]\ntrust_level = \"trusted\"\n", json!(o));
         let s = source(Kind::Codex, &r, &Value::Null, &config).map(|(k, p)| (k.name(), p));
         assert_eq!(s, Some(("codex", o.as_str())));
         fs::remove_dir_all(&dir).unwrap();
@@ -662,15 +845,22 @@ mod tests {
 
     #[test]
     fn set_trust_touches_only_the_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let a = claude_key(a.to_str().unwrap());
+        let b = claude_key(b.to_str().unwrap());
         let mut c =
-            json!({"x": 1, "projects": {"/a": {"lastCost": 2, "hasTrustDialogAccepted": false}}});
-        assert!(set_trust(&mut c, "/a"));
-        assert!(set_trust(&mut c, "/b"));
+            json!({"x": 1, "projects": {&a: {"lastCost": 2, "hasTrustDialogAccepted": false}}});
+        assert!(set_trust(&mut c, &a));
+        assert!(set_trust(&mut c, &b));
         assert_eq!(
             c,
             json!({"x": 1, "projects": {
-                "/a": {"lastCost": 2, "hasTrustDialogAccepted": true},
-                "/b": {"hasTrustDialogAccepted": true},
+                &a: {"lastCost": 2, "hasTrustDialogAccepted": true},
+                &b: {"hasTrustDialogAccepted": true},
             }})
         );
         assert!(set_trust(&mut json!({}), "/a"));

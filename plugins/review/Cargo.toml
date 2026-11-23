@@ -15,6 +15,8 @@ vega-build = { path = "../../crates/vega-build" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.28"
+url = "2"
+vega-browser = { path = "../browser" }
 vega-herdr = { path = "../../crates/vega-herdr" }
 
 [dev-dependencies]

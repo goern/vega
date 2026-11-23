@@ -59,7 +59,7 @@ if cmd=='run':
  (root/'counter').write_text(i[1:])
  if p.get('on'): i=p['on']+'/'+i
  labels=p['labels']
- assert p['argv'][0]==labels['vega.kind'] or p['argv'][0].endswith('hc-toolbox-shell')
+ assert p['argv'][0]==os.environ.get('TEST_WINDOWS_EXE',labels['vega.kind']) or p['argv'][0].endswith('hc-toolbox-shell')
  t=terminal({'address':i,'argv':p['argv'],'name':n,'state':'live','pid':int(os.environ['TEST_PARENT_PID']),'status':{'app':labels['vega.kind'],'state':'idle'},'cwd':p['cwd'],'labels':labels,'turn':0})
  ts[i]=t;save()
  if p.get('on') and (root/'remote-home').exists():
@@ -67,6 +67,14 @@ if cmd=='run':
   (root/'remote-home/terminals.json').write_text(json.dumps({local['address']:local}))
  if os.environ.get('TEST_UNDELIVERED'): t['first_message']={'sent':False,'reason':'blocked'}
  emit(t)
+elif cmd=='exec' and a[a.index('--')+1]=='herdr-app':
+ import base64, subprocess
+ host=p['on']
+ if host==os.environ.get('TEST_APP_HOST'):
+  r=subprocess.run([str(root/'bin/herdr-app')]+p['argv'][1:],capture_output=True,env=dict(os.environ,TEST_REMOTE_APP=host))
+  out,errb,rc=r.stdout,r.stderr,r.returncode
+ else: out,errb,rc=b'',b'no Herdr window',1
+ emit({'code':rc,'ms':1,'signal':None,'stderr':base64.b64encode(errb).decode(),'stdout':base64.b64encode(out).decode(),'timed_out':False,'truncated':False})
 elif cmd=='exec':
  if os.environ.get('TEST_PREPARE_FAIL') or (os.environ.get('TEST_RECORD_FAILURE')=='unavailable' and a[a.index('--')+2]=='record-spawn'): err('unavailable')
  assert a[a.index('--')+1]=='vega-mux'
@@ -80,7 +88,11 @@ elif cmd=='exec':
  elif a[a.index('--')+2]=='record-spawn':
   import base64
   out,errb,rc=base64.b64decode(a[-1]),b'',0
- else: out,errb,rc=(json.dumps({'schema':1,'trust':None})+'\n').encode(),b'',0
+ else:
+  prepared={'schema':1,'trust':None}
+  if os.environ.get('TEST_WINDOWS_EXE'):
+   prepared.update(platform='windows',executable=os.environ['TEST_WINDOWS_EXE'],cwd=a[a.index('--cwd')+1])
+  out,errb,rc=(json.dumps(prepared)+'\n').encode(),b'',0
  # machine.exec wraps the program's output: base64 stdout/stderr plus its exit code.
  import base64
  failure=os.environ.get('TEST_RECORD_FAILURE') if a[a.index('--')+2]=='record-spawn' else os.environ.get('TEST_MODE_FAILURE')

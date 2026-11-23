@@ -3,15 +3,17 @@
 //! in-test DevTools responder, and temp homes. Nothing real is started.
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
+use base64::Engine;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use vega_browser::mark;
 
@@ -35,9 +37,11 @@ impl Fix {
 
 impl Drop for Fix {
     fn drop(&mut self) {
-        if let Ok(pids) = fs::read_to_string(self.path("responders")) {
-            for pid in pids.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
-                let _ = Command::new("kill").arg(pid.to_string()).status();
+        for file in ["responders", "vpn-supervisors"] {
+            if let Ok(pids) = fs::read_to_string(self.path(file)) {
+                for pid in pids.lines().filter_map(|l| l.trim().parse::<u32>().ok()) {
+                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                }
             }
         }
     }
@@ -89,10 +93,20 @@ fn fix() -> Fix {
     for dir in [&f.bin, &f.state, &f.home, &f.tmp.join("tmp")] {
         fs::create_dir_all(dir).unwrap();
     }
+    fs::write(f.path("ca.pem"), include_str!("fixtures/vpn-ca.pem")).unwrap();
+    script(
+        &f.bin.join("security"),
+        r#"printf '%s\n' "$*" >> "$VEGA_FIX/security-argv"; cat "$VEGA_FIX/ca.pem""#,
+    );
+    script(
+        &f.bin.join("ssh"),
+        r#"printf '%s\n' "$*" >> "$VEGA_FIX/ca-ssh-argv"; security find-certificate -a -p -c 'Internal Root CA' /Library/Keychains/System.keychain"#,
+    );
     // agent-browser: records argv and env, answers the subcommands vega uses.
     script(
         &f.bin.join("agent-browser"),
         r#"
+[ "$1" = "--version" ] && { echo "agent-browser 0.43.0"; exit 0; }
 printf '%s\n' "$*" >> "$VEGA_FIX/ab-argv"
 env | grep '^AGENT_BROWSER_' | sort >> "$VEGA_FIX/ab-env"
 [ -e "$VEGA_FIX/ab-hang" ] && : > "$VEGA_FIX/hang"
@@ -113,6 +127,7 @@ case " $* " in
 esac
 "#,
     );
+    fs::write(f.path("ps"), "").unwrap();
     // ps: the table under test, from a file.
     script(&f.bin.join("ps"), r#"cat "$VEGA_FIX/ps" 2>/dev/null"#);
     // herdr: pane list from a file (`{"pane_id":"w1:p2"}` lines).
@@ -210,6 +225,9 @@ fn run(f: &Fix, args: &[&str], env: &[(&str, String)]) -> Output {
         .env("PATH", format!("{}:/usr/bin:/bin", f.bin.display()))
         .env("XDG_STATE_HOME", &f.state)
         .env("HOME", &f.home)
+        .env("XDG_DATA_HOME", f.path("data"))
+        .env("AGENT_BROWSER_SOCKET_DIR", f.path("sock"))
+        .env_remove("AGENT_BROWSER_NAMESPACE")
         .env_remove("XDG_CONFIG_HOME")
         .env("TMPDIR", f.tmp.join("tmp"))
         .env("VEGA_FIX", &f.tmp)
@@ -260,6 +278,234 @@ fn chromium_attaches_to_the_answering_global() {
         )
     );
     assert!(!f.path("chromium-argv").exists(), "must not start Chromium");
+}
+
+fn vpn_config(f: &Fix, extra: Value) -> (u16, u16) {
+    let port = free_port();
+    let socks = free_port();
+    let mut cfg = serde_json::json!({"cdp_port":port, "socks_port":socks, "ca_sha256":test_ca().0});
+    for (k, v) in extra.as_object().unwrap() {
+        cfg[k] = v.clone();
+    }
+    fs::create_dir_all(f.home.join(".config/vega")).unwrap();
+    fs::write(
+        f.home.join(".config/vega/browser-vpn.json"),
+        cfg.to_string(),
+    )
+    .unwrap();
+    (port, socks)
+}
+
+#[test]
+fn vpn_refuses_collisions_bad_config_and_implicit_start() {
+    let f = fix();
+    for cfg in [
+        serde_json::json!({"cdp_port":9223}),
+        serde_json::json!({"socks_port":f.port}),
+        serde_json::json!({"host":"-bad"}),
+        serde_json::json!({"typo":true}),
+        serde_json::json!({"ca_sha256":"gg".repeat(32)}),
+        serde_json::json!({"ca_sha256":123}),
+        serde_json::json!({"profile":f.home.join(".local/share/vega-chromium")}),
+    ] {
+        vpn_config(&f, cfg);
+        let o = run(&f, &["vpn", "start"], &[]);
+        assert!(!o.status.success(), "{}", out(&o));
+    }
+    let (port, _) = vpn_config(&f, serde_json::json!({}));
+    let held = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let o = run(&f, &["vpn", "start"], &[]);
+    assert!(out(&o).contains("occupied"), "{}", out(&o));
+    drop(held);
+    let o = run(
+        &f,
+        &["vpn", "start"],
+        &[(
+            "XDG_STATE_HOME",
+            f.path("state with spaces").display().to_string(),
+        )],
+    );
+    assert!(!o.status.success());
+    assert!(out(&o).contains("whitespace"));
+    let o = run(
+        &f,
+        &[
+            "ab",
+            "--profile",
+            "vpn",
+            "--session",
+            "vpn-test",
+            "get",
+            "title",
+        ],
+        &[],
+    );
+    assert!(!o.status.success());
+    assert!(!f.path("chromium-argv").exists());
+    assert!(!f.path("ab-argv").exists());
+    for args in [
+        vec!["vpn", "start", "--typo"],
+        vec!["ab", "--profile=bad", "--session", "test"],
+    ] {
+        assert_eq!(run(&f, &args, &[]).status.code(), Some(2));
+    }
+}
+
+#[test]
+fn vpn_lifecycle_reuses_launcher_and_isolates_agent_attach_and_stop() {
+    let f = fix();
+    let (port, socks) = vpn_config(&f, serde_json::json!({}));
+    // Real local responder only; no real SSH, autossh, browser or corp request.
+    script(
+        &f.bin.join("autossh"),
+        r#"
+printf '%s\n' "$$" >> "$VEGA_FIX/vpn-supervisors"
+printf '%s\n' "$*" > "$VEGA_FIX/ssh-argv"
+printf '%s 0:01 /fake/autossh %s\n' "$$" "$*" >> "$VEGA_FIX/ps"
+port=$(printf '%s\n' "$*" | tr ' ' '\n' | sed -n 's/^127.0.0.1://p')
+python3 "$VEGA_FIX/responder.py" "$port" "$VEGA_FIX" &
+touch "$VEGA_FIX/tunnel"
+trap 'exit 0' TERM
+while :; do sleep 1; done
+"#,
+    );
+    script(
+        &f.bin.join("ssh"),
+        r#"
+case "$*" in *"-O check"*) test -e "$VEGA_FIX/tunnel";;
+*"-O exit"*) rm -f "$VEGA_FIX/tunnel";; *) security find-certificate -a -p -c 'Internal Root CA' /Library/Keychains/System.keychain;; esac
+"#,
+    );
+    script(
+        &f.bin.join("curl"),
+        r#"printf '%s\n' "$*" >> "$VEGA_FIX/curl-argv"; printf 302"#,
+    );
+    let chromium = fs::read_to_string(f.bin.join("chromium"))
+        .unwrap()
+        .replace("> \"$VEGA_FIX/ps\"", ">> \"$VEGA_FIX/ps\"");
+    fs::write(f.bin.join("chromium"), chromium).unwrap();
+    // Fake kill only removes exact recorded rows; it never signals fixture PID 4242.
+    script(
+        &f.bin.join("kill"),
+        r#"
+printf '%s\n' "$1" >> "$VEGA_FIX/killed"
+case "$1" in 4242) for p in $(cat "$VEGA_FIX/responders"); do /bin/kill "$p"; done;;
+*) /bin/kill "$1"; rm -f "$VEGA_FIX/tunnel";; esac
+awk -v pid="$1" '$1 != pid' "$VEGA_FIX/ps" > "$VEGA_FIX/ps.next"
+mv "$VEGA_FIX/ps.next" "$VEGA_FIX/ps"
+"#,
+    );
+    fs::write(
+        f.path("ps"),
+        format!("{}\n", ours_line(&f).replace("4242", "9999")),
+    )
+    .unwrap();
+    let pinned = vega_browser::chrome::binary(&f.home);
+    fs::create_dir_all(pinned.parent().unwrap()).unwrap();
+    fs::rename(f.bin.join("chromium"), &pinned).unwrap();
+    let started = run(&f, &["vpn", "start"], &[("CDP_CHROMIUM", String::new())]);
+    assert!(
+        started.status.success(),
+        "{}{}",
+        out(&started),
+        err(&started)
+    );
+    let again = run(&f, &["vpn", "start"], &[]);
+    assert!(
+        again.status.success(),
+        "{} ps={} status={}",
+        out(&again),
+        fs::read_to_string(f.path("ps")).unwrap(),
+        out(&run(&f, &["vpn", "status", "--json"], &[]))
+    );
+    let argv = fs::read_to_string(f.path("chromium-argv")).unwrap();
+    assert!(argv.contains(&format!("--remote-debugging-port={port}")));
+    assert!(argv.contains(&format!("--proxy-server=socks5://127.0.0.1:{socks}")));
+    assert!(!argv.contains("--host-resolver-rules"));
+    assert!(argv.contains("--proxy-bypass-list=<-loopback>"));
+    let ssh = fs::read_to_string(f.path("ssh-argv")).unwrap();
+    assert!(ssh.contains(&format!("-D 127.0.0.1:{socks}")));
+    assert!(ssh.contains("BatchMode=yes") && ssh.contains("ExitOnForwardFailure=yes"));
+    assert!(!ssh.contains("-R"));
+    let attached = run(
+        &f,
+        &[
+            "ab",
+            "--profile=vpn",
+            "--session",
+            "test-vpn",
+            "get",
+            "title",
+        ],
+        &[],
+    );
+    assert!(attached.status.success(), "{}", out(&attached));
+    let ab = fs::read_to_string(f.path("ab-argv")).unwrap();
+    assert!(
+        ab.contains("--cdp ws://127.0.0.1:")
+            && !ab.contains(&format!(":{port}/"))
+            && !ab.contains("--profile")
+    );
+    let o = run(&f, &["vpn", "status", "--json"], &[]);
+    let v: Value = serde_json::from_str(&out(&o)).unwrap();
+    assert_eq!(v["corp_http"], "302");
+    assert_eq!(v["browser"], true);
+    // The fake running version can differ from the installed pin.
+    assert_eq!(v["browser_version"], "Chrome/146.0.0.0");
+    assert!(out(&run(&f, &["vpn", "status"], &[])).contains("browser_version: Chrome/146.0.0.0"));
+    assert_eq!(v["ca_trusted"], true);
+    let curl = fs::read_to_string(f.path("curl-argv")).unwrap();
+    assert!(curl.contains("--socks5-hostname") && curl.contains("--insecure"));
+    // Stop follows the saved launch settings, even after a config edit.
+    vpn_config(&f, serde_json::json!({"host":"different-host"}));
+    let stopped = run(&f, &["vpn", "stop"], &[]);
+    assert!(
+        stopped.status.success(),
+        "{}{}",
+        out(&stopped),
+        err(&stopped)
+    );
+    assert!(!fs::read_to_string(f.path("killed"))
+        .unwrap()
+        .contains("9999"));
+    assert!(f.home.join(".local/share/vega-chromium-vpn").is_dir());
+    assert!(run(&f, &["vpn", "stop"], &[]).status.success());
+}
+
+#[test]
+fn vpn_without_a_pinned_browser_reports_the_install_command() {
+    let f = fix();
+    vpn_config(&f, serde_json::json!({}));
+    let status = run(&f, &["vpn", "status", "--json"], &[]);
+    let value: Value = serde_json::from_str(&out(&status)).unwrap();
+    assert_eq!(value["browser"], false);
+    assert!(value["browser_version"].is_null());
+    let start = run(&f, &["vpn", "start"], &[("CDP_CHROMIUM", String::new())]);
+    assert!(!start.status.success());
+    assert!(
+        out(&start).contains("vega browser install"),
+        "{}",
+        out(&start)
+    );
+    assert!(!f.path("chromium-argv").exists());
+    assert!(!f.path("ca-ssh-argv").exists());
+}
+
+#[test]
+fn vpn_start_failure_and_stale_pid_do_not_kill_foreign_processes() {
+    let f = fix();
+    vpn_config(&f, serde_json::json!({}));
+    script(&f.bin.join("autossh"), "exit 1");
+    script(&f.bin.join("ssh"), "exit 1");
+    script(&f.bin.join("kill"), r#"echo "$*" >> "$VEGA_FIX/killed""#);
+    let o = run(&f, &["vpn", "start"], &[]);
+    assert!(!o.status.success());
+    assert!(!f.path("chromium-argv").exists());
+    assert!(!f.state.join("vega/browser/vpn/active.json").exists());
+    fs::write(f.state.join("vega/browser/vpn/autossh.pid"), "8888").unwrap();
+    fs::write(f.path("ps"), "8888 0:01 /some/other/program\n").unwrap();
+    assert!(run(&f, &["vpn", "stop"], &[]).status.success());
+    assert!(!f.path("killed").exists());
 }
 
 #[test]
@@ -326,68 +572,59 @@ fn chromium_fails_loudly_when_it_does_not_come_up() {
 }
 
 #[test]
-fn ab_attaches_passes_through_and_records_the_owner() {
+fn shared_session_cannot_fall_back_to_the_foreign_first_page() {
+    use serde_json::json;
+    use tungstenite::Message;
     let f = fix();
-    serve(&f, f.port);
-    fs::write(f.path("ps"), ours_line(&f)).unwrap();
-    herdr_panes(&f, r#"{"pane_id":"w1:p2"}"#);
-    let o = run(
-        &f,
-        &["ab", "--session", "me", "get", "url"],
-        &[
-            ("HERDR_PANE_ID", "w1:p2".into()),
-            ("AGENT_BROWSER_AUTO_CONNECT", "1".into()),
-        ],
-    );
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
-    // The fake answers `get url` with a URL.
-    assert_eq!(out(&o).trim(), "https://example.com/x");
-    // A call without --headed (attaching to the global Chromium) is unchanged.
+    let named = |args: &[&str]| {
+        let mut argv = vec!["ab", "--profile", "global", "--session", "me"];
+        argv.extend_from_slice(args);
+        run(&f, &argv, &[])
+    };
+    let ok = |args: &[&str]| {
+        let o = named(args);
+        assert!(o.status.success(), "{}", out(&o));
+        out(&o)
+    };
+    assert!(!ok(&["tab", "list"]).contains("foreign"));
+    ok(&["tab", "new"]);
+    assert!(ok(&["tab", "list"]).contains("[t2]"));
+    for args in [vec!["tab", "foreign"], vec!["tab", "close", "t3"]] {
+        assert!(!named(&args).status.success());
+    }
+    ok(&["tab", "close"]);
+    ok(&["tab", "close"]);
+    let endpoint = ok(&["get", "cdp-url"]);
+    let (mut ws, _) = tungstenite::connect(endpoint.trim()).unwrap();
+    let mut rpc = |method: &str, params: Value, session: Option<&str>| {
+        let mut req = json!({"id":10,"method":method,"params":params});
+        if let Some(session) = session {
+            req["sessionId"] = json!(session);
+        }
+        ws.send(Message::text(req.to_string())).unwrap();
+        serde_json::from_str::<Value>(ws.read().unwrap().to_text().unwrap()).unwrap()
+    };
+    let infos = rpc("Target.getTargets", json!({}), None);
+    assert_eq!(infos["result"]["targetInfos"].as_array().unwrap().len(), 1);
+    assert_eq!(infos["result"]["targetInfos"][0]["targetId"], "owned3");
+    for method in [
+        "Target.activateTarget",
+        "Target.closeTarget",
+        "Target.attachToTarget",
+    ] {
+        assert!(
+            rpc(method, json!({"targetId":"foreign","flatten":true}), None)["error"].is_object()
+        );
+    }
+    assert!(rpc("Runtime.evaluate", json!({}), Some("foreign"))["error"].is_object());
     assert_eq!(
-        lines_of(&f, "ab-argv"),
-        [format!("--cdp {} --session me get url", f.port)]
+        rpc("Runtime.evaluate", json!({}), Some("owned3"))["result"]["target"],
+        "owned3"
     );
-    // Browser-picking env never reaches agent-browser.
-    assert!(!fs::read_to_string(f.path("ab-env"))
-        .unwrap()
-        .contains("AUTO_CONNECT"));
-    let me = &records(&f)["me"];
-    assert_eq!(me["pane"], "w1:p2");
-    assert_eq!(me["host"], hostname());
-    assert_eq!(me["project"], "proj");
-    assert!(me["first_seen"].as_i64().unwrap() > 0);
-    assert_eq!(me["first_seen"], me["last_seen"]);
-
-    // An explicitly headed ab call carries the window mark; the opt-out wins.
-    let o = run(
-        &f,
-        &["ab", "--session", "me", "--headed", "open", "https://x"],
-        &[],
-    );
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
-    let mark = f.state.join("vega/browser/marks/me.js");
-    assert!(mark.is_file(), "the mark script is written");
-    assert!(fs::read_to_string(&mark)
-        .unwrap()
-        .contains("DOMContentLoaded"));
-    assert_eq!(
-        lines_of(&f, "ab-argv").last().unwrap(),
-        &format!(
-            "--cdp {} --init-script {} --session me --headed open https://x",
-            f.port,
-            mark.display()
-        )
-    );
-    let o = run(
-        &f,
-        &["ab", "--session", "me", "--headed", "open", "https://y"],
-        &[("VEGA_BROWSER_MARK", "0".into())],
-    );
-    assert!(o.status.success(), "{}{}", out(&o), err(&o));
-    assert_eq!(
-        lines_of(&f, "ab-argv").last().unwrap(),
-        &format!("--cdp {} --session me --headed open https://y", f.port)
-    );
+    drop(ws);
+    assert!(ok(&["get", "url"]).contains("https://example.com/x"));
+    assert_eq!(records(&f)["me"]["project"], "proj");
+    ok(&["close"]);
 }
 
 #[test]
@@ -427,7 +664,7 @@ fn ab_refuses_unnamed_calls_and_browser_pickers() {
 }
 
 #[test]
-fn ab_never_runs_without_the_global_and_reports_a_lost_one() {
+fn ab_never_runs_without_a_verified_browser_endpoint() {
     // Down: refuses before agent-browser runs.
     let f = fix();
     fs::write(f.path("ps"), "").unwrap();
@@ -440,15 +677,13 @@ fn ab_never_runs_without_the_global_and_reports_a_lost_one() {
     assert!(out(&o).contains("no fallback browser"), "{}", out(&o));
     assert!(lines_of(&f, "ab-argv").is_empty());
 
-    // Lost mid-call: agent-browser fails and CDP goes dark.
+    // An HTTP 200 without a browser generation cannot authorize a daemon.
     let f2 = fix();
     serve(&f2, f2.port);
     fs::write(f2.path("ps"), ours_line(&f2)).unwrap();
-    fs::write(f2.path("ab-fail"), "boom").unwrap();
-    fs::write(f2.path("ab-hang"), "").unwrap();
     let o = run(&f2, &["ab", "--session", "me", "get", "url"], &[]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(err(&o).contains("lost the global Chromium"), "{}", err(&o));
+    assert!(lines_of(&f2, "ab-argv").is_empty());
 }
 
 #[test]
@@ -731,8 +966,46 @@ fn ls_survives_a_missing_agent_browser() {
     assert_eq!(s[0]["state"], "live", "no session list: nothing is closed");
 }
 
+fn daemon_socket(f: &Fix, session: &str) -> UnixListener {
+    fs::create_dir_all(f.path("sock")).unwrap();
+    UnixListener::bind(f.path(&format!("sock/{session}.sock"))).unwrap()
+}
+
+fn expect_disconnect(socket: UnixListener) {
+    socket.set_nonblocking(true).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut stream = loop {
+        match socket.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("expected disconnect: {e}"),
+        }
+    };
+    stream.set_nonblocking(false).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut command = String::new();
+    BufReader::new(&stream).read_line(&mut command).unwrap();
+    let request: Value = serde_json::from_str(&command).unwrap();
+    assert_eq!(request["action"], "close");
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({
+            "id": request["id"], "success": true, "data": {"closed": true}
+        })
+    )
+    .unwrap();
+}
+
 #[test]
-fn gc_closes_dead_owners_and_prunes_dead_records_only() {
+fn gc_closes_only_daemons_of_dead_local_owners() {
     let f = fix();
     let host = hostname();
     let now = std::time::SystemTime::now()
@@ -741,7 +1014,7 @@ fn gc_closes_dead_owners_and_prunes_dead_records_only() {
         .as_secs() as i64;
     fs::write(
         f.path("sessions"),
-        "s-dead\ns-live\ns-hc-dead\ns-far\ns-none\n",
+        "s-dead\ns-live\ns-hc-dead\ns-far\ns-none\ns-unrecorded\n",
     )
     .unwrap();
     herdr_panes(&f, r#"{"pane_id":"w1:p2"}"#);
@@ -752,7 +1025,29 @@ fn gc_closes_dead_owners_and_prunes_dead_records_only() {
     record(&f, "s-none", None, &host, now - 60, now - 60);
     record(&f, "s-ghost", Some("w1:p2"), &host, now - 60, now - 60);
 
+    let workers: Vec<_> = ["s-dead", "s-hc-dead"]
+        .into_iter()
+        .map(|name| {
+            let socket = daemon_socket(&f, name);
+            thread::spawn(move || expect_disconnect(socket))
+        })
+        .collect();
+    // Ownerless sessions remain untouched even when their sockets exist.
+    let untouched: Vec<_> = ["s-unrecorded", "s-live", "s-far", "s-none"]
+        .into_iter()
+        .map(|name| daemon_socket(&f, name))
+        .collect();
     let o = run(&f, &["gc"], &[]);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    for socket in untouched {
+        socket.set_nonblocking(true).unwrap();
+        assert_eq!(
+            socket.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
     assert!(o.status.success(), "{}", out(&o));
     let text = out(&o);
     assert!(
@@ -763,28 +1058,13 @@ fn gc_closes_dead_owners_and_prunes_dead_records_only() {
         text.contains("closed s-hc-dead (owner pane t9 is gone)"),
         "{text}"
     );
-    assert!(
-        text.contains("pruned s-ghost (no agent-browser session)"),
-        "{text}"
-    );
-    assert!(
-        text.contains("gc: 2 closed, kept 3 (1 live owner pane, 1 on another host, 1 unattributed, 0 liveness unknown)"),
-        "{text}"
-    );
-    let closed = lines_of(&f, "ab-argv");
-    assert!(
-        closed.contains(&"--session s-dead close".to_string()),
-        "{closed:?}"
-    );
-    assert!(
-        closed.contains(&"--session s-hc-dead close".to_string()),
-        "{closed:?}"
-    );
+    assert!(text.contains("gc: 2 closed, 4 kept"), "{text}");
+    assert!(lines_of(&f, "ab-argv").is_empty());
     let left = records(&f);
-    for kept in ["s-live", "s-far", "s-none"] {
+    for kept in ["s-live", "s-far", "s-none", "s-ghost"] {
         assert!(left.get(kept).is_some(), "{left}");
     }
-    for gone in ["s-dead", "s-hc-dead", "s-ghost"] {
+    for gone in ["s-dead", "s-hc-dead"] {
         assert!(left.get(gone).is_none(), "{left}");
     }
 }
@@ -797,19 +1077,117 @@ fn gc_keeps_sessions_when_liveness_is_unknown() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    fs::write(f.path("sessions"), "s-herdr-down\n").unwrap();
+    let _unknown = daemon_socket(&f, "s-herdr-down");
     fs::remove_file(f.bin.join("herdr")).unwrap(); // no herdr: liveness unknown
     record(&f, "s-herdr-down", Some("w1:p2"), &host, now - 60, now - 60);
     let o = run(&f, &["gc"], &[]);
     assert!(o.status.success(), "{}", out(&o));
     assert!(
-        out(&o).contains("kept s-herdr-down: cannot tell whether pane w1:p2 is alive"),
+        out(&o).contains("kept s-herdr-down: unknown"),
         "{}",
         out(&o)
     );
-    // Only the session listing ran; nothing was closed.
-    assert_eq!(lines_of(&f, "ab-argv"), ["session list"]);
+    assert!(lines_of(&f, "ab-argv").is_empty());
     assert!(records(&f).get("s-herdr-down").is_some());
+}
+
+#[test]
+fn gc_only_releases_dev_bindings_with_a_matching_dead_local_owner() {
+    let f = fix();
+    let dir = f.path("data/vega/browser/dev-cft");
+    fs::create_dir_all(&dir).unwrap();
+    let registry = dir.join("vega-dev.json");
+    let session = serde_json::json!({
+        "project": "fixture",
+        "generation": "/devtools/browser/expired",
+        "pane": "w1:p9",
+        "active": 1,
+        "next": 2,
+        "tabs": {"1": {"target": "fixture", "port": 0}}
+    });
+    fs::write(
+        &registry,
+        serde_json::json!({
+            "browser": null, "projects": {},
+            "sessions": {"dev-dead": session, "dev-transferred": session}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    herdr_panes(&f, r#"{"pane_id":"w1:p2"}"#);
+    let host = hostname();
+    record(&f, "dev-dead", Some("w1:p9"), &host, 1, 2);
+    record(&f, "dev-transferred", Some("w1:p2"), &host, 1, 2);
+    let output = run(&f, &["gc"], &[]);
+    assert!(output.status.success(), "{output:?}");
+    let current: Value = serde_json::from_slice(&fs::read(registry).unwrap()).unwrap();
+    assert!(current["sessions"]["dev-dead"].is_null());
+    assert!(current["sessions"]["dev-transferred"].is_object());
+}
+
+#[test]
+fn legacy_disconnect_requires_current_ownerless_socket_identity() {
+    let f = fix();
+    fs::write(f.path("sessions"), "ownerless\nprotected\n").unwrap();
+    let old = daemon_socket(&f, "ownerless");
+    let protected = daemon_socket(&f, "protected");
+    record(&f, "protected", Some("w1:p2"), "remote", 1, 2);
+    let args = ["gc", "--dry-run"];
+    let dry = run(&f, &args, &[]);
+    assert!(dry.status.success(), "{dry:?}");
+    let original = out(&dry);
+    let identity = |report: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix("  ownerless,ownerless,"))
+            .filter(|id| id.len() == 64)
+            .unwrap()
+            .to_owned()
+    };
+    let reviewed = identity(&original);
+    assert!(original.contains("protected,remote,"));
+    assert!(lines_of(&f, "ab-argv").is_empty());
+
+    fs::remove_file(f.path("sock/ownerless.sock")).unwrap();
+    let replacement = daemon_socket(&f, "ownerless");
+    let rejected = run(
+        &f,
+        &["disconnect", "ownerless", "--identity", &reviewed],
+        &[],
+    );
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(out(&rejected).contains("no longer active with that identity"));
+    let current = identity(&out(&run(&f, &args, &[])));
+    assert_ne!(current, reviewed);
+
+    record(&f, "ownerless", Some("w1:p2"), &hostname(), 1, 2);
+    let rejected = run(
+        &f,
+        &["disconnect", "ownerless", "--identity", &current],
+        &[],
+    );
+    assert!(!rejected.status.success(), "{rejected:?}");
+    assert!(out(&rejected).contains("no longer a legacy ownerless entry"));
+    // The old socket and newly owned socket were never connected to.
+    for socket in [&old, &replacement, &protected] {
+        socket.set_nonblocking(true).unwrap();
+        assert_eq!(
+            socket.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    record(&f, "ownerless", None, &hostname(), 1, 2);
+    let worker = thread::spawn(move || expect_disconnect(replacement));
+    let closed = run(
+        &f,
+        &["disconnect", "ownerless", "--identity", &current],
+        &[],
+    );
+    worker.join().unwrap();
+    assert!(closed.status.success(), "{closed:?}");
+    assert!(records(&f).get("ownerless").is_none());
+    assert!(records(&f).get("protected").is_some());
 }
 
 #[test]
@@ -829,4 +1207,121 @@ fn close_closes_one_session_on_request() {
     let o = run(&f, &["close", "bad name"], &[]);
     assert_eq!(o.status.code(), Some(1));
     assert!(out(&o).contains("bad session name"), "{}", out(&o));
+}
+
+fn test_ca() -> (String, Vec<u8>) {
+    let pem = include_str!("fixtures/vpn-ca.pem");
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap();
+    (format!("{:x}", Sha256::digest(&der)), der)
+}
+
+#[test]
+fn vpn_trust_pins_ca_and_preserves_existing_certificates() {
+    let f = fix();
+    vpn_config(&f, serde_json::json!({}));
+    let db_path = f
+        .home
+        .join(".local/share/vega-chromium-vpn/Default/ServerCertificate");
+    let initial = run(&f, &["vpn", "status", "--json"], &[]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out(&initial)).unwrap()["ca_trusted"],
+        false
+    );
+    assert!(!db_path.exists());
+    let imported = run(&f, &["vpn", "trust", "--json"], &[]);
+    assert!(
+        imported.status.success(),
+        "{}{}",
+        out(&imported),
+        err(&imported)
+    );
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (pin, der) = test_ca();
+    let stored: (Vec<u8>, Vec<u8>) = db
+        .query_row(
+            "SELECT der_cert,trust_settings FROM certificates WHERE sha256hash_hex=?",
+            [&pin],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (der, vec![10, 2, 8, 3]));
+    db.execute(
+        "INSERT INTO certificates VALUES('unrelated',x'12',x'34')",
+        [],
+    )
+    .unwrap();
+    let before = fs::read(&db_path).unwrap();
+    fs::remove_file(f.path("ca.pem")).unwrap();
+    assert!(run(&f, &["vpn", "trust"], &[]).status.success());
+    assert_eq!(before, fs::read(&db_path).unwrap());
+    assert!(!f.home.join(".local/share/vega-chromium").exists());
+    let ssh = fs::read_to_string(f.path("ca-ssh-argv")).unwrap();
+    assert!(ssh.contains("BatchMode=yes") && ssh.contains("ConnectTimeout=10"));
+    assert_eq!(ssh.lines().count(), 1);
+    assert!(ssh.contains("puck security find-certificate -a -p -c 'Internal Root CA' /Library/Keychains/System.keychain"));
+    assert!(fs::read_to_string(f.path("security-argv"))
+        .unwrap()
+        .contains("find-certificate -a -p -c Internal Root CA /Library/Keychains/System.keychain"));
+    db.execute(
+        "UPDATE certificates SET trust_settings=x'0a020802' WHERE sha256hash_hex=?",
+        [&pin],
+    )
+    .unwrap();
+    let before = fs::read(&db_path).unwrap();
+    let o = run(&f, &["vpn", "trust"], &[]);
+    assert!(
+        !o.status.success() && out(&o).contains("no overwrite"),
+        "{}",
+        out(&o)
+    );
+    assert_eq!(before, fs::read(&db_path).unwrap());
+}
+
+#[test]
+fn vpn_trust_refuses_mismatch_running_profile_symlink_and_unknown_schema() {
+    let f = fix();
+    vpn_config(&f, serde_json::json!({"ca_sha256":"00".repeat(32)}));
+    let profile = f.home.join(".local/share/vega-chromium-vpn");
+    let o = run(&f, &["vpn", "start"], &[]);
+    assert!(
+        !o.status.success() && out(&o).contains("fingerprint mismatch"),
+        "{}",
+        out(&o)
+    );
+    assert!(!profile.exists());
+    assert!(!f.path("chromium-argv").exists());
+    vpn_config(&f, serde_json::json!({}));
+    fs::write(
+        f.path("ps"),
+        format!("4242 1:00 Chromium --user-data-dir={}\n", profile.display()),
+    )
+    .unwrap();
+    let o = run(&f, &["vpn", "trust"], &[]);
+    assert!(
+        !o.status.success() && out(&o).contains("stop the VPN"),
+        "{}",
+        out(&o)
+    );
+    fs::write(f.path("ps"), "").unwrap();
+    fs::create_dir_all(&profile).unwrap();
+    std::os::unix::fs::symlink(&f.tmp, profile.join("Default")).unwrap();
+    assert!(out(&run(&f, &["vpn", "trust"], &[])).contains("symlinks"));
+    fs::remove_file(profile.join("Default")).unwrap();
+    assert!(run(&f, &["vpn", "trust"], &[]).status.success());
+    let path = profile.join("Default/ServerCertificate");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE meta SET value='2' WHERE key='version'", [])
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(out(&run(&f, &["vpn", "trust"], &[])).contains("unsupported"));
+    assert_eq!(before, fs::read(&path).unwrap());
+    db.execute("UPDATE meta SET value='1'", []).unwrap();
+    db.execute("ALTER TABLE certificates ADD COLUMN future TEXT", [])
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(out(&run(&f, &["vpn", "trust"], &[])).contains("unsupported"));
+    assert_eq!(before, fs::read(&path).unwrap());
 }

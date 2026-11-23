@@ -5,13 +5,13 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
-## 230 · 2026-11-17
+## 275 · 2026-11-23
 
 - feature: `vega gate start --retry` ignores earlier abandoned reviews of the branch's segments and starts a fresh
   review; use it after fixing the reviewer's login or API key, when the gate failed open with "review abandoned
   twice". Old review beads are never edited.
 
-## 229 · 2026-11-17
+## 274 · 2026-11-23
 
 - feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
   the gate's `timeout`, closes its beads `abandoned` with the reason and mails the author once, without
@@ -19,7 +19,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   (Dolt server down) no longer drops the review's state with its beads still `running`: the state stays
   until every bead is closed and the sweep retries.
 
-## 228 · 2026-11-17
+## 273 · 2026-11-23
 
 - feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces
   them on a push's own commits: a bare `Assisted-by: claude` there refuses the push until it is reworded
@@ -31,13 +31,319 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   without a reviewer ("review running elsewhere" until the timeout): the gate adopts the bead, and a
   leftover local one without reviewer state is abandoned after 5 minutes.
 
-## 227 · 2026-11-17
+## 272 · 2026-11-23
 
 - feature: local `vega mux spawn` and `reopen` on hc start the agent through `~/.local/bin/hc-toolbox-shell`
   when that executable exists, so agents and their tool shells run in the toolbox whose glibc the vega
   binaries need (vega-alc). Hosts without the launcher, and remote `--machine` spawns, are unchanged.
   The spawn environment, including `--env` values, is forwarded as `env K=V` and therefore shows in the
   agent's process argv: keep secrets out of `--env`. Gate reviewers still start on the host.
+## 271 · 2026-11-23
+
+- feature: `vega browser install` installs pinned Chrome for Testing 158.0.8127.36.
+  New VPN browser launches use that build by default. `vega browser vpn status`
+  reports the running browser's version.
+
+## 270 · 2026-11-23
+
+- feature: `vega browser install` recognizes mise-managed agent-browser and
+  prints the pinned mise command when an update is needed.
+
+## 269 · 2026-11-22
+
+- feature: Pinned agent tooltips in the Herdr sidebar work and no longer
+  emit warnings during rendering.
+
+## 268 · 2026-11-22
+
+- feature: `vega browser` works when agent-browser comes from a mise shim; it no
+  longer runs the `mise` binary behind the shim and reports its version.
+
+## 267 · 2026-11-22
+
+- feature: Herdr's Vega sidebar, status bar and inbox skip redraws on unchanged
+  polls. Changes to badge freshness, age labels and error messages still appear.
+
+## 266 · 2026-11-22
+
+- feature: Managed dev Chrome for Testing enables Developer mode and incognito
+  access for Vega Dev Tab Groups in its dedicated profile. Marked sessions
+  can group tabs in existing project contexts and report a named timeout if
+  allocation stalls.
+
+## 265 · 2026-11-22
+
+- feature: The PagerDuty poller skips pane directories outside Git repositories
+  and still reports Git errors and timeouts when inspecting repositories.
+
+## 264 · 2026-11-22
+
+- feature: Dev screenshot requests report a capture timeout if Chrome stops
+  answering, so subsequent commands can reuse their tab and snapshot refs.
+
+## 263 · 2026-11-22
+
+- feature: Dev Chrome for Testing sessions on macOS keep their CDP attachments
+  and snapshot refs when forwarding large screenshot replies.
+
+## 262 · 2026-11-20
+
+- feature: Share a project's headed dev tabs with a remote vega agent-browser
+  shim using `vega browser dev share <project> --to <host> --origin <origin>`.
+  Use `dev share status` to list shares and `dev share --stop <project>` to revoke one.
+
+## 261 · 2026-11-20
+
+- feature: Git, gh, bd, herdr, tea and agent-browser shims skip duplicate
+  vega shim builds on PATH. Recursive wrappers now fail with a stderr
+  diagnostic.
+
+## 260 · 2026-11-20
+
+- feature: Global and VPN Chromium sessions now list and control only tabs
+  they create. Closing the last owned tab gives the session a fresh blank
+  tab. Shared-profile reviews use the same protection.
+
+## 259 · 2026-11-20
+
+- feature: The managed dev Chrome for Testing starts with `--use-mock-keychain`, so
+  it no longer shows the macOS "keychain not found" dialog. If that dialog appears,
+  choose Cancel, never "Reset To Defaults" (it resets the login keychain).
+
+## 258 · 2026-11-20
+
+- feature: Local headed `vega review` sessions use the project's shared
+  Chrome for Testing context. Use the printed session name for later commands.
+- optional: Inspect legacy browser owners with `vega browser gc --dry-run`
+  and disconnect a reviewed entry with `vega browser disconnect <session>
+  --identity <identity>`.
+
+## 257 · 2026-11-20
+
+- feature: Register dev origins with `vega browser dev state register <origin>`.
+  Use `dev state save` before closing the project and `dev state restore`
+  before reopening it to carry host-only cookies and localStorage across
+  Chrome for Testing restarts.
+
+## 256 · 2026-11-20
+
+- feature: Shared Chrome for Testing groups dev tabs by project and session.
+  Enable **Allow in Incognito** for **Vega Dev Tab Groups** on
+  `chrome://extensions` in the regular managed Chrome for Testing window.
+  Set `VEGA_BROWSER_MARK=0` when opening tabs to skip grouping and page marks.
+
+## 255 · 2026-11-20
+
+- feature: `vega browser dev --session <name> open <url>` and ordinary
+  headed agent-browser launches share one Chrome for Testing process.
+  Each Git project has its own browser context and window, and each named
+  session controls its own tabs.
+
+## 254 · 2026-11-20
+
+- feature: vegad retries an initially empty unread count after live mail arrives and logs why a pending pointer waits.
+
+## 253 · 2026-11-20
+
+- feature: `vega review start <url> --profile global|vpn` opens a pinned review
+  tab in the selected Chromium profile. Stopping the review closes its tab
+  while the shared browser stays running.
+
+## 252 · 2026-11-19
+
+- feature: In the vega sidebar, clicking a nested sentinel that has its own pane
+  (kept as a tab) opens that pane instead of the peek preview; paneless children
+  still peek.
+
+## 251 · 2026-11-19
+
+- unit: lanista seats move tiers to the current models: codex flagship
+  `gpt-6.2-astra`, balanced `gpt-6.2-sol` (budget stays `gpt-6-luna`); claude
+  flagship `claude-fable-5-2` (Opus 5.5 stays startable by explicit pin). Run
+  `vega lanista install` to write the seats file.
+
+## 250 · 2026-11-19
+
+- feature: VPN Chromium automatically trusts the pinned corporate root CA in its
+  dedicated profile before launch. `vega browser vpn trust` imports without
+  starting; status reports `ca_trusted`. The public CA is read from puck over
+  SSH and checked against SHA-256 before import; existing trust is a no-op.
+- optional: Set `ca_sha256` (64 hex digits) in `~/.config/vega/browser-vpn.json`
+  for a verified replacement CA. New imports require a stopped VPN profile;
+  incompatible stores or conflicting trust need manual review. No keychain or
+  browser policy changes are made.
+
+## 249 · 2026-11-19
+
+- feature: `vega browser vpn start|stop|status` manages a separate headed Chromium
+  through puck's VPN over SSH SOCKS, with remote DNS and no direct fallback.
+  Agents attach with `ab --profile vpn --session <project>-vpn-<task>`; the global
+  Chromium remains unchanged. Requires autossh and BatchMode SSH access to puck.
+- optional: Configure host/ports/profile in `~/.config/vega/browser-vpn.json`.
+  The new profile replaces the old dotfiles vpn-proxy PAC workflow; retire that
+  script and its ZeroOmega setting separately after rollout (vega-3e71).
+
+## 248 · 2026-11-19
+
+- feature: Completed identity cutovers accept newly enrolled schema-2 registry
+  hosts without rewriting the flag-day bundle. Fresh non-v2 heartbeats and
+  legacy project keys still block startup and publication (vega-nic.28.18).
+
+## 247 · 2026-11-19
+
+- feature: Capacity imports token-burn's stored reset counts, next expiry and last use
+  for the binding account; manual ledger entries still override source inventory.
+  JSON includes reset provenance, and expiry within a week is marked (vega-of26).
+- required: Live overage credit display requires token-burn's dated credit read interface.
+  Older OpenObserve readers (including v0.1.37) can show healthy quotas while omitting
+  credits/resets; undated balances cannot suppress spawn warnings.
+
+## 246 · 2026-11-19
+
+- feature: Failed hc connections preserve hc's diagnostic and recovery hint,
+  including Windows pipe access errors, instead of reporting only `hc_bad_output`.
+
+## 245 · 2026-11-19
+
+- feature: CI watches report `cancelled` when current-head jobs or workflows were
+  cancelled, including a run where only `secrets` passed. This prevents incomplete
+  acceptance from being mailed green; superseded runs on older heads remain ignored
+  (vega-nic.28.13).
+
+## 244 · 2026-11-17
+
+- feature: Windows `relay start` survives hc exec and terminal shutdown using a
+  temporary per-user interactive task. `relay status [--json]` and
+  `relay stop` manage the native worker without killing unrelated processes.
+- feature: The Windows source installer replaces running images by renaming them
+  aside, then restarts a worker belonging to that install directory. Old foreground
+  workers need Ctrl-C once before upgrading (vega-nic.28.17).
+
+## 243 · 2026-11-17
+
+- feature: Native Windows Claude spawns inherit repository trust using Claude's forward-slash
+  project keys. Old backslash entries no longer falsely report trust or prevent their repair
+  (vega-nic.28.16).
+
+## 242 · 2026-11-17
+
+- feature: Headed `vega mux spawn --machine` children get tabs in a target-folder space,
+  reused or created with `focus:false`. Mux can reach an app window on another saved hc host
+  with direct argv, including Windows targets. Headless children stay unplaced; unreachable
+  placement prints a hint. Parent nesting in the sidebar is preserved.
+
+## 241 · 2026-11-17
+
+- optional: Windows installer `-CoreAutostart` registers hidden, non-elevated hc desktop startup
+  at logon; `-CoreAutostartOnly` registers without building or starting a core.
+- feature: Windows `vega post doctor` detects a Services/session-0 core or pipe access
+  denied and give recovery steps. See `docs/design/windows.md` for logon verification and ownership repair.
+
+## 240 · 2026-11-17
+
+- feature: The app starts the native Windows pointer worker (`vega-post.exe relay start`) also on a Windows
+  host whose PATH has Git's `sh` but no Unix vega-post; before, Git's `sh` made it report the host as not
+  provisioned (vega-nic.28.9).
+
+## 239 · 2026-11-17
+
+- feature: Native Windows `vega-post.exe relay start` runs one local hc pointer
+  worker with draft/status guards, inbox-owned acknowledgements, registry presence
+  and reconnect retries. The app uses direct executable argv after a missing-sh
+  error; an absent Windows binary stays quietly not provisioned. Provision and
+  enroll io-win first; see `docs/design/windows.md` for the start path.
+
+## 238 · 2026-11-17
+
+- feature: Unix coordinators can spawn native Codex and Claude agents on Windows
+  hc machines with an absolute Windows `--cwd`. The Windows installer includes
+  `vega-mux.exe` for native executable preparation and launch/parent records;
+  tier/model selection stays on the coordinator. Windows targets reject
+  `--worktree`; create the checkout separately first.
+
+## 237 · 2026-11-17
+
+- feature: Native Windows `vega post` supports status, send/reply, inbox, log,
+  done, own-host key generation and fresh v2 identity enrollment. `vega.exe`
+  dispatches native plugins; `vega skills` loads their guides. Config defaults
+  to `%APPDATA%\vega`; see `docs/design/windows.md` for operator provisioning.
+  Daemon, relay, admin provisioning and legacy cutover stay Unix-only.
+
+## 236 · 2026-11-17
+
+- feature: The app's not-provisioned check for remote vegad starts now reads hc's launch error from stderr, where
+  hc prints it; io-win no longer shows "vegad start failed" (vega-nic.28.11).
+
+## 235 · 2026-11-17
+
+- feature: Connected machines without vega's runtime are reported as not provisioned.
+  The app keeps them out of failure status, and `vega deploy apply --all` skips them;
+  startup and deployment errors on provisioned hosts still surface. Explicit Unix
+  deployment can still bootstrap a fresh installation.
+
+## 234 · 2026-11-17
+
+- feature: `scripts/windows-install.ps1` builds the approved Windows package list
+  natively with pinned MSVC Rust, without mise or administrator access. It uses
+  a separate Cargo home and installs listed executables to the user PATH as
+  Windows executable ports become available; today it builds the two libraries.
+
+## 233 · 2026-11-17
+
+- feature: Windows clients resolve common Git configuration, recognize existing
+  agent trust across native path spellings, and reliably clear a child's waiting
+  hand after a reply or dismissal.
+
+## 232 · 2026-11-17
+
+- feature: The shared plugin and hc client libraries support native Windows
+  executable discovery, user paths, verified process ancestry, process cleanup,
+  file locks and atomic state replacement. Windows CI checks and tests
+  `vega-plugin` and `vega-herdr`; herdr-app sockets and daemon storage stay Unix-only.
+
+## 231 · 2026-11-17
+
+- feature: `mux spawn --bead <id>` derives its tier from the bead label or type.
+  A differing `--tier` requires `--why`; flagship also requires a reason unless
+  the bead labels it `tier:flagship`. Bead notes and `mux show` retain the chosen
+  tier, model and reason; the brief names the bead.
+
+## 230 · 2026-11-17
+
+- feature: Cross-machine hc children without an app space appear in the sidebar's
+  project trees. `vega mux show` uses their live parent/mode and model metadata;
+  new hc spawns also publish tier/model labels for inspection from other hosts.
+
+## 229 · 2026-11-17
+
+- feature: Services scopes registrations to their owning project across hosts and
+  excludes agent-browser/Chrome listeners (shown in Browsers).
+- migration: Re-register existing services from their owning checkout on each host
+  to persist project and cwd. Older entries still use PID/cwd attribution; unknown
+  owners appear in one labelled global group. Refresh the panel after registration.
+
+## 228 · 2026-11-17
+
+- unit: `browser.agent-browser` skips a host that has neither agent-browser nor npm on PATH
+  (it does not use browsers, e.g. io) instead of failing every apply.
+
+## 227 · 2026-11-17
+
+- unit: `browser.agent-browser` converges agent-browser to the repository pin 0.43.0
+  and installs Chrome for Testing only when its cache is missing. `vega browser install`
+  runs it directly; `status`/`doctor` report dependency drift without opening a browser.
+  Deploy's config apply includes the unit (vega-nic.22).
+- migration: Use the normal login shell's npm global (fnm on proteus/ganymede,
+  mise Node on puck, Linux npm on io). The resolved real agent-browser must belong
+  to that prefix; conflicting installs or `VEGA_AGENT_BROWSER_BIN` fail visibly
+  instead of creating a shadowing copy. Resolve the conflict and retry
+  `vega config apply browser.agent-browser`. Existing sessions are not restarted.
+  Owners of dotted session names must close them before upgrading and use hyphens.
+- feature: Verified 0.43 browser contracts: init scripts now persist across calls and
+  cover `tab new` immediately; opt out before first registration or use a fresh
+  session for unmarked work. Session names no longer accept dots; tabs use stable
+  `t1`/`t2` ids. `addinitscript` remains unsupported. See docs/design/browser.md.
+
 ## 226 · 2026-11-17
 
 - feature: Browser sessions are visible in the herdr-app panels and the windows themselves

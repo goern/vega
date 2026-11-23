@@ -1,3 +1,4 @@
+#![cfg(all(unix, not(feature = "target-only")))]
 //! Public CLI validation must happen before reading briefs or creating panes.
 use std::process::Command;
 
@@ -20,12 +21,13 @@ fn missing_tier_exits_two_with_models_before_reading_a_brief() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     for text in [
         "usage",
+        "--bead <id>",
         "--tier flagship",
         "design/root-cause",
-        "gpt-6-astra",
+        "gpt-6.2-astra",
         "--tier balanced",
         "normal implementation",
-        "gpt-6.1-sol",
+        "gpt-6.2-sol",
         "--tier budget",
         "mechanical",
         "gpt-6-luna",
@@ -58,7 +60,7 @@ fn tier_and_model_and_no_parent_reach_brief_reading() {
             .unwrap();
         assert_eq!(out.status.code(), Some(2));
         let stdout = String::from_utf8(out.stdout).unwrap();
-        assert!(!stdout.contains("spawn requires --tier"), "{stdout}");
+        assert!(!stdout.contains("spawn requires --bead"), "{stdout}");
         assert!(stdout.contains("/nonexistent/brief"), "{stdout}");
     }
 }

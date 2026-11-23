@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -50,7 +49,7 @@ pub struct RepoLocation {
     pub checkout: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,
     pub location: RepoLocation,
@@ -122,7 +121,10 @@ pub fn metadata_path(workspace: Option<&serde_json::Value>, cwd: &str) -> PathBu
                 .or_else(|| w["worktree"]["repo_key"].as_str().filter(|s| !s.is_empty()))
         })
         .unwrap_or(cwd);
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+    match (
+        path.strip_prefix("~/"),
+        crate::platform::home().map(PathBuf::into_os_string),
+    ) {
         (Some(rest), Some(home)) => Path::new(&home).join(rest),
         _ => path.into(),
     }
@@ -219,12 +221,13 @@ fn git_command(path: &Path, args: &[&str]) -> Command {
 fn output_within(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
+    crate::platform::isolate(cmd);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(stdout.try_clone()?)
         .stderr(stderr.try_clone()?)
-        .process_group(0)
         .spawn()?;
+    let _tree = crate::platform::ProcessTree::attach(&mut child)?;
     let start = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -232,7 +235,7 @@ fn output_within(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(10)),
             result => {
                 // SAFETY: this child leads a new process group, never our own.
-                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                crate::platform::kill_tree(&mut child);
                 let _ = child.kill();
                 let _ = child.wait();
                 return result.map(|_| None);
@@ -403,13 +406,15 @@ pub fn resolve(path: &Path, host: &str) -> Result<Project, Failure> {
             &["rev-parse", "--show-toplevel"],
         )?))?
     };
-    let config = common_dir.join("config");
     let output = git(
         &common_dir,
         &[
             "config",
             "--file",
-            path_text(&config)?,
+            // Git for Windows does not accept every verbatim Win32 path here.
+            // -C already selects the common directory; relative includes still
+            // resolve beside this file, including for linked worktrees.
+            "config",
             "--includes",
             "--null",
             "--list",
@@ -494,6 +499,12 @@ fn invalid_url() -> Failure {
 /// contain passwords, tokens or userinfo. Local targets must already exist.
 pub fn normalize_remote(remote: &str, host: &str, common_dir: &Path) -> Result<ProjectId, Failure> {
     validate_host(host)?;
+    // Native absolute paths (drive, UNC and verbatim) must precede SCP/URL
+    // parsing. Windows paths naturally contain backslashes and sometimes '?'.
+    #[cfg(windows)]
+    if Path::new(remote).is_absolute() && !remote.chars().any(|c| c.is_control()) {
+        return local_remote(Path::new(remote), host, common_dir);
+    }
     if remote.is_empty()
         || remote.chars().any(|c| c.is_control())
         || remote.contains(['?', '#', '\\'])
@@ -685,6 +696,7 @@ pub fn decode_component(encoded: &str) -> Result<String, Failure> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn identity_probes_kill_descendants_and_ignore_inherited_pipes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -982,7 +994,7 @@ mod tests {
     #[test]
     fn git_layouts_common_config_and_local_catalog() {
         let tmp = TempDir::new().unwrap();
-        let plain = repo(tmp.path(), "plain", false);
+        let plain = repo(tmp.path(), "plain space", false);
         run(
             &plain,
             &[
@@ -997,7 +1009,7 @@ mod tests {
             ],
         );
         remote(&plain, "origin", "git@github.com:Team/Repo.git");
-        let linked = tmp.path().join("linked");
+        let linked = tmp.path().join("linked space");
         run(
             &plain,
             &["worktree", "add", "-qb", "linked", linked.to_str().unwrap()],
@@ -1071,6 +1083,35 @@ mod tests {
     }
 
     #[test]
+    fn common_config_resolves_relative_nested_includes() {
+        let tmp = TempDir::new().unwrap();
+        let path = repo(tmp.path(), "repo with spaces", false);
+        let config_dir = path.join(".git/config fragments");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("remote.cfg"),
+            "[include]\npath = nested.cfg\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("nested.cfg"),
+            "[remote \"origin\"]\nurl = https://github.com/Team/Repo.git\n",
+        )
+        .unwrap();
+        config(&path, "include.path", "config fragments/remote.cfg");
+        for input in [
+            path.clone(),
+            path.canonicalize().unwrap(),
+            path.join(".git"),
+        ] {
+            assert_eq!(
+                resolve(&input, "host").unwrap().id.as_str(),
+                "github.com/team/repo"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_common_config_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let path = repo(tmp.path(), "clone", false);
@@ -1083,6 +1124,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn git_io_failures_are_bounded_and_structured() {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(mode) = std::env::var("VEGA_PROJECT_TEST_MODE") {

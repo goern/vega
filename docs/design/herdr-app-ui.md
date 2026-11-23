@@ -4,6 +4,35 @@ Slice 5b of the [hc migration](hc-migration.md) (vega-0h4c.10): what vega shows 
 Slayer acts on it. Decided with the Slayer on 2026-11-07. Background: the herdr TUI sidebar (machines tree,
 priority-sorted agents list, vega tokens from `report-metadata`) and the former dashboard Inbox (preserved at `herdr-tui-final`).
 
+## Remote sentinel placement (vega-nic.27)
+
+A headed `vega mux spawn --machine <target> --cwd <folder>` starts a pane in
+its own target-machine tab. Mux reuses a space on that machine with the exact
+folder (including a remotely prepared worktree), or creates one. Both
+`space.new` and `tab.new` use `focus:false`. Machine-local IDs from the response
+become `herdr.space` and `herdr.tab` labels on `terminal.run`, with `keep:true`.
+Herdr adopts labelled terminals automatically; no user `terminal.keep` is needed.
+The placeholder shell is removed only after the window reports the child's pane;
+if confirmation fails, it remains with a warning rather than risking the space.
+
+The spawning host need not run the window: mux tries local `herdr-app ls`, then
+saved hc machines in inventory order, observing the command-direction policy.
+Remote probes use bounded `machine.exec` with direct `herdr-app` argv; commands
+run on the selected window host, not automatically on the child host. Thus a
+UAC on ganymede can ask the window on proteus to place a child on io or io-win.
+If the window itself runs on the target, its local spaces and bare IDs are used.
+The window must have the target saved under the same hc machine name; there is
+no hard-coded window host and no shell dependency on Windows. Discovery targets
+the default app home on remote hosts (the local CLI honours `HERDR_APP_HOME`).
+
+Without a reachable window, or after a failed placement command, spawning still
+succeeds without layout labels and prints a placement hint. A lost mutation
+response is not retried on another window, avoiding duplicate spaces. Headless
+remote children deliberately skip placement and discovery. Native hc parent
+lineage is unchanged: the sidebar's existing parent-address tree keeps children
+under the UAC even when they have panes in other spaces or on other machines.
+Tests use fake hc/herdr-app only; no live layout mutations are needed.
+
 ## Profile windows (vega-0h4c.85, vega-0h4c.86)
 
 `config/herdr-app/profiles/<name>.toml` declares `layout`, `mods`, `[settings]`,
@@ -596,7 +625,7 @@ Only the focused project's services appear, across all its machines/spaces;
 the focused live `vega.role=uber` terminal alone enables the unscoped list.
 Project resolution follows sidebar identity rules: full IDs, unambiguous legacy
 names, UAC space labels and live ancestors. An unresolved focus shows only
-unattributed registrations in their explicit host group.
+registrations with no resolvable project in the labelled global group.
 Herdr's live focus renders update the filter without timers or rescanning. Owned
 forwards survive a scope switch and become visible again with their project.
 Attribution follows PID ancestry to a live terminal, then the most specific pane
@@ -645,9 +674,14 @@ listener. Stop removes it; a second forward followed by layout teardown exercise
 cleanup. This sentinel only used fake tests, never started that live flow.
 
 Registered services use host/port identities, retaining titles and owned forwards
-across listener restarts. When ancestry/cwd attribution fails they appear under
-Registered services / Host registrations across project filters, explicitly host
-scoped rather than guessed into a project. A still-live registered process without
+across listener restarts. New registrations persist the registering checkout's
+canonical project and cwd. That owner wins over live ancestry, including on fleet
+scans (`exec` on ganymede runs the same helper and carries ownership fields).
+Legacy entries fall back to PID/cwd attribution; only unresolved project owners
+appear in one Global services (owner unknown) group. Re-register from the owning
+checkout to migrate old entries without requiring an agent pane to stay alive.
+Agent-browser daemons, Chrome/Chromium and their descendants are excluded from
+Services even with Show agent ports enabled; Browsers owns their display. A still-live registered process without
 a listener shows Stopped. Rows independently label running/forwarded/stopped,
 host, and remote port versus local forward; only owned forwards offer Stop.
 
@@ -752,3 +786,13 @@ gated by `RUST_LOG` on stderr, and is not persisted anywhere by default, so
 the ring file is the only durable record. Tests use fake `fs` in the vm
 loader: detection, phase wiring, exception/slow recording, rate limiting and
 the ring cap.
+
+### Unspaced cross-machine children (vega-nic.25)
+
+The sidebar merges live core agents from `terminals()` into the native `agents()`
+rows during cached model derivation. Remote hc spawns intentionally have no
+`herdr.space`: source-host space IDs cannot identify destination-host spaces.
+Core status plus harness/program/report evidence supplies an agent row without
+adopting a pane. Native rows win on address; existing project labels, group
+claims and ancestor project/space resolution decide placement. The same view,
+Active and pin filters apply, and input changes invalidate the render cache.

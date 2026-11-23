@@ -3,27 +3,27 @@
 //! colour, else a stable hash of the session name), and headed calls carry an
 //! init script that colours the browser window's pages — a fixed frame, a
 //! session tag and a `[session]` title prefix, so the window on screen can
-//! be matched to its panel row. Headless sessions never show it; they show
+//! be matched to its panel row. Fresh headless sessions have no mark; they show
 //! their colour in the panels only, and `launch` (bot blockers) never marks.
 //!
-//! What 0.31.1 really does (verified, vega-nic.19): `--init-script` applies
-//! only to the navigations of the call that carries it (so every headed named
-//! call gets the flag), init scripts run before `document.documentElement`
-//! exists (all DOM work defers to DOMContentLoaded), duplicate
-//! registrations in one call are possible (the script guards itself), and
-//! `eval` is never used on a shared browser (it runs on the active tab,
-//! which can be another agent's or the user's).
+//! Verified on 0.43.0 (vega-nic.22): init scripts persist across calls and
+//! cover tab new's first navigation. Repeating a script path is deduplicated.
+//! Scripts run before document.documentElement exists; defer DOM work and
+//! retain the page guard. Only headed calls register the mark, but omitting
+//! the flag later does not remove a registration. Opt out before the first
+//! marked call; use a fresh session for unmarked work. Never eval a shared tab.
 //!
 //! Review (Slayer, 2026-11-17): the mark changes what callers see — title
 //! asserts, `snapshot` text, screenshot pixels, injected DOM on bot-wary
 //! sites — so it rides only explicitly headed calls (`--headed` flag or a
 //! truthy `AGENT_BROWSER_HEADED`), is invisible to the accessibility tree
-//! (`aria-hidden`), and `VEGA_BROWSER_MARK=0` turns it off everywhere.
+//! (`aria-hidden`), and `VEGA_BROWSER_MARK=0` prevents new registrations.
 
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
 use vega_herdr::theme;
 
 /// The fallback palette: ten hues that read on light and dark panels, in
@@ -78,10 +78,11 @@ fn safe_name(session: &str) -> Option<&str> {
 /// only, a dataset guard against duplicate registrations, a title observer
 /// for SPA renames.
 fn script(session: &str, colour: &str) -> String {
+    let session = serde_json::Value::String(session.to_owned());
     // inline-md: allow (generated page JS with format! interpolation, not a guide)
     format!(
         r#"(() => {{
-  const name = "{session}", colour = "{colour}";
+  const name = {session}, colour = "{colour}";
   const mark = () => {{
     const root = document.documentElement;
     if (!root || root.dataset.vegaMark === name) return;
@@ -116,19 +117,29 @@ fn script(session: &str, colour: &str) -> String {
 /// name is unsafe or the file cannot be written.
 pub fn ensure_mark(session: &str, colour: &str) -> Option<PathBuf> {
     let name = safe_name(session)?;
+    write_mark(name, session, colour)
+}
+
+pub(crate) fn dev_mark(session: &str, project: &str, label: &str) -> Option<PathBuf> {
+    let digest = Sha256::digest(format!("{project}\0{session}").as_bytes());
+    let colour = session_colour(session, Some(label));
+    write_mark(
+        &format!("dev-{digest:x}"),
+        &format!("{label} / {session}"),
+        &colour,
+    )
+}
+
+fn write_mark(name: &str, label: &str, colour: &str) -> Option<PathBuf> {
     let dir = marks_dir()?;
     let path = dir.join(format!("{name}.js"));
-    let text = script(name, colour);
+    let text = script(label, colour);
     if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-        let _ = fs::create_dir_all(&dir);
-        let tmp = dir.join(format!(".{name}.js.tmp"));
-        if fs::write(&tmp, &text)
-            .and_then(|_| fs::rename(&tmp, &path))
-            .is_err()
-        {
-            let _ = fs::remove_file(&tmp);
-            return None;
-        }
+        use std::io::Write;
+        fs::create_dir_all(&dir).ok()?;
+        let mut tmp = tempfile::NamedTempFile::new_in(&dir).ok()?;
+        tmp.write_all(text.as_bytes()).ok()?;
+        tmp.persist(&path).ok()?;
     }
     Some(path)
 }
@@ -143,16 +154,20 @@ pub fn mark_for(session: &str, project: Option<&str>) -> Option<PathBuf> {
 /// Whether `name`'s call args ask for a headed browser: an explicit
 /// `--headed` flag, or agent-browser's `AGENT_BROWSER_HEADED` env set to
 /// anything but `0`/`false`/empty.
-fn headed(args: &[String]) -> bool {
-    if args.iter().any(|a| a == "--headed") {
-        return true;
+pub fn headed(args: &[String]) -> bool {
+    if let Some(index) = args.iter().rposition(|a| a == "--headed") {
+        return args.get(index + 1).is_none_or(|value| value != "false");
     }
-    matches!(std::env::var("AGENT_BROWSER_HEADED").ok().as_deref(), Some(v)
-        if !v.is_empty() && v != "0" && v != "false")
+    std::env::var("AGENT_BROWSER_HEADED").is_ok_and(|value| {
+        !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no"
+        )
+    })
 }
 
-/// Whether the mark is on for this call: headed (above) and not opted out
-/// with `VEGA_BROWSER_MARK=0` (off everywhere: shim, ab).
+/// Whether this call registers a mark: headed and not opted out.
+/// An existing upstream registration persists even when this returns false.
 pub fn wanted(args: &[String]) -> bool {
     if std::env::var("VEGA_BROWSER_MARK").ok().as_deref() == Some("0") {
         return false;
@@ -161,8 +176,8 @@ pub fn wanted(args: &[String]) -> bool {
 }
 
 /// `args` with the mark flag in front: agent-browser takes its options
-/// before the command, and a call without the flag does not mark its
-/// navigations. Calls that are not headed (or opted out) pass through
+/// before the command. In 0.43 registrations persist across calls.
+/// Calls that are not headed (or opted out) pass through
 /// unchanged; sessions without a mark file pass through unchanged too.
 pub fn with_mark(args: &[String], session: &str, project: Option<&str>) -> Vec<String> {
     if !wanted(args) {

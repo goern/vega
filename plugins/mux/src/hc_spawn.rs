@@ -33,6 +33,7 @@ pub fn spawn(
     mode: Mode,
     extra: &[String],
     tier: Option<&str>,
+    policy: Option<&tier::Policy>,
     old: Option<&SpawnRecord>,
 ) -> Result<String, Failure> {
     if !valid_agent_name(name) {
@@ -91,6 +92,9 @@ pub fn spawn(
         cwd = resolve_cwd(&cwd, &env::var("HOME").unwrap_or_default())?;
     }
     let selection = tier::select(kind, tier, extra, Some(&cwd))?;
+    if let Some(policy) = policy {
+        policy.record(selection.model.as_deref(), Some(&cwd))?;
+    }
     // Space IDs belong to the local app; they do not identify remote spaces.
     let mut space = if let Some(Terminal::Hc(p)) = &own.as_ref().filter(|_| machine().is_none()) {
         hc_local(&["get", p])?["labels"]["herdr.space"]
@@ -119,6 +123,7 @@ pub fn spawn(
         None
     };
     let mut placeholder = None;
+    let mut remote_placement = None;
     let mut tab_fallback = false;
     if let Place::Worktree { branch, base } = place {
         let (path, how) = if let Some(prepared) = &remote_prepared {
@@ -172,9 +177,22 @@ pub fn spawn(
         }
     }
 
+    if let Some(target) = machine().filter(|_| mode == Mode::Headed) {
+        match remote_space::prepare(target, &cwd, name) {
+            Ok(placement) => remote_placement = Some(placement),
+            Err(f) => println!("placement: child remains unplaced ({}); open herdr-app on a saved hc host connected to {target} and retry placement there", cell(&f.message)),
+        }
+    }
+
     if machine().is_none() && !no_parent {
         vega_herdr::project::resolve_optional(Path::new(&cwd), &vega_herdr::state::post_host())?;
     }
+    let executable = remote_prepared
+        .as_ref()
+        .filter(|v| v["platform"] == "windows")
+        .and_then(|v| v["executable"].as_str())
+        .unwrap_or(kind)
+        .to_string();
     let trust_line = if let Some(prepared) = remote_prepared {
         prepared["trust"].as_str().map(String::from)
     } else {
@@ -191,8 +209,30 @@ pub fn spawn(
     let mut labels = serde_json::json!({
         "vega.kind":kind, "vega.harness":kind, "vega.mode":mode.as_str(), "vega.role":"sentinel"
     });
+    if let Some(tier) = tier {
+        labels["vega.tier"] = tier.into();
+    }
+    if let Some(model) = &selection.model {
+        labels["vega.model"] = model.clone().into();
+    }
+    if let Some(why) = policy
+        .and_then(|p| p.why.as_deref())
+        .or_else(|| old.and_then(|r| r.tier_why.as_deref()))
+    {
+        labels["vega.tier-why"] = why.into();
+    }
+    if let Some(bead) = policy
+        .and_then(|p| p.bead.as_deref())
+        .or_else(|| old.and_then(|r| r.bead.as_deref()))
+    {
+        labels["vega.bead"] = bead.into();
+    }
     if let Some(s) = space {
         labels["herdr.space"] = s.into();
+    }
+    if let Some(placement) = &remote_placement {
+        labels["herdr.space"] = placement.space.clone().into();
+        labels["herdr.tab"] = placement.tab.clone().into();
     }
     let mut launch_env = serde_json::Map::new();
     for k in ["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM"] {
@@ -208,7 +248,7 @@ pub fn spawn(
             launch_env.insert(k.into(), v.into());
         }
     }
-    let mut args = vec![kind.to_string()];
+    let mut args = vec![executable];
     let mut agent_args = spawn_args(kind, &[("SSH_AUTH_SOCK", socket.as_deref())], user, &[]);
     if kind == "codex" {
         // The child ID/socket are created by hc, not the parent's environment.
@@ -248,7 +288,7 @@ pub fn spawn(
             "name":name, "on":machine(), "outlive_parent":true, "die_with_parent":false,
             "no_parent":no_parent || !matches!(own, Some(Terminal::Hc(_))),
             "caller":own.as_ref().and_then(|t| match t { Terminal::Hc(p) => Some(p), _ => None }),
-            "wait":false,
+            "wait":false, "keep":remote_placement.is_some(),
         }),
         std::time::Duration::from_secs(30),
     )?;
@@ -271,6 +311,9 @@ pub fn spawn(
             )
         })?
         .to_string();
+    if let Some(placement) = &remote_placement {
+        placement.cleanup(&pane);
+    }
     // The agent is now in the space, so the shell that space.new made is
     // surplus: remove it so the agent is the space's only terminal. Removing
     // it earlier would close the space. Failure leaves a harmless extra shell.
@@ -304,6 +347,8 @@ pub fn spawn(
         extra: selection.args.clone(),
         tier: tier.map(String::from),
         model: selection.model.clone(),
+        tier_why: policy.and_then(|p| p.why.clone()),
+        bead: policy.and_then(|p| p.bead.clone()),
         ..Default::default()
     });
     record.pane = pane.clone();
@@ -349,7 +394,7 @@ pub fn spawn(
     if undelivered.is_some() {
         return Err(Failure::new("brief_not_delivered", format!("terminal {pane} started, but hc did not deliver its first message"), &format!("inspect `vega mux show {pane}`; after resolving startup, use `vega mux spawn --resume {pane}`")));
     }
-    if tab_fallback {
+    if tab_fallback && machine().is_none() {
         println!("placement: no local herdr-app; started as a tab in the caller's space");
     }
     println!(
@@ -455,7 +500,40 @@ fn prepare_remote(target: &str, kind: &str, cwd: &str, place: &Place) -> Result<
             "deploy the matching vega version to the target before spawning",
         ));
     }
+    if prepared["platform"] == "windows" {
+        if matches!(place, Place::Worktree { .. }) {
+            return Err(Failure::new(
+                "unsupported",
+                "Windows targets do not support --worktree",
+                "create the checkout separately and spawn with --cwd <absolute Windows path>",
+            ));
+        }
+        let executable = prepared["executable"].as_str().unwrap_or("");
+        if !matches!(kind, "codex" | "claude")
+            || !windows_absolute(executable)
+            || !executable.to_ascii_lowercase().ends_with(".exe")
+            || !windows_absolute(cwd)
+            || prepared["cwd"] != cwd
+        {
+            return Err(Failure::new(
+                "remote_prepare_failed",
+                "target returned an invalid Windows preparation result",
+                "deploy matching vega binaries and pass an absolute Windows checkout path",
+            ));
+        }
+    }
     Ok(prepared)
+}
+
+// Validate target paths using Windows syntax, independent of the coordinator OS.
+fn windows_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/'))
+        || path.strip_prefix("\\\\").is_some_and(|p| {
+            let mut parts = p.split('\\');
+            parts.next().is_some_and(|s| !s.is_empty())
+                && parts.next().is_some_and(|s| !s.is_empty())
+        })
 }
 
 /// Check the configured socket before invoking a CLI that emits plain-text
@@ -501,7 +579,10 @@ fn exec_output(target: &str, wrapped: &Value) -> Result<Value, Failure> {
         return Err(fail(format!(
             "{target}: vega-mux prepare exited {}: {}",
             wrapped["code"],
-            String::from_utf8_lossy(&stderr).trim()
+            serde_json::from_slice::<Value>(&stdout)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| String::from_utf8_lossy(&stderr).trim().to_string())
         )));
     }
     serde_json::from_slice(&stdout)
@@ -605,6 +686,7 @@ pub fn reopen(r: &SpawnRecord, extra: &[String]) -> Result<(), Failure> {
         Mode::parse(&r.mode).unwrap_or(Mode::Headed),
         extra,
         r.tier.as_deref(),
+        None,
         Some(r),
     )
     .map(|_| ())
