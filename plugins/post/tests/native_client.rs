@@ -77,8 +77,13 @@ mod native {
         }
     }
     pub fn fake_hc() {
-        let line = std::io::stdin().lock().lines().next().unwrap().unwrap();
-        let req: Value = serde_json::from_str(&line).unwrap();
+        for line in std::io::stdin().lock().lines() {
+            let req: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            fake_hc_request(req);
+        }
+    }
+
+    fn fake_hc_request(req: Value) {
         let pane =
             req["params"]["terminal"]
                 .as_str()
@@ -102,7 +107,7 @@ mod native {
             return;
         }
         let terminal = json!({"address":pane,"state":"live","name":pane,"pid":pid,
-            "argv":[],"labels":{},"created_ms":0,"screen":"exact","cols":80,"rows":24,
+            "argv":[],"labels":state.get("labels").cloned().unwrap_or_else(|| json!({})),"created_ms":0,"screen":"exact","cols":80,"rows":24,
             "cwd":cwd,"foreground":null,"turn":0,
             "status":{"app":"codex","state":state["status"]},"parent":env::var("FAKE_PARENT").ok()});
         let result = match req["method"].as_str().unwrap() {
@@ -110,9 +115,35 @@ mod native {
             "terminal.list" => {
                 let mut remote = terminal.clone();
                 remote["address"] = "other/t9".into();
-                json!({"terminals":[terminal,remote],"machines":[],"hidden_finished":0})
+                let mut rows = vec![terminal.clone(), remote];
+                for (id, role, parent) in [
+                    ("t5", "sentinel", None),
+                    ("t6", "gate-reviewer", None),
+                    ("t7", "", Some("t5")),
+                ] {
+                    if env::var_os("FAKE_LABEL_WRITES").is_some() {
+                        let mut row = terminal.clone();
+                        row["address"] = id.into();
+                        row["labels"]["vega.role"] = role.into();
+                        row["parent"] = json!(parent);
+                        rows.push(row);
+                    }
+                }
+                json!({"terminals":rows,"machines":[],"hidden_finished":0})
             }
             "doc.get" => json!({"version":0,"value":null}),
+            "terminal.label" => {
+                if let Some(path) = env::var_os("FAKE_LABEL_WRITES") {
+                    use std::io::Write;
+                    let mut f = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap();
+                    writeln!(f, "{}", req["params"]).unwrap();
+                }
+                terminal
+            }
             "terminal.read" => json!({"text":state["screen"],"complete":true,"how":"screen"}),
             "terminal.send" => {
                 assert_ne!(state["status"], "blocked");
@@ -378,6 +409,22 @@ mod native {
                 vega_registry::get_one(client, &vega_registry::agent_key(win.host, "t4"))
                     .await
                     .unwrap()
+                    .is_some_and(|agent| {
+                        assert_eq!(agent["schema"], 2);
+                        assert_eq!(agent["project"], "example.invalid/team/native");
+                        true
+                    })
+            })
+        });
+        wait_for(|| {
+            rt.block_on(vega_registry::get_one(
+                client,
+                &vega_registry::beat_key(win.host),
+            ))
+            .unwrap()
+            .is_some_and(|beat| {
+                beat["native"]["inventory"]["last_success"]
+                    .as_i64()
                     .is_some()
             })
         });
@@ -579,11 +626,86 @@ mod native {
             .unwrap()
             .port();
         let url = format!("nats://127.0.0.1:{port}");
+        let sidebar = Host::make(&root, "sidebar-test", &bin, &url);
+        // The broker is still offline. Only this test's foreground worker and fake
+        // core are used, including when running this case alone on a live host.
+        let labels = sidebar.root.join("labels.jsonl");
+        let state = sidebar.root.join("sidebar-state.json");
+        fs::write(
+            &state,
+            json!({"status":"idle","labels":{"vega.role":"uac","vega.review":"keep"}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            sidebar.root.join("roaming/vega/theme.toml"),
+            "[symbols.hosts]\nsidebar-test = '🌔'\n",
+        )
+        .unwrap();
+        let claims = sidebar.root.join("local/vega/uac/v2");
+        fs::create_dir_all(&claims).unwrap();
+        let claimed = "example.invalid/team/claimed";
+        fs::write(
+            claims.join(format!(
+                "{}.json",
+                vega_herdr::project::encode_component(claimed)
+            )),
+            json!({"schema":2,"project":claimed,"pane":"t5","host":sidebar.host}).to_string(),
+        )
+        .unwrap();
+        let mut serve = sidebar.cmd(&["relay", "serve"], "t4");
+        let worker = Broker(
+            serve
+                .env("FAKE_STATE", &state)
+                .env("FAKE_LABEL_WRITES", &labels)
+                .spawn()
+                .unwrap(),
+        );
+        let expected = json!({
+            "t4":{"vega.host":"🌔","vega.project":"native","vega.role":""},
+            "t5":{"vega.host":"🌔","vega.project":"claimed","vega.role":"uac"},
+            "t6":{"vega.host":"🌔","vega.project":"native"},
+            "t7":{"vega.host":"🌔","vega.project":"native","vega.role":"sentinel"}
+        });
+        // Git identity arrives asynchronously. Apply the writes in order and
+        // verify the final labels even if role and project arrive separately.
+        wait_for(|| {
+            let mut actual = json!({});
+            let Ok(writes) = fs::read_to_string(&labels) else {
+                return false;
+            };
+            for line in writes.lines() {
+                let Ok(write) = serde_json::from_str::<Value>(line) else {
+                    return false;
+                };
+                let pane = write["terminal"].as_str().unwrap();
+                for (key, value) in write["labels"].as_object().unwrap() {
+                    actual[pane][key] = value.clone();
+                }
+            }
+            actual == expected
+        });
+        wait_for(|| {
+            fs::read(sidebar.root.join("local/vega/vegad-health.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|h| {
+                    ["inventory", "labels"].iter().all(|phase| {
+                        h["native"][*phase]["last_success"]
+                            .as_i64()
+                            .is_some_and(|at| at > 0)
+                            && h["native"][*phase]["error"].is_null()
+                    })
+                })
+        });
+        drop(worker);
+        if env::args().any(|arg| arg == "--sidebar-only") {
+            return;
+        }
         let win = Host::make(&root, "native-test", &bin, &url);
         let peer = Host::make(&root, "peer-test", &bin, &url);
         let admin = nkeys::KeyPair::new_user();
         let conf = root.join("nats.conf");
-        fs::write(&conf,format!("listen: 127.0.0.1:{port}\njetstream {{ store_dir: {} }}\nauthorization {{ users: [{{ nkey: \"{}\" }}, {}, {}] }}\n",json!(root.join("js").to_string_lossy()),admin.public_key(),permissions(win.host,&win.public()),permissions(peer.host,&peer.public()))).unwrap();
+        fs::write(&conf,format!("listen: 127.0.0.1:{port}\njetstream {{ store_dir: {}, max_file_store: 64G }}\nauthorization {{ users: [{{ nkey: \"{}\" }}, {}, {}] }}\n",json!(root.join("js").to_string_lossy()),admin.public_key(),permissions(win.host,&win.public()),permissions(peer.host,&peer.public()))).unwrap();
         let mut broker = Broker(
             Command::new("nats-server")
                 .arg("-c")

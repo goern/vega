@@ -947,7 +947,9 @@ pub fn spawn_args(
     a
 }
 
-/// hc owns the terminal lifecycle; the task is argv, never shell text.
+/// hc owns the terminal lifecycle; the task is argv, never shell text. With a toolbox
+/// `launcher` (local hosts that have one, vega-alc) the reviewer's `env VEGA_GATE_ROLE=...
+/// <kind>` command runs inside the toolbox: `<launcher> env ...`.
 #[allow(clippy::too_many_arguments)]
 pub fn hc_spawn_args(
     tab: &str,
@@ -957,6 +959,7 @@ pub fn hc_spawn_args(
     task: &str,
     model: &[String],
     space: Option<&str>,
+    launcher: Option<&str>,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "run",
@@ -978,8 +981,9 @@ pub fn hc_spawn_args(
     if let Some(space) = space {
         args.extend(["--label".into(), format!("herdr.space={space}")]);
     }
+    args.push("--".into());
+    args.extend(launcher.map(String::from));
     args.extend([
-        "--".into(),
         "env".into(),
         "VEGA_GATE_ROLE=reviewer".into(),
         mise_ignore_env(clone),
@@ -1119,6 +1123,8 @@ fn spawn_review(
             &task,
             &model_args(cand, model),
             info["labels"]["herdr.space"].as_str(),
+            // hc_on(None, ..) below starts the reviewer on this host.
+            vega_herdr::launch::toolbox_launcher().as_deref(),
         );
         match vega_herdr::hc_on(
             None,
@@ -1349,7 +1355,16 @@ mod tests {
 
     #[test]
     fn hc_spawn_gives_agy_its_task_through_dash_i() {
-        let args = hc_spawn_args("gate-r", "r", "agy", Path::new("/clone"), "task", &[], None);
+        let args = hc_spawn_args(
+            "gate-r",
+            "r",
+            "agy",
+            Path::new("/clone"),
+            "task",
+            &[],
+            None,
+            None,
+        );
         assert!(
             args.ends_with(&["-i", "task"].map(String::from)),
             "{args:?}"
@@ -1371,6 +1386,7 @@ mod tests {
                 "--model".into(),
                 "glm-5.3".into(),
             ],
+            None,
             None,
         );
         assert!(args.ends_with(
@@ -1394,10 +1410,23 @@ mod tests {
             "task",
             &[],
             None,
+            None,
         );
         assert!(args
             .windows(2)
             .any(|a| a == ["-c", "check_for_update_on_startup=false"]));
+    }
+
+    #[test]
+    fn hc_spawn_wraps_the_reviewer_in_the_toolbox_launcher_when_given() {
+        let args = |l| hc_spawn_args("gate-r", "r", "pi", Path::new("/clone"), "t", &[], None, l);
+        let plain = args(None);
+        let at = plain.iter().position(|a| a == "--").unwrap();
+        assert_eq!(plain[at + 1], "env");
+        let wrapped = args(Some("/h/.local/bin/hc-toolbox-shell"));
+        assert_eq!(wrapped[..=at], plain[..=at]);
+        assert_eq!(wrapped[at + 1], "/h/.local/bin/hc-toolbox-shell");
+        assert_eq!(wrapped[at + 2..], plain[at + 1..]);
     }
 
     #[test]
@@ -1430,7 +1459,16 @@ mod tests {
         );
         assert!(s.contains("--env VEGA_GATE_ROLE=reviewer --env MISE_IGNORED_CONFIG_PATHS="));
         assert!(s.contains("/c --no-parent -- -m gpt"), "{s}");
-        let hc = hc_spawn_args("gate-r", "r", "pi", Path::new("/clone"), "task", &[], None);
+        let hc = hc_spawn_args(
+            "gate-r",
+            "r",
+            "pi",
+            Path::new("/clone"),
+            "task",
+            &[],
+            None,
+            None,
+        );
         assert!(hc
             .iter()
             .any(|a| a.starts_with("MISE_IGNORED_CONFIG_PATHS=") && a.ends_with("/clone")));

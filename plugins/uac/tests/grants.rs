@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::process::{Command, Output};
 
 fn run(root: &std::path::Path, args: &[&str]) -> Output {

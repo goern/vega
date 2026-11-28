@@ -19,10 +19,17 @@ vega-plugin = { path = "../../crates/vega-plugin" }
 
 serde = { version = "1", features = ["derive"] }
 toml_edit = "0.25"
-vega-gate = { path = "../gate" }
 
 [dev-dependencies]
 tempfile = "3"
 
 [build-dependencies]
 vega-build = { path = "../../crates/vega-build" }
+
+[target.'cfg(unix)'.dependencies]
+vega-shim = { path = "../../crates/vega-shim" }
+vega-gate = { path = "../gate" }
+
+[[test]]
+name = "native_adoption"
+harness = false

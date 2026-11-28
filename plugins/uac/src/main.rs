@@ -12,8 +12,10 @@
 
 mod adoption;
 mod beads;
+#[cfg(unix)]
 mod grants;
 mod group;
+#[cfg(unix)]
 mod land;
 mod terminal;
 
@@ -27,8 +29,8 @@ use serde_json::Value;
 use vega_herdr::lanes;
 use vega_herdr::state::{self as st, parent_of_on, Attention};
 use vega_herdr::{
-    agent_name, cell, collapse_home, herdr, herdr_on, me_line, print_failure, status_counts,
-    status_rank, str_of, Failure, Me,
+    agent_name, cell, collapse_home, herdr_on, me_line, print_failure, status_counts, status_rank,
+    str_of, Failure, Me,
 };
 
 const ROLE: &str = include_str!("../../../docs/design/uac-role.md");
@@ -94,17 +96,34 @@ fn main() -> ExitCode {
             }
         };
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|a| a == "land") {
         return land::main(&args[1..]);
     }
+    #[cfg(unix)]
     if args.first().is_some_and(|a| a == "prune") {
         return land::prune::main(&args[1..]);
     }
+    #[cfg(unix)]
     if args
         .first()
         .is_some_and(|a| matches!(a.as_str(), "grant" | "revoke" | "grants"))
     {
         return grants::main(&args);
+    }
+    #[cfg(windows)]
+    if args.first().is_some_and(|a| {
+        matches!(
+            a.as_str(),
+            "land" | "prune" | "capacity" | "grant" | "revoke" | "grants"
+        )
+    }) && !args.iter().any(|a| matches!(a.as_str(), "-h" | "--help"))
+    {
+        return done(Err(Failure::new(
+            "unsupported_platform",
+            format!("vega uac {} requires Unix", args[0]),
+            "run the command from a Unix coordinator",
+        )));
     }
     // `adopt --headless`: the flag may stand anywhere after `adopt`.
     let headless = args.first().is_some_and(|a| a == "adopt") && {
@@ -120,6 +139,7 @@ fn main() -> ExitCode {
     match args.as_slice() {
         [] => run(Mode::View),
         [a] if a == "status" => run(Mode::Status),
+        #[cfg(unix)]
         [a, rest @ ..] if a == "capacity" => done(capacity_alias(rest)),
         [a] if a == "claim" => run(Mode::Claim),
         [a] if a == "release" => run(Mode::Release),
@@ -178,6 +198,7 @@ fn main() -> ExitCode {
 
 /// `vega uac capacity [...]` runs `vega-capacity [...]` in its place
 /// (docs/design/capacity.md); returns only when that fails to start.
+#[cfg(unix)]
 fn capacity_alias(args: &[String]) -> Result<(), Failure> {
     use std::os::unix::process::CommandExt;
     let e = std::process::Command::new("vega-capacity")
@@ -228,9 +249,9 @@ fn snapshot(machine: Option<&str>) -> Result<Snapshot, Failure> {
     })
 }
 
-/// Labels of the enabled herdr machines; none if the list cannot be read.
+/// Labels of the enabled machines (hc's fleet, else herdr's); none if the list cannot be read.
 fn machines() -> Vec<String> {
-    herdr(&["machine", "list", "--json"])
+    vega_herdr::hc::machines()
         .ok()
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default()
@@ -251,6 +272,41 @@ enum Mode {
     Release,
     /// `adopt <pane> [--machine <m>] [--headless]`.
     Adopt(String, Option<String>, bool),
+}
+
+fn print_local_native_health() {
+    if cfg!(windows) {
+        for (host, health) in native_workers(None) {
+            print!("{}", health.render(&host, unix_now()));
+        }
+    }
+}
+
+fn native_workers(
+    view: Option<&vega_registry::View>,
+) -> std::collections::BTreeMap<String, vega_herdr::daemon_health::Native> {
+    let local = st::post_host();
+    let mut workers: std::collections::BTreeMap<_, _> = view
+        .into_iter()
+        .flat_map(|view| &view.entries)
+        .filter_map(|(key, beat)| {
+            let host = key.strip_suffix(".beat")?;
+            if host == local {
+                return None;
+            }
+            Some((
+                host.to_owned(),
+                serde_json::from_value(beat.get("native")?.clone()).ok()?,
+            ))
+        })
+        .collect();
+    if cfg!(windows) {
+        let health = vega_herdr::daemon_health::read()
+            .and_then(|h| h.native)
+            .unwrap_or_default();
+        workers.insert(local, health);
+    }
+    workers
 }
 
 fn home(mode: Mode) -> Result<(), Failure> {
@@ -274,7 +330,7 @@ fn home(mode: Mode) -> Result<(), Failure> {
                 .into_owned(),
         }
     } else {
-        terminal::identity()?
+        terminal::identity().inspect_err(|_| print_local_native_health())?
     };
     // Remote machines answer over ssh: ask them in parallel with the local one.
     let remote: Vec<_> = machines()
@@ -282,14 +338,18 @@ fn home(mode: Mode) -> Result<(), Failure> {
         .map(|m| {
             let handle = thread::spawn({
                 let m = m.clone();
-                move || snapshot(Some(&m))
+                move || terminal::remote(&m)
             });
             (m, handle)
         })
         .collect();
     // The registry (other hosts' lineage, UACs, statuses), in parallel.
     let reg = thread::spawn(|| vega_registry::read_blocking_cli(Duration::from_secs(4)));
-    let local = terminal::local()?;
+    let local = terminal::local().inspect_err(|_| {
+        if !json {
+            print_local_native_health();
+        }
+    })?;
 
     let bin = env::current_exe()
         .map(|p| collapse_home(&p.display().to_string()))
@@ -297,7 +357,9 @@ fn home(mode: Mode) -> Result<(), Failure> {
     if !json {
         println!("bin: {bin}");
         println!("description: UAC facility console: every agent on this project across terminal backends and hosts, with parent and bead");
-        print!("{}", vega_herdr::daemon_health::status());
+        if !cfg!(windows) {
+            print!("{}", vega_herdr::daemon_health::status());
+        }
         let my_name = local
             .agents
             .iter()
@@ -317,6 +379,12 @@ fn home(mode: Mode) -> Result<(), Failure> {
         .join()
         .unwrap_or_else(|_| Err("registry read crashed".into()));
     let view = registry.as_ref().ok();
+    let native = native_workers(view);
+    if !json {
+        for (host, health) in &native {
+            print!("{}", health.render(host, unix_now()));
+        }
+    }
     if let Some(p) = &project {
         match &mode {
             Mode::Claim => {
@@ -382,6 +450,7 @@ fn home(mode: Mode) -> Result<(), Failure> {
         projects.insert(p.clone());
     }
 
+    #[cfg(unix)]
     if !json {
         grants::listing()?;
     }
@@ -400,7 +469,10 @@ fn home(mode: Mode) -> Result<(), Failure> {
     let host = st::post_host();
     let mut lookup = beads::Lookup::default();
     let watching = vega_ci_watch::store::waiting(vega_ci_watch::unix_now());
+    #[cfg(unix)]
     let gates = vega_gate::state::waiting_authors(unix_now());
+    #[cfg(windows)]
+    let gates = std::collections::HashSet::<String>::new();
     let mut rows = Vec::new();
     for s in &snapshots {
         let m = s.machine.as_deref();
@@ -460,6 +532,12 @@ fn home(mode: Mode) -> Result<(), Failure> {
                     silence,
                 )
             };
+            let spawn = st::spawn_of_on(m, pane, agent_name(a), str_of(a, "agent"));
+            let published = m.and_then(|machine| {
+                view?
+                    .agent(&vega_registry::token(&machine.to_lowercase()), pane)
+                    .filter(|entry| entry["name"] == agent_name(a))
+            });
             rows.push(Row {
                 project: agent_project.unwrap_or_default(),
                 machine: m.unwrap_or(&host).to_string(),
@@ -472,8 +550,12 @@ fn home(mode: Mode) -> Result<(), Failure> {
                     .map(|t| str_of(t, "label").to_string())
                     .unwrap_or_default(),
                 kind: str_of(a, "agent").to_string(),
-                selection: st::spawn_of_on(m, pane, agent_name(a), str_of(a, "agent"))
-                    .map(|r| (r.tier.unwrap_or_default(), r.model.unwrap_or_default())),
+                selection: spawn.as_ref().map(|r| {
+                    (
+                        r.tier.clone().unwrap_or_default(),
+                        r.model.clone().unwrap_or_default(),
+                    )
+                }),
                 status: str_of(a, "agent_status").to_string(),
                 dialog: if m.is_none() && matches!(str_of(a, "agent_status"), "blocked" | "unknown")
                 {
@@ -501,14 +583,21 @@ fn home(mode: Mode) -> Result<(), Failure> {
                             format!("{pp} on {ph}")
                         })
                     })
+                    .or_else(|| {
+                        let parent: st::Parent =
+                            serde_json::from_value(published?.get("lineage")?.clone()).ok()?;
+                        Some(parent.label_on(&host, m))
+                    })
                     .unwrap_or_else(|| "-".into()),
                 mode: parent_of_on(m, pane, agent_name(a))
                     .map(|_| st::mode_of(m, pane, agent_name(a)).as_str().to_string())
                     .unwrap_or_default(),
-                // bd runs in the agent's cwd, so only local agents get a bead.
                 bead: match m {
                     None => lookup.bead(Path::new(str_of(a, "cwd")), &host),
-                    Some(_) => String::new(),
+                    Some(_) => spawn
+                        .and_then(|r| r.bead)
+                        .or_else(|| published?.get("bead")?.as_str().map(String::from))
+                        .unwrap_or_default(),
                 },
                 unread: vega_herdr::mail::unread(a, unix_now()),
                 rank: status_rank(str_of(a, "agent_status")),
@@ -561,16 +650,28 @@ fn home(mode: Mode) -> Result<(), Failure> {
     if json {
         let grants = vega_herdr::mail_grants::list()
             .map_err(|e| Failure::new("grant_store", e, "inspect vega/mail-grants state files"))?;
-        println!(
-            "{}",
-            facility_json(
-                project.as_deref(),
-                &rows,
-                &grants,
-                &unreachable,
-                registry.as_ref().err()
-            )
+        let mut result = facility_json(
+            project.as_deref(),
+            &rows,
+            &grants,
+            &unreachable,
+            registry.as_ref().err(),
         );
+        if !native.is_empty() {
+            let now = unix_now();
+            result["native_workers"] = serde_json::Value::Object(
+                native
+                    .into_iter()
+                    .map(|(host, health)| {
+                        let mut value = serde_json::json!(health);
+                        value["inventory"]["status"] = health.inventory.status(now).into();
+                        value["labels"]["status"] = health.labels.status(now).into();
+                        (host, value)
+                    })
+                    .collect(),
+            );
+        }
+        println!("{result}");
         return Ok(());
     }
     if let Mode::Ask(question, within) = &mode {
@@ -675,9 +776,12 @@ fn claim_project(key: &str, path: &Path) -> Result<vega_herdr::project::Project,
 /// process cannot start in a literal `~` dir (a workspace made before
 /// `git init` has no repo_key, so this fallback finds the project).
 fn expand_home(path: &str) -> std::path::PathBuf {
-    match (path.strip_prefix("~/"), env::var("HOME")) {
-        (Some(rest), Ok(home)) => Path::new(&home).join(rest),
-        _ if path == "~" => env::var("HOME").map(Into::into).unwrap_or_default(),
+    let relative = path.strip_prefix("~/");
+    #[cfg(windows)]
+    let relative = relative.or_else(|| path.strip_prefix("~\\"));
+    match (relative, vega_herdr::platform::home()) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ if path == "~" => vega_herdr::platform::home().unwrap_or_default(),
         _ => path.into(),
     }
 }
@@ -1437,6 +1541,7 @@ fn gh_report() {
         ),
         Err(e) => println!("gh: core limit unknown ({})", cell(&e)),
     }
+    #[cfg(unix)]
     for line in shim_calls("gh", now) {
         println!("{line}");
     }
@@ -1445,6 +1550,7 @@ fn gh_report() {
 /// The tea calls per pane on this host (the tea shim counts them), only when
 /// there are any: most hosts never use Forgejo. No limit line: Forgejo sends
 /// no rate headers.
+#[cfg(unix)]
 fn tea_report() {
     for line in tea_lines(shim_calls("tea", unix_now())) {
         println!("{line}");
@@ -1452,6 +1558,7 @@ fn tea_report() {
 }
 
 /// Nothing for a zero table: one line, no rows.
+#[cfg(unix)]
 fn tea_lines(table: Vec<String>) -> Vec<String> {
     if table.len() == 1 {
         Vec::new()
@@ -1462,6 +1569,7 @@ fn tea_lines(table: Vec<String>) -> Vec<String> {
 
 /// The last hour of `tool` calls the shim counted, split into panes and
 /// callers without a herdr pane.
+#[cfg(unix)]
 fn shim_calls(tool: &str, now: i64) -> Vec<String> {
     let (panes, sessions): (Vec<_>, Vec<_>) =
         vega_shim::calls::per_pane(tool, vega_shim::calls::HOUR, now)
@@ -1472,6 +1580,7 @@ fn shim_calls(tool: &str, now: i64) -> Vec<String> {
 
 /// The `<tool>_calls` table: pane ids only; callers without a herdr pane (a
 /// session id) in their own table, labelled by harness.
+#[cfg(unix)]
 fn calls_table(tool: &str, panes: &[(String, usize)], sessions: &[(String, usize)]) -> Vec<String> {
     let mut out = Vec::new();
     if panes.is_empty() {
@@ -1564,6 +1673,7 @@ fn git_report() {
 
 fn report(project: Option<&str>) {
     gh_report();
+    #[cfg(unix)]
     tea_report();
     beads_report();
     git_report();
@@ -1950,6 +2060,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_native_health_survives_inventory_beat_expiry() {
+        let mut view = vega_registry::View::default();
+        let mut health = vega_herdr::daemon_health::Native::default();
+        health.inventory.record(100, Some("hc unavailable".into()));
+        health.labels.record(100, Some("hc unavailable".into()));
+        view.entries.insert(
+            "fixture-win.beat".into(),
+            serde_json::json!({"schema":2,"at":0,"native":health}),
+        );
+        view.entries.insert(
+            "fixture-unix.beat".into(),
+            serde_json::json!({"schema":2,"at":100}),
+        );
+        let workers = native_workers(Some(&view));
+        assert!(!workers.contains_key("fixture-unix"));
+        assert_eq!(workers["fixture-win"].inventory.status(101), "failed");
+        assert_eq!(workers["fixture-win"].inventory.status(221), "stale");
+    }
+
+    #[test]
     fn facility_json_has_agent_and_grant_rows_even_when_empty() {
         let v = facility_json(Some("github.com/team/repo"), &[], &[], &[], None);
         assert_eq!(v["schema"], 1);
@@ -2135,8 +2265,11 @@ mod tests {
         let cwd = dir.path().to_str().unwrap();
         assert!(project_key(&ws, "w1", cwd).unwrap().is_some());
         // Me.cwd arrives collapsed to `~/...`: it must still reach the filesystem.
-        let home = env::var("HOME").unwrap();
-        assert_eq!(expand_home("~/src/x"), Path::new(&home).join("src/x"));
+        let home = vega_herdr::platform::home().unwrap();
+        assert_eq!(expand_home("~/src/x"), home.join("src/x"));
+        #[cfg(windows)]
+        assert_eq!(expand_home(r"~\src\x"), home.join(r"src\x"));
+        assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("/abs"), Path::new("/abs"));
     }
 
@@ -2414,6 +2547,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn calls_table_lists_panes_and_labels_sessions() {
         let panes = vec![("w3V:p1".to_string(), 4)];
         let sessions = vec![

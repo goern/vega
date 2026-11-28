@@ -5,7 +5,7 @@ notable commands. `vega onboard` shows the blocks newer than the one this host s
 [docs/design/onboarding.md](docs/design/onboarding.md). Newest block first; never edit a block that is on
 main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `feature`.
 
-## 276 · 2026-11-23
+## 293 · 2026-11-28
 
 - feature: `vega <plugin>` and `vega mux spawn` give `bd` and spawned agents the project's dolt server
   variables (`BEADS_DOLT_AUTO_START`, `_SERVER_HOST`, `_SERVER_PORT`, `_SERVER_USER`, `_SHARED_SERVER`), read
@@ -21,13 +21,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   Agents keep their spawn-time values: an hc spawn record and a resumed agent do not follow later edits of
   `mise.local.toml`.
 
-## 275 · 2026-11-23
-
-- feature: `vega gate start --retry` ignores earlier abandoned reviews of the branch's segments and starts a fresh
-  review; use it after fixing the reviewer's login or API key, when the gate failed open with "review abandoned
-  twice". Old review beads are never edited.
-
-## 274 · 2026-11-23
+## 292 · 2026-11-28
 
 - feature: vegad ends hung gate reviews itself: every minute it kills a reviewer that exited or ran past
   the gate's `timeout`, closes its beads `abandoned` with the reason and mails the author once, without
@@ -35,7 +29,7 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   (Dolt server down) no longer drops the review's state with its beads still `running`: the state stays
   until every bead is closed and the sweep retries.
 
-## 273 · 2026-11-23
+## 291 · 2026-11-28
 
 - feature: `vega gate` takes the author kind from `Assisted-by: <kind>:<model>` trailers and enforces
   them on a push's own commits: a bare `Assisted-by: claude` there refuses the push until it is reworded
@@ -47,13 +41,94 @@ main, add a new one. Entry kinds: `required`, `optional`, `unit`, `migration`, `
   without a reviewer ("review running elsewhere" until the timeout): the gate adopts the bead, and a
   leftover local one without reviewer state is abandoned after 5 minutes.
 
-## 272 · 2026-11-23
+## 290 · 2026-11-26
+
+- feature: Native Windows builds include `vega secrets` for scoped environment injection and ACL-protected host identities. See the [io-win delivery steps](docs/design/secrets.md#native-windows-io-win).
+
+## 289 · 2026-11-26
+
+- feature: `vega bd init --adopt` seeds a named-user Dolt remote as `DOLT_REMOTE_USER` (SQL push with `--user`) instead of failing as `root` (gh #7).
+
+## 288 · 2026-11-26
+
+- feature: Agent switcher rows look like sidebar rows: UAC rows show u▲c and the project, every row the harness glyph and the coloured host label.
+
+## 287 · 2026-11-26
 
 - feature: local `vega mux spawn` and `reopen` on hc start the agent through `~/.local/bin/hc-toolbox-shell`
   when that executable exists, so agents and their tool shells run in the toolbox whose glibc the vega
   binaries need (vega-alc). Hosts without the launcher, and remote `--machine` spawns, are unchanged.
   The spawn environment, including `--env` values, is forwarded as `env K=V` and therefore shows in the
-  agent's process argv: keep secrets out of `--env`. Gate reviewers still start on the host.
+  agent's process argv: keep secrets out of `--env`; spawn warns once with the keys. Resumed agents and local gate reviewers start through the launcher too.
+
+## 286 · 2026-11-26
+
+- feature: `vega gate start --retry` ignores earlier abandoned reviews of the branch's segments and starts a fresh
+  review; use it after fixing the reviewer's login or API key, when the gate failed open with "review abandoned
+  twice". Old review beads are never edited.
+
+## 285 · 2026-11-26
+
+- feature: The native Windows mail relay uses less CPU at idle by reusing hc connections, caching Git project lookups and writing registry entries only when they change.
+
+## 284 · 2026-11-25
+
+- feature: Managed browser tabs open in the background when agents run `tab new <url>`. Use `tab <id>` to activate a tab in Chromium.
+
+## 283 · 2026-11-25
+
+- feature: The agent switcher's `/` search matches fuzzily like fzf (`rcv1` finds `rc-v1`), best match first.
+
+## 282 · 2026-11-25
+
+- feature: Agent switcher shortcuts: `d` shows only done agents, `/` searches all agents by substrings.
+
+## 281 · 2026-11-25
+
+- feature: The agent switcher (`ctrl-s l`) also opens right after a restart or mod reload: it fills a short focus history with the most recently active agents.
+
+## 280 · 2026-11-25
+
+- feature: `ctrl-s l` opens an agent switcher: the last ten agents in focus order, the previous one selected; Enter goes there, arrows or digits pick another. `cmd-;` still toggles directly. Apply with `vega config apply herdr-app`.
+
+## 279 · 2026-11-25
+
+- feature: vegad now resumes agents after a reboot by default (`resume.toml` missing means `mode = "auto"`). Set `mode = "offer"` in `~/.config/vega/resume.toml` for the old note-only behavior.
+
+## 278 · 2026-11-24
+
+- feature: Claude theme sync preserves current settings when switching idle panes, so stale sessions no longer bring back removed hooks during delivery. Working panes switch once idle. Concurrent settings edits during a switch can be overwritten.
+
+## 277 · 2026-11-24
+
+- feature: Repo group members now find the coordination database even when bd's per-user `~/.beads` directory exists above the checkout.
+
+## 276 · 2026-11-24
+
+- feature: From a repo group member without `.beads`, `vega mux spawn --bead` and the agent `bd` shim use the coordination database registered on that host. Claims identify the member worktree.
+
+## 275 · 2026-11-24
+
+- feature: The herdr-app vega mod starts the native relay on connected Windows machines, including hosts with Git Bash.
+
+## 274 · 2026-11-24
+
+- feature: `vega uac` shows native Windows inventory and label health locally
+  and through the host heartbeat. On Windows, `vega bd status` reports that
+  beads sync is unsupported.
+
+## 273 · 2026-11-24
+
+- feature: The native Windows relay now labels local hc terminals with their
+  configured host glyph, project and role, including while the broker is offline.
+
+## 272 · 2026-11-23
+
+- feature: The native Windows subset includes `vega-uac.exe`. A parent can
+  adopt a worker on io-win, and the native relay publishes the worker's project
+  and lineage for the UAC view. Workers launched with `vega mux spawn --bead`
+  also show their recorded bead.
+
 ## 271 · 2026-11-23
 
 - feature: `vega browser install` installs pinned Chrome for Testing 158.0.8127.36.

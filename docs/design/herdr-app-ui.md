@@ -82,15 +82,27 @@ leave successfully created terminals available for the next invocation.
 
 ## Last-focus navigation (vega-0h4c.70)
 
-`ctrl-s l` or `cmd-;` toggles the last agent, `ctrl-s shift-l` the last space,
+`cmd-;` toggles the last agent, `ctrl-s shift-l` the last space,
 and `ctrl-s ;` the last pane in the current tab. Press again to return (A → B → A).
+
+`ctrl-s l` (`vega-sidebar.switch-agent`) opens the agent switcher: a dialog with
+the last ten live agents in focus order (current first, with when each was last
+focused), the previous one selected. Rows use the sidebar's symbols: u▲c plus the project
+name for a UAC (its detail line, like other rows' name, prefers a tab name the Slayer gave over the agent's title), the harness glyph, the hc terminal name (`t1j`, as `vega mux` and `vega post` address it; searchable), and the coloured host label from theme.toml. Enter goes there, so `ctrl-s l` Enter is the
+old toggle; arrows, Tab, j/k or l move; a digit jumps to that row (1 = previous);
+Esc closes. `d` shows only done agents; `/` searches all live agents
+fuzzily like fzf (space-separated terms in any order, each a subsequence of name,
+project, space, host, tab or address; best score first; Backspace edits and leaves an empty search, ctrl-u clears; Esc closes the dialog,
+since Herdr handles it before the mod). The main sidebar copy keeps the agent history and its focus times in
+its localStorage, so the switcher survives a restart; the dialog gets the rows as
+props, since overlays do not share module state.
 Pane history includes mod panes; agent history includes qualified remote addresses
 and ignores shells. Closed targets are skipped; without a previous live target the
 command does nothing. The keys deliver `vega-sidebar.last-agent`,
 `vega-sidebar.last-space` and `vega-sidebar.last-pane` through `nextCommand()`.
 
 History stays in module memory, shared by all sidebar copies on herdr-app 0.1.14+,
-and resets on mod reload or app restart. Renders sample focus; a 300 ms background
+and resets on mod reload or app restart, except the agent history (above). Renders sample focus; a 300 ms background
 loop also samples because the API does not guarantee a render for every focus
 change. Copies share the polling budget and only read agent inventory when the
 terminal changes. Broadcast key deliveries are batched for one microtask so only
@@ -160,7 +172,7 @@ launch/unlock races, and ignoring persisted overlay handles from a previous app 
    localStorage); under it the UAC first, its sentinels as tree branches, then the project's other agents on
    any machine. Below, "Spaces": every space without a UAC, a click selects it. Rows follow the TUI symbols
    ([theme-symbols](theme-symbols.md)): status, `u▲c` only on the UAC row, the harness glyph (`✳` `֍` `✈`
-   `π`) in its colour, name, git, badges, duration and the machine's `$host` label (`♆₈`) right-aligned in
+   `π`) in its colour, name (a UAC row, whose project is the header, shows its tab name or else its title), git, badges, duration and the machine's `$host` label (`♆₈`) right-aligned in
    its host colour from `~/.config/vega/theme.toml`. No sentinel cog: the tree line marks a child. The
    project row carries git and the positive totals `✉ ⚖ ✋`.
 4. **Decisions go to a `vega-inbox` window, not the chat.** An overlay of `kind: "window"` with `key` and
@@ -440,6 +452,8 @@ Its click toggles the pin and stops propagation, as does its left mouse-down, so
 fold or drag the header. Pins live in vega project preferences (`projects.toml`, `pinned: true`),
 not localStorage. The sidebar reads `vega project config --json`, writes
 `vega project config <id> --pin|--unpin --json`, then refreshes; failures use the config error line.
+A member project's pin pins its whole coordination block: the header's pin then shows
+dimmed in the accent colour, its tooltip names the pinned member, and a click unpins that member.
 With Active on, a pinned project's group and UAC remain even if idle or without status; idle
 sub-agents and other idle agents still hide. Pins respect the current label/machine view and
 do not retain projects outside it. Retained pinned UACs do not count in `N idle hidden`.

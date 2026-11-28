@@ -113,7 +113,7 @@ DIAG.flush = diagFlush;
 // Which copy is running: the main sidebar or one of its popup/window views.
 const copyKind = () => {
   const p = props();
-  return p?.globalConfig ? "settings" : p?.mail ? "mail" : p?.attentionProject ? "attention"
+  return p?.switcher ? "switcher" : p?.globalConfig ? "settings" : p?.mail ? "mail" : p?.attentionProject ? "attention"
     : p?.projectConfig ? "project" : p?.viewMenu ? "views" : p?.spaceMenu ? "space-menu"
     : p?.agentMenu ? "agent-menu" : "main";
 };
@@ -165,6 +165,13 @@ function parseSymbols(text) {
   }
   return out;
 }
+
+// Host label cell: a fixed 22px column fits a symbol of up to 2 characters; a longer label (a bare host
+// name, when theme.toml has no [symbols.hosts] entry) keeps its natural width instead of wrapping.
+const hostCell = (label, color, dim) => {
+  const cell = div().flex_none().whitespace_nowrap().text_right().text_size(12).text_color(color ?? dim).child(label);
+  return [...label].length > 2 ? cell.ml(4) : cell.w(22);
+};
 
 // A machine's $host label is resolved once per derivation in buildModel (model.hostLabels).
 
@@ -265,7 +272,24 @@ function duration(ms) {
 }
 
 // Shared by all copies on herdr-app 0.1.14+. Overlays do not participate.
-const navigation = { agents: [], spaces: [], panes: new Map(), commands: new Map(), sampled: null, polled: 0 };
+const navigation = { agents: [], spaces: [], panes: new Map(), commands: new Map(), sampled: null, polled: 0,
+  // When each agent was last focused (ms); the main copy keeps both in localStorage across restarts.
+  seen: new Map(), dirty: false };
+const SWITCHER_ROWS = 10;
+function restoreAgentHistory() {
+  if (navigation.agents.length) return;
+  try {
+    for (const [address, at] of JSON.parse(localStorage.getItem("agent-history") ?? "[]")) {
+      navigation.agents.push(address); navigation.seen.set(address, at);
+    }
+  } catch (_) {}
+}
+function saveAgentHistory() {
+  if (!navigation.dirty) return;
+  navigation.dirty = false;
+  const kept = navigation.agents.slice(0, 3 * SWITCHER_ROWS);
+  try { localStorage.setItem("agent-history", JSON.stringify(kept.map(a => [a, navigation.seen.get(a) ?? 0]))); } catch (_) {}
+}
 function visit(history, id) {
   if (!id || history[0] === id) return;
   const index = history.indexOf(id);
@@ -283,8 +307,51 @@ function sampleFocus() {
   // The frequent path only reads focused(); copy agent inventory on transitions.
   if (f.terminal !== navigation.sampled) {
     navigation.sampled = f.terminal;
-    if (agents().some(a => a.address === f.terminal)) visit(navigation.agents, f.terminal);
+    if (agents().some(a => a.address === f.terminal)) {
+      visit(navigation.agents, f.terminal);
+      navigation.seen.set(f.terminal, Date.now());
+      navigation.dirty = true;
+    }
   }
+  // Leaving an agent stamps it too: the switcher shows when you last looked at it.
+  const current = navigation.agents[0];
+  if (current === f.terminal) navigation.seen.set(current, Date.now());
+}
+// fzf-style fuzzy score of one term in text (both lowercase): the term's characters in order,
+// not necessarily adjacent; null without a match. Like fzf, it rewards consecutive characters and
+// starts of words and penalizes gaps; it takes the best of every start position.
+const WORD_START = /[\s\-_/.·:|]/;
+function fuzzyScore(term, text) {
+  let best = null;
+  for (let start = text.indexOf(term[0]); start >= 0; start = text.indexOf(term[0], start + 1)) {
+    let score = 0, at = start, previous = -1;
+    for (const ch of term) {
+      at = text.indexOf(ch, previous < 0 ? start : previous + 1);
+      if (at < 0) { score = null; break; }
+      score += 16;
+      if (previous >= 0 && at === previous + 1) score += 8;
+      else if (previous >= 0) score -= Math.min(at - previous - 1, 8);
+      if (at === 0 || WORD_START.test(text[at - 1])) score += 8;
+      previous = at;
+    }
+    if (score === null) break;
+    if (best === null || score > best) best = score;
+  }
+  return best;
+}
+// The agent switcher: the last agents in focus order in a dialog, the previous one selected.
+function openSwitcher(f) {
+  const all = agents();
+  const live = new Set(all.map(a => a.address));
+  // Focus history first, then every other live agent, most recently active first: a fresh history
+  // (first start, mod reload) still fills the list, and `d` and `/` search all agents.
+  const list = navigation.agents.filter(a => live.has(a));
+  if (f.terminal && live.has(f.terminal) && !list.includes(f.terminal)) list.unshift(f.terminal);
+  for (const a of [...all].sort((x, y) => y.seq - x.seq)) if (!list.includes(a.address)) list.push(a.address);
+  if (!list.length || (list.length === 1 && list[0] === f.terminal)) return;
+  const rows = list.map(address => ({ address, at: navigation.seen.get(address) ?? 0 }));
+  openOverlay({ mod: "vega-sidebar", kind: "dialog", width: 560, height: 48 + 48 * Math.min(SWITCHER_ROWS, rows.length),
+    props: { switcher: { rows, index: list[0] === f.terminal ? 1 : 0, current: f.terminal } } });
 }
 function lastFocus(command) {
   sampleFocus();
@@ -299,6 +366,9 @@ function lastFocus(command) {
   } else if (command === "last-space") {
     history = navigation.spaces; live = new Set(spaces().map(s => s.id));
     current = f.space; action = "space.select"; argument = "id";
+  } else if (command === "switch-agent") {
+    navigation.agents.splice(0, navigation.agents.length, ...navigation.agents.filter(id => agents().some(a => a.address === id)));
+    return openSwitcher(f);
   } else if (command === "last-pane") {
     history = navigation.panes.get(f.tab) ?? [];
     live = new Set(panes().filter(p => p.tab === f.tab).map(p => p.pane));
@@ -325,6 +395,19 @@ export default class Agents extends View {
 
   initBody(_props, cx) {
     this.dismissBusy = new Set(); this.dismissResults = new Map();
+    if (props()?.switcher) {
+      this.switcherIndex = props().switcher.index ?? 0;
+      this.focusHandle = cx.focus_handle?.();
+      this.focusHandle?.focus();
+      // The sidebar's symbol colours (harness glyphs, u▲c, host labels).
+      cx.spawn(async (cx) => {
+        try {
+          const r = await exec("cat", [`${home()}/.config/vega/theme.toml`]);
+          if (r.code === 0) { this.symbols = parseSymbols(r.stdout); cx.notify(); }
+        } catch (_) {}
+      });
+      return;
+    }
     if (props()?.globalConfig) {
       this.settingsTab = "models";
       this.focusHandle = cx.focus_handle?.();
@@ -407,6 +490,7 @@ export default class Agents extends View {
       return;
     }
     if (props()?.spaceMenu || props()?.agentMenu) return;
+    restoreAgentHistory();
     this.startNavigation(cx);
     cx.timer.every(1000, cx => this.reconcileWaiting(cx));
     this.preferences = { projects: {}, views: {} };
@@ -453,6 +537,7 @@ export default class Agents extends View {
         if (now - navigation.polled >= 250) {
           navigation.polled = now;
           sampleFocus();
+          saveAgentHistory();
         }
         await cx.sleep(300);
       }
@@ -1454,6 +1539,121 @@ export default class Agents extends View {
     return Boolean(this.vegaTerminals?.get(address)?.labels?.["herdr.pinned"]);
   }
 
+  // Enter goes to the selected agent (the previous one when it opens); arrows, Tab, j/k or l
+  // move; a digit goes to that row (0 is the current agent); `d` shows only done agents; `/`
+  // searches all agents fuzzily like fzf (space-separated terms, any order). Herdr closes a dialog on
+  // Esc before the mod sees it, so Esc always closes; Backspace on an empty query leaves the search.
+  switcher(t) {
+    const { rows: all, current } = props().switcher;
+    const byAddress = new Map(agents().map(a => [a.address, a]));
+    const labels = new Map(terminals().map(x => [x.address, x.labels ?? {}]));
+    // A tab name the Slayer gave wins over the agent's own title, as in the sidebar.
+    const named = new Map(spaces().flatMap(s => s.tabs).filter(tab => tab.named).map(tab => [tab.id, tab.name]));
+    const close = () => closeOverlay(props().overlay);
+    const now = Date.now();
+    const describe = r => {
+      const a = byAddress.get(r.address);
+      const l = labels.get(r.address) ?? {};
+      const uac = l["vega.role"] === "uac";
+      // As in the sidebar: a UAC row is its project; other agents go by their label or title.
+      const tabName = named.get(a.tab);
+      const name = uac ? (l["vega.project"] || a.space_name || r.address)
+        : (tabName || l["vega.label"]?.replace(/^[^\p{L}\p{N}]+/u, "") || a.pane_name || l["vega.name"] || a.title || a.tab_name || r.address);
+      const where = (uac ? [tabName || a.title] : [l["vega.project"], a.space_name]).filter(Boolean)
+        .filter((v, k, xs) => xs.indexOf(v) === k && v !== name).join(" · ");
+      const host = l["vega.host"] || machineOf(r.address);
+      // The hc terminal name (t1j), as vega mux and vega post address it.
+      const pane = r.address.split("/").pop();
+      return { ...r, a, l, uac, name, where, host, pane,
+        text: [pane, uac ? "uac" : "", name, where, host, a.tab_name, a.title, r.address].join(" ").toLowerCase() };
+    };
+    const query = this.switcherQuery;
+    const terms = (query ?? "").toLowerCase().split(/\s+/).filter(Boolean);
+    // Each term must match fuzzily; with a query the best total score wins, ties keep focus order.
+    const rows = all.filter(r => byAddress.has(r.address)).map(describe)
+      .filter(r => !this.switcherDone || r.a.status === "done")
+      .map((r, order) => {
+        let score = 0;
+        for (const term of terms) {
+          const s = fuzzyScore(term, r.text);
+          if (s === null) return null;
+          score += s;
+        }
+        return { ...r, score, order };
+      })
+      .filter(Boolean)
+      .sort((x, y) => terms.length ? y.score - x.score || x.order - y.order : x.order - y.order)
+      .slice(0, SWITCHER_ROWS);
+    const index = Math.max(0, Math.min(this.switcherIndex ?? 0, rows.length - 1));
+    const go = i => {
+      const r = rows[i];
+      if (!r) return;
+      close();
+      if (r.address !== current) run("agent.focus", { terminal: r.address });
+    };
+    const move = step => { if (rows.length) this.switcherIndex = (index + step + rows.length) % rows.length; };
+    // A new filter selects its first row.
+    const refilter = () => { this.switcherIndex = 0; };
+    const C = this.colors();
+    // Harness glyphs as in the sidebar rows (projectTree kindOf).
+    const kindOf = r => {
+      const key = (r.l["vega.harness"] || r.a.program?.key || r.a.app || "").toLowerCase();
+      for (const [name, glyph] of [["claude", "✳"], ["codex", "֍"], ["copilot", "✈"], ["pi", "π"]]) if (key.includes(name)) return [glyph, C[name]];
+      return ["◇", C.other_agent];
+    };
+    const row = (r, i) => {
+      const when = r.address === current ? "now" : r.at ? duration(now - r.at) : "";
+      const [glyph, color] = kindOf(r);
+      // Number, dot, age and host sit on the name's line; the detail line is indented under the name.
+      return v_flex().id(`switch-${i}`).h(46).px(10).gap(1).justify_center().rounded(7).cursor_pointer()
+        .when(i === index, el => el.bg(t.selected)).hover(el => el.bg(t.hover))
+        .on_click((_e, cx) => { cx.stop_propagation(); go(i); })
+        .child(h_flex().gap(8).items_center()
+          .child(div().w(14).flex_none().text_color(t.dim).text_size(11).child(query === undefined || query === null ? String(i) : ""))
+          .child(div().w(8).h(8).flex_none().rounded(4).bg(t[r.a.status] ?? t.dim))
+          .when(r.uac, el => el.child(div().flex_none().font_semibold().text_color(C.uac).child(r.l["vega.uac"] || "u▲c")))
+          .child(div().flex_none().text_color(color).child(glyph))
+          .child(div().min_w(0).flex_1().truncate()
+            .text_color(r.a.status === "idle" ? t.muted : t.foreground).when(r.uac, el => el.font_semibold()).child(r.name))
+          .child(div().flex_none().text_size(11).text_color(t.dim).child(when))
+          .child(div().flex_none().text_size(11).text_color(t.dim).child(r.pane))
+          .child(hostCell(r.host, C.hosts[r.host], t.dim)))
+        .when(Boolean(r.where), el => el.child(div().pl(38).text_size(11).text_color(t.dim).truncate().child(r.where)));
+    };
+    const searching = typeof query === "string";
+    const head = searching ? `/ ${query}▏` : this.switcherDone ? "done only · d all · / search · Enter · Esc"
+      : "Enter · ↑↓ · 0–9 · d done · / search · Esc";
+    // Rows inherit the app's UI size like the sidebar rows, so glyphs and labels line up.
+    return v_flex().size_full().p(8).gap(2).bg(t.popover).text_color(t.foreground)
+      .when(Boolean(this.focusHandle), el => el.track_focus(this.focusHandle))
+      .on_key_down((e, cx) => {
+        const k = e.keystroke;
+        const typed = !e.modifiers?.control && !e.modifiers?.platform && !e.modifiers?.alt ? e.key_char : undefined;
+        if (k === "enter") go(index);
+        else if (["down", "tab", "ctrl-n"].includes(k)) move(1);
+        else if (["up", "shift-tab", "ctrl-p"].includes(k)) move(-1);
+        else if (searching) {
+          if (k === "backspace") { if (query) this.switcherQuery = query.slice(0, -1); else this.switcherQuery = null; }
+          else if (k === "ctrl-u") this.switcherQuery = "";
+          else if (typed && typed >= " ") this.switcherQuery = query + typed;
+          else return;
+          refilter();
+        } else if (k === "escape") { if (this.switcherDone) { this.switcherDone = false; refilter(); } else close(); }
+        // German layouts type "/" as shift-7: go by the character.
+        else if (k === "/" || typed === "/") { this.switcherQuery = ""; refilter(); }
+        else if (k === "d") { this.switcherDone = !this.switcherDone; refilter(); }
+        else if (["j", "l"].includes(k)) move(1);
+        else if (["k", "h"].includes(k)) move(-1);
+        else if (/^[0-9]$/.test(k)) go(+k);
+        else return;
+        cx.stop_propagation();
+        cx.notify();
+      })
+      .child(div().px(10).pb(4).when(!searching, el => el.text_size(11)).text_color(searching ? t.foreground : t.dim).child(head))
+      .when(!rows.length, el => el.child(div().px(10).py(8).text_color(t.dim).child("No matching agents.")))
+      .children(rows.map(row));
+  }
+
   openAgentMenu(address, cx, project = null) {
     cx.stop_propagation();
     openOverlay({ mod: "vega-sidebar", kind: "popup", width: 260, height: 100,
@@ -1527,7 +1727,9 @@ export default class Agents extends View {
   // but only into a project with a UAC (the signal behind the "no UAC" marker, vega-0h4c.79).
   foreignChild(k) {
     const own = k.labels?.["vega.project-id"], parent = this.projectLabelOf(k.parent);
-    return Boolean(own && parent && own !== parent && this.projectUacs?.has(own));
+    // A group UAC's sentinel on a member project is its own branch, not foreign.
+    return Boolean(own && parent && own !== parent && this.projectUacs?.has(own)
+      && this.projectUacs.get(own)?.address !== k.parent);
   }
 
   // Live tree-eligible children by parent, so tree() walks subtrees without
@@ -1735,7 +1937,7 @@ export default class Agents extends View {
     };
     const host = (address) => {
       const label = labelsOf(address)["vega.host"];
-      return label ? div().w(22).flex_none().text_right().text_size(12).text_color(C.hosts[label] ?? t.dim).child(label) : div().w(22).flex_none();
+      return label ? hostCell(label, C.hosts[label], t.dim) : div().w(22).flex_none();
     };
     const tokens = (address, uac) => this.vegaIcons(address, t, uac ? ["uac", "kind", "git"] : ["uac", "kind"], m.waitingByAddress.get(address) ?? []);
     const agentRow = (a, subs, depth, lines = []) => {
@@ -1744,7 +1946,9 @@ export default class Agents extends View {
       const [glyph, color] = kindOf(a);
       const st = { ...a, status: depth ? kidStatus(a, this.listed) : this.topStatus(a) };
       const when = depth ? 0 : this.since(a);
-      const name = uac ? "" : depth
+      // A UAC row's project is its header: like other rows, it shows a tab name
+      // someone gave it, else the agent's title.
+      const name = depth && !uac
         ? (l["vega.label"]?.replace(/^[^\p{L}\p{N}]+/u, "") || a.name || a.template || a.title || a.address)
         : [this.rowLabel(a), clean(a.title), a.program?.name].find(n => n && !/^\d+$/.test(n)) || "";
       const on = a.address === m.shown;
@@ -1862,12 +2066,20 @@ export default class Agents extends View {
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .cursor_pointer().on_click((_e, cx) => this.openAttention(project, address, cx)));
         })
-        .when(!nested, el => el.child(div().id(`pin-${gid}`).flex_none().text_color(this.preferences?.projects?.[project]?.pinned ? t.accent : t.dim)
-          .cursor_pointer().tooltip(this.preferences?.projects?.[project]?.pinned ? "Unpin project" : "Pin project in Active view")
-          .child(svg("mods/vega-sidebar/pin.svg").size(12).text_color(this.preferences?.projects?.[project]?.pinned ? t.accent : t.dim))
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          // The click's cx dies after the handler: the awaiting toggle runs in cx.spawn.
-          .on_click((_e, cx) => { cx.stop_propagation(); cx.spawn(cx => this.toggleProjectPin(project, cx)); })))
+        .when(!nested, el => {
+          // A member project's pin pins the whole block: show it here and name its source.
+          const own = this.preferences?.projects?.[project]?.pinned;
+          const via = own ? [] : membership.projectsInBlock(project).filter(id => id !== project && this.preferences?.projects?.[id]?.pinned);
+          const tip = own ? "Unpin project" : via.length ? `Pinned via ${via.map(id => id.split("/").at(-1)).join(", ")}: click to unpin` : "Pin project in Active view";
+          return el.child(div().id(`pin-${gid}`).flex_none().cursor_pointer().tooltip(tip)
+            .child(svg("mods/vega-sidebar/pin.svg").size(12).text_color(own ? t.accent : via.length ? t.accent + "99" : t.dim))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            // The click's cx dies after the handler: the awaiting toggle runs in cx.spawn.
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              cx.spawn(async cx => { for (const id of via.length ? via : [project]) await this.toggleProjectPin(id, cx); });
+            }));
+        })
         .child(div().id(`gear-${gid}`).flex_none().text_color(t.dim).cursor_pointer().tooltip("Project window")
           .child(svg("mods/workspace-chrome/settings.svg").size(12).text_color(t.dim))
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
@@ -1905,8 +2117,7 @@ export default class Agents extends View {
           .on_mouse_down("right", (_e, cx) => this.openSpaceMenu(sp, cx))
           .child(div().min_w(0).flex_shrink_1().truncate().text_color(t.muted).child(sp.name))
           .child(div().flex_1())
-          .child(div().w(22).flex_none().text_right().text_size(12).text_color(C.hosts[hostLabel] ?? t.dim)
-            .child(hostLabel)));
+          .child(hostCell(hostLabel, C.hosts[hostLabel], t.dim)));
         for (const a of m.agentsBySpace.get(sp.id) ?? []) out.push(...withTree(a));
         out.push(...plainRows(m.plainBySpace.get(sp.id) ?? [], false));
       }
@@ -2223,7 +2434,8 @@ export default class Agents extends View {
     const leads = leadPanes(panes());
     const tabLabels = new Map(spaces().flatMap(s => s.tabs).map(tab => [tab.id, title(tab, leads.get(tab.id))]));
     const labels = new Map(list.map(a => [a.address, tabLabels.get(a.tab) ?? (a.title || a.program?.name || "")]));
-    const label = (a) => labels.get(a.address);
+    // A group UAC kept as context may be missing from the list: read its tab directly.
+    const label = (a) => labels.get(a.address) ?? tabLabels.get(a.tab);
     const detail = new Map(list.map(a => [a.address, /^\d+$/.test(label(a)) ? null : label(a)]));
     const seenLabels = {};
     for (const a of list) { const k = `${a.space_name}\u0000${detail.get(a.address) ?? ""}`; seenLabels[k] = (seenLabels[k] ?? 0) + 1; }
@@ -2308,6 +2520,7 @@ export default class Agents extends View {
           .child(div().text_size(11).text_color(t.muted).child(`${m.from || m.host || ""} · ${m.time || ""} · ${m.read === false || m.unread ? "Unread" : "Read"}`))
           .when(Boolean(m.title), el => el.child(div().font_semibold().child(m.title)))
           .child(div().child(m.text ?? m.body ?? ""))) : [div().child("No mail.")]) : [div().child(this.mail)]));
+    if (props()?.switcher) return this.switcher(t);
     if (props()?.attentionProject) return this.attentionPopover(t);
     if (props()?.globalConfig) return this.settingsOverlay(t);
     if (props()?.projectConfig) return this.projectOverlay(t);

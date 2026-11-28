@@ -268,7 +268,10 @@ pub fn spawn(
         .filter_map(|(k, v)| v.as_str().map(|v| format!("{k}={v}")))
         .filter(|kv| !user.contains(kv))
         .collect();
-    let launcher = machine().is_none().then(toolbox_launcher).flatten();
+    let launcher = machine()
+        .is_none()
+        .then(vega_herdr::launch::toolbox_launcher)
+        .flatten();
     if let Some(p) = prompt {
         let text = if no_parent && own.is_none() {
             p.into()
@@ -277,8 +280,17 @@ pub fn spawn(
         };
         args.extend(vega_herdr::launch::prompt_args(kind, &text));
     }
+    if let Some(w) = visible_env_warning(user, launcher.is_some()) {
+        eprintln!("{w}");
+    }
     let args = match &launcher {
-        Some(l) => toolbox_argv(l, &launch_env, args),
+        Some(l) => vega_herdr::launch::toolbox_argv(
+            l,
+            launch_env
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.as_str(), v))),
+            args,
+        ),
         None => args,
     };
     let v = vega_herdr::hc::rpc(
@@ -293,7 +305,9 @@ pub fn spawn(
         std::time::Duration::from_secs(30),
     )?;
     // Keep the harness as argv[0]. A nice/env wrapper hides its identity.
-    if machine().is_none() {
+    // With the toolbox launcher `pid` is the `toolbox` client on the host, not the agent (that
+    // runs in the container), so renicing it would not slow the agent: skip it.
+    if renice_pid(machine().is_some(), launcher.is_some()) {
         if let Some(pid) = v["pid"].as_u64().filter(|p| *p > 1) {
             let _ = Command::new("renice")
                 .args([AGENT_NICE, "-p", &pid.to_string()])
@@ -426,36 +440,6 @@ pub fn spawn(
     Ok(pane)
 }
 
-/// The toolbox launcher a host provisions at `~/.local/bin/hc-toolbox-shell` (see
-/// docs/design/hc-migration.md, "Toolbox launch of local hc spawns"), when this host has
-/// one. The host's glibc can be older than the vega shims need (vega-alc), so agents
-/// must start inside the toolbox.
-fn toolbox_launcher() -> Option<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = Path::new(&env::var("HOME").ok()?).join(".local/bin/hc-toolbox-shell");
-    let meta = std::fs::metadata(&path).ok()?;
-    (meta.is_file() && meta.permissions().mode() & 0o111 != 0)
-        .then(|| path.to_string_lossy().into_owned())
-}
-
-/// `toolbox run` passes only a fixed env allowlist (the launcher re-injects `HC_*`), so the
-/// spawn env goes in through `env` inside the toolbox. An empty value stays `K=`, so it still
-/// overrides a value the toolbox would inherit.
-fn toolbox_argv(
-    launcher: &str,
-    env: &serde_json::Map<String, Value>,
-    agent: Vec<String>,
-) -> Vec<String> {
-    let mut out = vec![launcher.to_string(), "env".to_string()];
-    for (k, v) in env {
-        if let Some(v) = v.as_str() {
-            out.push(format!("{k}={v}"));
-        }
-    }
-    out.extend(agent);
-    out
-}
-
 /// Prepare on the target: filesystem paths and worktrunk hooks belong there.
 fn prepare_remote(target: &str, kind: &str, cwd: &str, place: &Place) -> Result<Value, Failure> {
     let mut args = vec![
@@ -555,6 +539,26 @@ fn local_shown_space() -> Result<Option<String>, Failure> {
         ));
     }
     shown_space()
+}
+
+/// The launcher forwards the spawn env as `env K=V` argv words, so `--env` values show in `ps`
+/// and `/proc/<pid>/cmdline`. One warning naming the keys (never the values) when that applies.
+fn visible_env_warning(user: &[String], wrapped: bool) -> Option<String> {
+    let keys: Vec<&str> = user
+        .iter()
+        .filter_map(|v| v.split_once('=').map(|(k, _)| k))
+        .collect();
+    (wrapped && !keys.is_empty()).then(|| {
+        format!(
+            "warning: --env values are visible in the process list (the toolbox launcher passes them as argv): {}",
+            keys.join(", ")
+        )
+    })
+}
+
+/// Whether `terminal.run`'s `pid` is the agent: a local spawn the launcher did not wrap.
+fn renice_pid(remote: bool, wrapped: bool) -> bool {
+    !remote && !wrapped
 }
 
 /// `machine.exec` wraps the program's output: base64 `stdout`, its exit `code`.
@@ -722,26 +726,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn toolbox_argv_prefixes_launcher_and_carries_env() {
-        let mut env = serde_json::Map::new();
-        env.insert("A".into(), "b c".into());
-        env.insert("HERDR_PANE_ID".into(), "".into());
-        let argv = toolbox_argv(
-            "/h/.local/bin/hc-toolbox-shell",
-            &env,
-            vec!["claude".into(), "--x".into()],
-        );
-        assert_eq!(
-            argv,
-            [
-                "/h/.local/bin/hc-toolbox-shell",
-                "env",
-                "A=b c",
-                "HERDR_PANE_ID=",
-                "claude",
-                "--x"
-            ]
-        );
+    fn env_warning_names_keys_not_values_and_only_with_the_launcher() {
+        let user = ["TOKEN=s3cret".to_string(), "EMPTY=".to_string()];
+        let w = visible_env_warning(&user, true).unwrap();
+        assert!(w.contains("TOKEN, EMPTY"), "{w}");
+        assert!(!w.contains("s3cret"));
+        assert_eq!(visible_env_warning(&user, false), None);
+        assert_eq!(visible_env_warning(&[], true), None);
+    }
+
+    #[test]
+    fn renice_skips_remote_and_launcher_wrapped_spawns() {
+        assert!(renice_pid(false, false));
+        assert!(!renice_pid(false, true));
+        assert!(!renice_pid(true, false));
     }
 }
 
